@@ -26,6 +26,7 @@ composer require nikic/php-parser:^4.0                  greenlion/php-sql-parser
 2. 再帰呼び出しでサブディレクトリを探索
 3. 正規表現で対象拡張子(.php/.inc/.html/.js)を判定
 4. 見つかったファイルを `parseFile($path, $relative)` へ渡す
+5. (一覧を出力)
 
 ## 6. stripComments() の実装
 - 正規表現で:
@@ -33,11 +34,14 @@ composer require nikic/php-parser:^4.0                  greenlion/php-sql-parser
   - `// ...`
   - `<!-- ... -->`
   をすべて除去
+- (除去したソースを出力)
 
 ## 7. collectConstants() の実装
 - `define('NAME','value')`
 - `const NAME = 'value';`
  の二つのパターンを `preg_match_all` で検出し、マップに格納
+- JSのconstを誤って検知しないようにする
+- (格納した結果を出力)
 
 ## 8. processAst() の実装
 1. `ParserFactory::PREFER_PHP5` で AST を生成
@@ -50,6 +54,7 @@ composer require nikic/php-parser:^4.0                  greenlion/php-sql-parser
      - 定数展開 `expandConstantsInSql()`
      - PHPSQLParser でパース → パース結果を `SqlStatement` に格納
      - CRUD 分類、テーブルエイリアス検出、サブクエリ判定
+- 作業重そう、テストこまめに
 
 ## 9. extractDependencies() の実装
 - `preg_match_all` で以下を検出
@@ -59,6 +64,7 @@ composer require nikic/php-parser:^4.0                  greenlion/php-sql-parser
   - `fetch('...')`
   - `window.open('...')`
 - 行番号取得のため `PREG_OFFSET_CAPTURE` や AST から `getStartLine()` を活用
+- (結果を出力)
 
 ## 10. extractSqlStatements() の実装（任意）
 - AST で拾えない動的 SQL を補完
@@ -88,6 +94,5 @@ composer require nikic/php-parser:^4.0                  greenlion/php-sql-parser
 4. エラー箇所は Errors シートを参照
 
 ## 13. 拡張ポイント
-- Laravel / WordPress プロジェクト対応
 - JSON / CSV 出力形式追加
 - 関数/ファイル呼び出しグラフ生成
