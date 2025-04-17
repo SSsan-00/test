@@ -1,0 +1,8 @@
+# まだ composer.json がなければ初期化
+composer init --require="nikic/php-parser:^4.0" \
+               --require="greenlion/php-sql-parser:^4.0" \
+               --require="phpoffice/phpspreadsheet:^1.28" \
+               --no-interaction
+
+# 依存ライブラリをインストール
+composer install
