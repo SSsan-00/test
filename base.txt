@@ -1,0 +1,376 @@
+#!/usr/bin/env php
+<?php
+// /**
+//  * Analyzer — PHP ソースコード静的解析ツール 全機能雛形
+//  *
+//  * 仕様 v1.4 すべての要件を実装するためのガイドライン付き雛形コードです。
+//  * 以下の機能を順次 TODO を埋めて実装してください。
+//  *
+//  * ■ 入力仕様
+//  *  - CLI 引数で指定されたディレクトリを再帰探索
+//  *  - 対象拡張子: .php, .inc, .html, .js
+//  *  - コメント除去(PHPDoc, //, /* */, HTMLコメント)
+//  *  - ファイルパスは解析ルートからの相対パスで扱う
+//  *
+//  * ■ 解析対象
+//  * 1. クラス定義 (AST ベース) → Classes シート
+//  * 2. 関数／メソッド定義 (AST ベース) → Functions シート
+//  * 3. include/require(_once) → Dependencies シート
+//  * 4. フロントエンド遷移 (form action, href, fetch, window.open) → Dependencies シート
+//  * 5. SQL抽出 & CRUD分類 (PostgreSQL対応) → CRUD シート
+//  *    - サブクエリ対応 (スコープ分離)
+//  *    - テーブルエイリアス解決 → CrudOperation::$aliasInfo
+//  *    - define/const 定数展開 & 備考記録 → CrudOperation::$notes
+//  * 6. SQL 実行関数のトレース (query, exec, prepare, mysqli_query, pg_query) → SqlStatement, CRUD
+//  *
+//  * ■ 出力形式 (phpspreadsheet)
+//  *  - シート: CRUD, SQLs, Dependencies, Classes, Functions, Errors, Summary
+//  *  - 全シート: 相対パス, 行番号, 並び替え/フィルタ対応
+//  *  - Summary シート: ファイル数, クラス数, 関数数, SQL数, CRUD別件数, 依存関係数
+//  */
+
+require_once __DIR__ . '/vendor/autoload.php';
+
+use PhpParser\ParserFactory;
+use PhpParser\Node;
+use PhpParser\NodeTraverser;
+use PhpParser\NodeVisitorAbstract;
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+use PHPSQLParser\PHPSQLParser;
+
+/** ----------------------------------------
+ * 結果保管用データ構造
+ * ---------------------------------------- */
+
+// 1行1操作を表す CRUD 情報
+class CrudOperation {
+    public $filePath;       // 相対パス
+    public $functionName;   // 関数／メソッド名
+    public $operation;      // SELECT / INSERT / UPDATE / DELETE
+    public $tableName;      // 主対象テーブル
+    public $sql;            // 実際の SQL 文
+    public $lineNumber;     // 行番号
+    public $aliasInfo;      // テーブルエイリアス情報
+    public $isSubQuery;     // サブクエリ判定フラグ
+    public $callerFunction; // 呼び出し関数名（トレース）
+    public $notes;          // 定数展開やパースエラーの備考
+}
+
+// SQL 構文解析結果の詳細
+class SqlStatement {
+    public $filePath;      // 相対パス
+    public $functionName;  // 関数／メソッド名
+    public $sql;           // SQL 文
+    public $operation;     // CRUD 操作種別
+    public $mainTable;     // 主対象テーブル
+    public $tablesUsed = [];  // 使用テーブル一覧
+    public $hasSubQuery;   // サブクエリ有無
+    public $lineNumber;    // 行番号
+    public $parseSuccess;  // パース成功フラグ
+    public $errorMessage;  // エラー時メッセージ
+}
+
+// ファイル依存・遷移先情報
+class Dependency {
+    public $sourceFile;   // 元ファイル相対パス
+    public $lineNumber;   // 行番号
+    public $type;         // include, require, transition
+    public $targetPath;   // 依存先パス or URL
+    public $note;         // 備考
+}
+
+// クラス定義情報
+class ClassDef {
+    public $file;         // 相対パス
+    public $namespace;    // 名前空間
+    public $className;    // クラス名
+    public $extends;      // 継承クラス
+    public $implements = []; // 実装インターフェース
+    public $line;         // 行番号
+}
+
+// 関数／メソッド定義情報
+class FunctionDef {
+    public $file;          // 相対パス
+    public $functionName;  // 関数／メソッド名
+    public $className;     // 所属クラス名（グローバル関数は空）
+    public $arguments = []; // 引数リスト
+    public $line;          // 行番号
+}
+
+/** ----------------------------------------
+ * メイン解析クラス
+ * ---------------------------------------- */
+class Analyzer
+{
+    private $rootDir;
+    private $constantMap = [];   // define/const 定数展開マップ
+
+    // 解析結果格納配列
+    private $crudOps      = [];
+    private $sqls         = [];
+    private $dependencies = [];
+    private $classes      = [];
+    private $functions    = [];
+    private $errors       = [];
+
+    /**
+     * コンストラクタ
+     *
+     * @param string $rootDir 解析対象ディレクトリ (CLI 引数)
+     */
+    public function __construct(string $rootDir)
+    {
+        $this->rootDir = rtrim($rootDir, '/');
+    }
+
+    /**
+     * 実行エントリポイント
+     */
+    public function run(): void
+    {
+        // 1) ファイル走査
+        $this->scanDirectory($this->rootDir);
+
+        // 2) Excel 出力
+        $this->generateExcel($this->rootDir . '/analysis_results.xlsx');
+
+        echo "解析完了：analysis_results.xlsx を出力しました\n";
+    }
+
+    /**
+     * 1. 再帰的にディレクトリを探索し、対象ファイルを parseFile() に渡す
+     *
+     * @param string $dir 現在探索中ディレクトリ
+     */
+    private function scanDirectory(string $dir): void
+    {
+        $items = scandir($dir);
+        foreach ($items as $item) {
+            if ($item === '.' || $item === '..') continue;
+            $path = "$dir/$item";
+
+            if (is_dir($path)) {
+                // サブディレクトリを再帰
+                $this->scanDirectory($path);
+            }
+            elseif (preg_match('/\.(php|inc|html|js)$/i', $item)) {
+                // 相対パス算出
+                $rel = substr($path, strlen($this->rootDir) + 1);
+                $this->parseFile($path, $rel);
+            }
+        }
+    }
+
+    /**
+     * 2. 単一ファイルの解析フロー
+     *
+     * @param string $fullPath フルパス
+     * @param string $relPath  相対パス
+     */
+    private function parseFile(string $fullPath, string $relPath): void
+    {
+        // 2-1) ファイル読み込み
+        $code = file_get_contents($fullPath);
+
+        // 2-2) コメント除去
+        $clean = $this->stripComments($code);
+
+        // 2-3) define()/const 定義を収集して constantMap を構築
+        $this->collectConstants($clean);
+
+        // 2-4) AST 解析：クラス/関数/SQL トレース
+        // TODO: ParserFactory で AST 取得 → processAst() 実装
+        // $ast = (new ParserFactory())->create(ParserFactory::PREFER_PHP5)->parse($clean);
+        // $this->processAst($ast, $relPath);
+
+        // 2-5) 依存関係抽出 (include/require, form action, href, fetch, window.open)
+        // TODO: extractDependencies() 実装
+
+        // 2-6) AST外での追加 SQL 抽出 (必要に応じて)
+        // TODO: extractSqlStatements() 実装
+    }
+
+    // /**
+    //  * コメント除去 (PHPDoc, //, /* */, HTML コメント)
+    //  *
+    //  * @param string $code 元コード
+    //  * @return string コメント削除後コード
+    //  */
+    private function stripComments(string $code): string
+    {
+        $patterns = [
+            '@/\*.*?\*/@s',    // /* ... */ (複数行)
+            '@//.*?$@m',        // // コメント
+            '@<!--.*?-->@s',    // <!-- ... --> (HTML)
+        ];
+        return preg_replace($patterns, '', $code);
+    }
+
+    // /**
+    //  * define()/const によるテーブル定数定義を収集
+    //  *
+    //  * @param string $code コメント除去済みコード
+    //  */
+    private function collectConstants(string $code): void
+    {
+        // define('NAME', 'value');
+        if (preg_match_all("/define\s*\(\s*['\"](\w+)['\"]\s*,\s*['\"](\w+)['\"]\s*\)/", $code, $m)) {
+            foreach ($m[1] as $i => $name) {
+                $this->constantMap[$name] = $m[2][$i];
+            }
+        }
+        // const NAME = 'value';
+        if (preg_match_all("/const\s+(\w+)\s*=\s*['\"](\w+)['\"]\s*;/", $code, $m2)) {
+            foreach ($m2[1] as $i => $name) {
+                $this->constantMap[$name] = $m2[2][$i];
+            }
+        }
+    }
+
+    // /**
+    //  * 3. AST 走査でクラス/関数/SQL トレースを収集
+    //  *
+    //  * @param array  $ast     AST ノード配列
+    //  * @param string $relPath 相対パス
+    //  */
+    private function processAst(array $ast, string $relPath): void
+    {
+        // TODO:
+        // - Node\Stmt\Class_ → ClassDef に追加
+        // - Node\Stmt\Function_ / ClassMethod → FunctionDef に追加
+        // - Node\Expr\MethodCall / FuncCall で SQL 実行関数(query, mysqli_query, pg_query…) を検出
+        //   ・定数展開 → expandConstantsInSql()
+        //   ・PHPSQLParser で parse → SqlStatement, CrudOperation に追加
+        //   ・テーブルエイリアス解決, サブクエリ判定, callerFunction トレース
+    }
+
+    /**
+     * 4. include/require, form action, href, fetch, window.open 抽出
+     *
+     * @param string $code    コメント除去済みコード
+     * @param string $relPath 相対パス
+     */
+    private function extractDependencies(string $code, string $relPath): void
+    {
+        // TODO:
+        // - preg_match_all で include/require(_once) を検出 → type に反映, 行番号取得
+        // - preg_match_all で form action=, href=, fetch(), window.open() を検出 → type='transition'
+        // - Dependency オブジェクト作成 → $this->dependencies[] に追加
+    }
+
+    /**
+     * 5. AST外での追加 SQL 抽出 (任意)
+     *
+     * @param string $code
+     * @param string $relPath
+     */
+    private function extractSqlStatements(string $code, string $relPath): void
+    {
+        // TODO: 動的に組み立てられる SQL 等、AST で拾えないケースを補完
+    }
+
+    /**
+     * 6. Excel(.xlsx) で結果を出力
+     *
+     * @param string $outputPath 出力ファイルパス
+     */
+    private function generateExcel(string $outputPath): void
+    {
+        $ss = new Spreadsheet();
+
+        // -- CRUD シート --
+        $crudSheet = $ss->getActiveSheet();
+        $crudSheet->setTitle('CRUD');
+        $crudSheet->fromArray([[
+            'FilePath','Function','Operation','Table','SQL','Line','Alias','SubQuery','Caller','Notes'
+        ]], null,'A1');
+        // TODO: $this->crudOps をループして行追加
+
+        // -- SQLs シート --
+        $sqlSheet = $ss->createSheet();
+        $sqlSheet->setTitle('SQLs');
+        $sqlSheet->fromArray([[
+            'FilePath','Function','SQL','Operation','MainTable',
+            'TablesUsed','HasSubQuery','Line','ParseSuccess','ErrorMessage'
+        ]], null,'A1');
+        // TODO: $this->sqls をループして行追加
+
+        // -- Dependencies シート --
+        $depSheet = $ss->createSheet();
+        $depSheet->setTitle('Dependencies');
+        $depSheet->fromArray([[
+            'SourceFile','Line','Type','TargetPath','Note'
+        ]], null,'A1');
+        // TODO: $this->dependencies をループして行追加
+
+        // -- Classes シート --
+        $clsSheet = $ss->createSheet();
+        $clsSheet->setTitle('Classes');
+        $clsSheet->fromArray([[
+            'FilePath','Namespace','ClassName','Extends','Implements','Line'
+        ]], null,'A1');
+        // TODO: $this->classes をループして行追加
+
+        // -- Functions シート --
+        $fnSheet = $ss->createSheet();
+        $fnSheet->setTitle('Functions');
+        $fnSheet->fromArray([[
+            'FilePath','FunctionName','ClassName','Arguments','Line'
+        ]], null,'A1');
+        // TODO: $this->functions をループして行追加
+
+        // -- Errors シート --
+        $errSheet = $ss->createSheet();
+        $errSheet->setTitle('Errors');
+        $errSheet->fromArray([[
+            'FilePath','Line','ErrorMessage'
+        ]], null,'A1');
+        // TODO: $this->errors をループして行追加
+
+        // -- Summary シート --
+        $sumSheet = $ss->createSheet();
+        $sumSheet->setTitle('Summary');
+        // TODO:
+        //   ・ファイル数 = count of parsed files
+        //   ・クラス数 = count($this->classes)
+        //   ・関数数 = count($this->functions)
+        //   ・SQL数 = count($this->sqls)
+        //   ・CRUD別件数 = 集計(SELECT,INSERT,...)
+        //   ・依存関係数 = count($this->dependencies)
+
+        // ファイル書き込み
+        $writer = new Xlsx($ss);
+        $writer->save($outputPath);
+    }
+
+    /**
+     * SQL 内の define/const 定義を実際のテーブル名に置換
+     *
+     * @param string $sql 元 SQL
+     * @return string 定数展開後 SQL
+     */
+    private function expandConstantsInSql(string $sql): string
+    {
+        foreach ($this->constantMap as $name => $value) {
+            $sql = str_replace($name, $value, $sql);
+        }
+        return $sql;
+    }
+}
+
+// =====================================
+// CLI 実行部分
+// =====================================
+if (php_sapi_name() === 'cli') {
+    if ($argc < 2) {
+        echo "Usage: php analyzer.php /path/to/project\n";
+        exit(1);
+    }
+    $dir = $argv[1];
+    $analyzer = new Analyzer($dir);
+    $analyzer->run();
+} else {
+    echo "This script must be run from the command line.\n";
+}
