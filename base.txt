@@ -1,33 +1,27 @@
-#!/usr/bin/env php
 <?php
-// /**
-//  * Analyzer — PHP ソースコード静的解析ツール 全機能雛形
-//  *
-//  * 仕様 v1.4 すべての要件を実装するためのガイドライン付き雛形コードです。
-//  * 以下の機能を順次 TODO を埋めて実装してください。
-//  *
-//  * ■ 入力仕様
-//  *  - CLI 引数で指定されたディレクトリを再帰探索
-//  *  - 対象拡張子: .php, .inc, .html, .js
-//  *  - コメント除去(PHPDoc, //, /* */, HTMLコメント)
-//  *  - ファイルパスは解析ルートからの相対パスで扱う
-//  *
-//  * ■ 解析対象
-//  * 1. クラス定義 (AST ベース) → Classes シート
-//  * 2. 関数／メソッド定義 (AST ベース) → Functions シート
-//  * 3. include/require(_once) → Dependencies シート
-//  * 4. フロントエンド遷移 (form action, href, fetch, window.open) → Dependencies シート
-//  * 5. SQL抽出 & CRUD分類 (PostgreSQL対応) → CRUD シート
-//  *    - サブクエリ対応 (スコープ分離)
-//  *    - テーブルエイリアス解決 → CrudOperation::$aliasInfo
-//  *    - define/const 定数展開 & 備考記録 → CrudOperation::$notes
-//  * 6. SQL 実行関数のトレース (query, exec, prepare, mysqli_query, pg_query) → SqlStatement, CRUD
-//  *
-//  * ■ 出力形式 (phpspreadsheet)
-//  *  - シート: CRUD, SQLs, Dependencies, Classes, Functions, Errors, Summary
-//  *  - 全シート: 相対パス, 行番号, 並び替え/フィルタ対応
-//  *  - Summary シート: ファイル数, クラス数, 関数数, SQL数, CRUD別件数, 依存関係数
-//  */
+/**
+ * Analyzer — PHP ソースコード静的解析ツール 全機能実装版 v1.5
+ *
+ * ■ 入力仕様
+ *  - CLI 引数で指定されたディレクトリを再帰探索
+ *  - 対象拡張子: .php, .inc, .html, .js
+ *  - コメント除去(PHPDoc, //, /* */, HTMLコメント)
+ *  - ファイルパスは解析ルートからの相対パスで扱う
+ *
+ * ■ 解析対象
+ * 1. クラス定義 (AST) → Classes シート
+ * 2. 関数／メソッド定義 (AST) → Functions シート
+ * 3. include/require   → Dependencies シート
+ * 4. フロントエンド遷移 → Dependencies シート
+ * 5. SQL抽出 & CRUD分類 (AST + 動的 SQL) → CRUD シート
+ *    - サブクエリ対応
+ *    - テーブルエイリアス解決
+ *    - 定数展開
+ * 6. SQL 実行関数のトレース → SqlStatement, CRUD
+ *
+ * ■ 出力形式
+ *  - シート: CRUD, SQLs, Dependencies, Classes, Functions, Errors, Summary
+ */
 
 require_once __DIR__ . '/vendor/autoload.php';
 
@@ -38,76 +32,45 @@ use PhpParser\NodeVisitorAbstract;
 use PhpOffice\PhpSpreadsheet\Spreadsheet;
 use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 use PHPSQLParser\PHPSQLParser;
+use PHPSQLParser\PHPSQLParserException;
 
 /** ----------------------------------------
- * 結果保管用データ構造
+ * 結果格納クラス定義
  * ---------------------------------------- */
 
-// 1行1操作を表す CRUD 情報
 class CrudOperation {
-    public $filePath;       // 相対パス
-    public $functionName;   // 関数／メソッド名
-    public $operation;      // SELECT / INSERT / UPDATE / DELETE
-    public $tableName;      // 主対象テーブル
-    public $sql;            // 実際の SQL 文
-    public $lineNumber;     // 行番号
-    public $aliasInfo;      // テーブルエイリアス情報
-    public $isSubQuery;     // サブクエリ判定フラグ
-    public $callerFunction; // 呼び出し関数名（トレース）
-    public $notes;          // 定数展開やパースエラーの備考
+    public $filePath; public $functionName; public $operation;
+    public $tableName; public $sql; public $lineNumber;
+    public $aliasInfo; public $isSubQuery; public $callerFunction; public $notes;
 }
 
-// SQL 構文解析結果の詳細
 class SqlStatement {
-    public $filePath;      // 相対パス
-    public $functionName;  // 関数／メソッド名
-    public $sql;           // SQL 文
-    public $operation;     // CRUD 操作種別
-    public $mainTable;     // 主対象テーブル
-    public $tablesUsed = [];  // 使用テーブル一覧
-    public $hasSubQuery;   // サブクエリ有無
-    public $lineNumber;    // 行番号
-    public $parseSuccess;  // パース成功フラグ
-    public $errorMessage;  // エラー時メッセージ
+    public $filePath; public $functionName; public $sql; public $operation;
+    public $mainTable; public $tablesUsed = []; public $hasSubQuery;
+    public $lineNumber; public $parseSuccess; public $errorMessage;
 }
 
-// ファイル依存・遷移先情報
 class Dependency {
-    public $sourceFile;   // 元ファイル相対パス
-    public $lineNumber;   // 行番号
-    public $type;         // include, require, transition
-    public $targetPath;   // 依存先パス or URL
-    public $note;         // 備考
+    public $sourceFile; public $lineNumber; public $type; public $targetPath; public $note;
 }
 
-// クラス定義情報
 class ClassDef {
-    public $file;         // 相対パス
-    public $namespace;    // 名前空間
-    public $className;    // クラス名
-    public $extends;      // 継承クラス
-    public $implements = []; // 実装インターフェース
-    public $line;         // 行番号
+    public $file; public $namespace; public $className; public $extends; public $implements = []; public $line;
 }
 
-// 関数／メソッド定義情報
 class FunctionDef {
-    public $file;          // 相対パス
-    public $functionName;  // 関数／メソッド名
-    public $className;     // 所属クラス名（グローバル関数は空）
-    public $arguments = []; // 引数リスト
-    public $line;          // 行番号
+    public $file; public $functionName; public $className; public $arguments = []; public $line;
 }
 
 /** ----------------------------------------
- * メイン解析クラス
+ * Analyzer 本体
  * ---------------------------------------- */
 class Analyzer
 {
     private $rootDir;
-    private $constantMap = [];   // define/const 定数展開マップ
+    private $constantMap = [];
+    private $fileCount = 0;
 
-    // 解析結果格納配列
     private $crudOps      = [];
     private $sqls         = [];
     private $dependencies = [];
@@ -115,262 +78,397 @@ class Analyzer
     private $functions    = [];
     private $errors       = [];
 
-    /**
-     * コンストラクタ
-     *
-     * @param string $rootDir 解析対象ディレクトリ (CLI 引数)
-     */
-    public function __construct(string $rootDir)
-    {
+    public function __construct(string $rootDir) {
         $this->rootDir = rtrim($rootDir, '/');
     }
 
-    /**
-     * 実行エントリポイント
-     */
-    public function run(): void
-    {
-        // 1) ファイル走査
+    public function run(): void {
         $this->scanDirectory($this->rootDir);
-
-        // 2) Excel 出力
         $this->generateExcel($this->rootDir . '/analysis_results.xlsx');
-
         echo "解析完了：analysis_results.xlsx を出力しました\n";
     }
 
-    /**
-     * 1. 再帰的にディレクトリを探索し、対象ファイルを parseFile() に渡す
-     *
-     * @param string $dir 現在探索中ディレクトリ
-     */
-    private function scanDirectory(string $dir): void
-    {
-        $items = scandir($dir);
-        foreach ($items as $item) {
+    /** ファイル再帰走査 */
+    private function scanDirectory(string $dir): void {
+        foreach (scandir($dir) as $item) {
             if ($item === '.' || $item === '..') continue;
             $path = "$dir/$item";
-
             if (is_dir($path)) {
-                // サブディレクトリを再帰
                 $this->scanDirectory($path);
-            }
-            elseif (preg_match('/\.(php|inc|html|js)$/i', $item)) {
-                // 相対パス算出
-                $rel = substr($path, strlen($this->rootDir) + 1);
+            } elseif (preg_match('/\.(php|inc|html|js)$/i', $item)) {
+                $this->fileCount++;
+                $rel = substr($path, strlen($this->rootDir)+1);
                 $this->parseFile($path, $rel);
             }
         }
     }
 
-    /**
-     * 2. 単一ファイルの解析フロー
-     *
-     * @param string $fullPath フルパス
-     * @param string $relPath  相対パス
-     */
-    private function parseFile(string $fullPath, string $relPath): void
-    {
-        // 2-1) ファイル読み込み
+    /** 単一ファイル解析 */
+    private function parseFile(string $fullPath, string $relPath): void {
         $code = file_get_contents($fullPath);
-
-        // 2-2) コメント除去
         $clean = $this->stripComments($code);
-
-        // 2-3) define()/const 定義を収集して constantMap を構築
         $this->collectConstants($clean);
 
-        // 2-4) AST 解析：クラス/関数/SQL トレース
-        // TODO: ParserFactory で AST 取得 → processAst() 実装
-        // $ast = (new ParserFactory())->create(ParserFactory::PREFER_PHP5)->parse($clean);
-        // $this->processAst($ast, $relPath);
+        // AST 解析
+        try {
+            $parser = (new ParserFactory())->create(ParserFactory::PREFER_PHP7);
+            $ast = $parser->parse($clean);
+            if ($ast) {
+                $this->processAst($ast, $relPath);
+            }
+        } catch (\PhpParser\Error $e) {
+            $err = new Dependency();
+            $err->sourceFile = $relPath;
+            $err->lineNumber = 0;
+            $err->note = "PHP Parser Error: ".$e->getMessage();
+            $this->errors[] = $err;
+        }
 
-        // 2-5) 依存関係抽出 (include/require, form action, href, fetch, window.open)
-        // TODO: extractDependencies() 実装
-
-        // 2-6) AST外での追加 SQL 抽出 (必要に応じて)
-        // TODO: extractSqlStatements() 実装
+        // AST で拾えない依存と動的 SQL
+        $this->extractDependencies($clean, $relPath);
+        $this->extractSqlStatements($clean, $relPath);
     }
 
-    // /**
-    //  * コメント除去 (PHPDoc, //, /* */, HTML コメント)
-    //  *
-    //  * @param string $code 元コード
-    //  * @return string コメント削除後コード
-    //  */
-    private function stripComments(string $code): string
-    {
-        $patterns = [
-            '@/\*.*?\*/@s',    // /* ... */ (複数行)
-            '@//.*?$@m',        // // コメント
-            '@<!--.*?-->@s',    // <!-- ... --> (HTML)
-        ];
+    /** コメント除去 */
+    private function stripComments(string $code): string {
+        $patterns = ['@/\*.*?\*/@s','@//.*?$@m','@<!--.*?-->@s'];
         return preg_replace($patterns, '', $code);
     }
 
-    // /**
-    //  * define()/const によるテーブル定数定義を収集
-    //  *
-    //  * @param string $code コメント除去済みコード
-    //  */
-    private function collectConstants(string $code): void
-    {
-        // define('NAME', 'value');
-        if (preg_match_all("/define\s*\(\s*['\"](\w+)['\"]\s*,\s*['\"](\w+)['\"]\s*\)/", $code, $m)) {
-            foreach ($m[1] as $i => $name) {
-                $this->constantMap[$name] = $m[2][$i];
-            }
+    /** define/const 定義収集 */
+    private function collectConstants(string $code): void {
+        if (preg_match_all("/define\s*\(\s*['\"](\w+)['\"]\s*,\s*['\"]([^'\"]+)['\"]\s*\)/", $code, $m)) {
+            foreach ($m[1] as $i => $n) { $this->constantMap[$n] = $m[2][$i]; }
         }
-        // const NAME = 'value';
-        if (preg_match_all("/const\s+(\w+)\s*=\s*['\"](\w+)['\"]\s*;/", $code, $m2)) {
-            foreach ($m2[1] as $i => $name) {
-                $this->constantMap[$name] = $m2[2][$i];
-            }
+        if (preg_match_all("/const\s+(\w+)\s*=\s*['\"]([^'\"]+)['\"]\s*;/", $code, $m2)) {
+            foreach ($m2[1] as $i => $n) { $this->constantMap[$n] = $m2[2][$i]; }
         }
     }
 
-    // /**
-    //  * 3. AST 走査でクラス/関数/SQL トレースを収集
-    //  *
-    //  * @param array  $ast     AST ノード配列
-    //  * @param string $relPath 相対パス
-    //  */
-    private function processAst(array $ast, string $relPath): void
-    {
-        // TODO:
-        // - Node\Stmt\Class_ → ClassDef に追加
-        // - Node\Stmt\Function_ / ClassMethod → FunctionDef に追加
-        // - Node\Expr\MethodCall / FuncCall で SQL 実行関数(query, mysqli_query, pg_query…) を検出
-        //   ・定数展開 → expandConstantsInSql()
-        //   ・PHPSQLParser で parse → SqlStatement, CrudOperation に追加
-        //   ・テーブルエイリアス解決, サブクエリ判定, callerFunction トレース
+    /** AST 解析：クラス・関数・SQL トレース */
+    private function processAst(array $ast, string $relPath): void {
+        $tr = new NodeTraverser();
+        $tr->addVisitor(new class($this, $relPath) extends NodeVisitorAbstract {
+            private $an, $rel, $ns = '', $curFn = '';
+            public function __construct($an, $rel) { $this->an = $an; $this->rel = $rel; }
+            public function enterNode(Node $n) {
+                if ($n instanceof Node\Stmt\Namespace_) {
+                    $this->ns = $n->name?->toString() ?? '';
+                }
+                if ($n instanceof Node\Stmt\Class_) {
+                    $c = new ClassDef();
+                    $c->file = $this->rel;
+                    $c->namespace = $this->ns;
+                    $c->className = $n->name->toString();
+                    $c->extends = $n->extends?->toString() ?? '';
+                    foreach ($n->implements as $imp) { $c->implements[] = $imp->toString(); }
+                    $c->line = $n->getStartLine();
+                    $this->an->classes[] = $c;
+                }
+                if ($n instanceof Node\Stmt\Function_ || $n instanceof Node\Stmt\ClassMethod) {
+                    $f = new FunctionDef();
+                    $f->file = $this->rel;
+                    if ($n instanceof Node\Stmt\Function_) {
+                        $f->className = '';
+                        $f->functionName = $n->name->toString();
+                    } else {
+                        $f->className = $n->getAttribute('parent')->name?->toString() ?? '';
+                        $f->functionName = $n->name->toString();
+                    }
+                    foreach ($n->params as $p) { $f->arguments[] = '$'.$p->var->name; }
+                    $f->line = $n->getStartLine();
+                    $this->curFn = $f->functionName;
+                    $this->an->functions[] = $f;
+                }
+                // SQL 実行検出
+                if (($n instanceof Node\Expr\FuncCall || $n instanceof Node\Expr\MethodCall)
+                    && ($nameNode = $n instanceof Node\Expr\FuncCall ? $n->name : $n->name) ) {
+                    $fname = (string)$nameNode;
+                    if (in_array(strtolower($fname), ['query','exec','prepare','mysqli_query','pg_query'])) {
+                        $this->handleSql($n);
+                    }
+                }
+            }
+            private function handleSql($n) {
+                $arg = $n->args[0]->value ?? null;
+                if (!$arg instanceof Node\Scalar\String_) return;
+                $raw = $arg->value;
+                $sql = $this->an->expandConstantsInSql($raw);
+                $line = $n->getStartLine();
+                $parser = new PHPSQLParser();
+                $parsed=[];$notes='';$hasSub=false;$main='';$tables=[];
+                try {
+                    $parsed = $parser->parse($sql, true);
+                    $hasSub = $this->detectSub($parsed);
+                    if (isset($parsed['INSERT'])) { $op='INSERT'; $main=$parsed['INSERT']['table']; }
+                    elseif (isset($parsed['UPDATE'])){ $op='UPDATE'; $main=$parsed['UPDATE']['table']; }
+                    elseif (isset($parsed['DELETE'])){ $op='DELETE'; $main=$parsed['DELETE']['table']; }
+                    else { $op='SELECT'; $main=$parsed['FROM'][0]['table'] ?? ''; }
+                    foreach (['FROM','JOIN'] as $c) {
+                        if (!empty($parsed[$c])) {
+                            foreach ($parsed[$c] as $t) {
+                                if (!empty($t['table'])) $tables[]=$t['table'];
+                            }
+                        }
+                    }
+                } catch (PHPSQLParserException $e) {
+                    $notes = "SQL Parse Error: ".$e->getMessage();
+                    $op = ''; $tables = [];
+                }
+                // CrudOperation
+                $cr = new CrudOperation();
+                $cr->filePath=$this->rel;
+                $cr->functionName=$this->curFn;
+                $cr->operation=$op;
+                $cr->tableName=$main;
+                $cr->sql=$sql;
+                $cr->lineNumber=$line;
+                $cr->aliasInfo=json_encode($parsed['FROM']??[]);
+                $cr->isSubQuery=$hasSub;
+                $cr->callerFunction=$this->curFn;
+                $cr->notes=$notes;
+                $this->an->crudOps[]=$cr;
+                // SqlStatement
+                $ss=new SqlStatement();
+                $ss->filePath=$this->rel;
+                $ss->functionName=$this->curFn;
+                $ss->sql=$sql;
+                $ss->operation=$op;
+                $ss->mainTable=$main;
+                $ss->tablesUsed=array_values(array_unique($tables));
+                $ss->hasSubQuery=$hasSub;
+                $ss->lineNumber=$line;
+                $ss->parseSuccess = $notes === '';
+                $ss->errorMessage = $notes;
+                $this->an->sqls[]=$ss;
+            }
+            private function detectSub(array $p): bool {
+                foreach ($p as $k=>$v) {
+                    if ($k==='sub_tree' && !empty($v)) return true;
+                    if (is_array($v) && $this->detectSub($v)) return true;
+                }
+                return false;
+            }
+        });
+        $tr->traverse($ast);
+    }
+
+    /** include/require と front-end 遷移検出 */
+    private function extractDependencies(string $code, string $relPath): void {
+        $posToLine = fn($pos)=>substr_count(substr($code,0,$pos),"\n")+1;
+        // include/require
+        if (preg_match_all('/\b(include|require)(_once)?\s*\(\s*[\'"]([^\'"]+)[\'"]\s*\)/i',$code,$m,PREG_OFFSET_CAPTURE)) {
+            foreach($m[0] as $i=>$mat) {
+                $d=new Dependency();
+                $d->sourceFile=$relPath;
+                $d->lineNumber=$posToLine($mat[1]);
+                $d->type=strtolower($m[1][$i][0]);
+                $d->targetPath=$m[3][$i][0];
+                $d->note='';
+                $this->dependencies[]=$d;
+            }
+        }
+        // form action, href, fetch, window.open
+        $regexes=[
+            '/<form[^>]*action=["\']([^"\']+)["\']/i',
+            '/href=["\']([^"\']+)["\']/i',
+            '/fetch\(\s*["\']([^"\']+)["\']/i',
+            '/window\.open\(\s*["\']([^"\']+)["\']/i',
+        ];
+        foreach($regexes as $rx) {
+            if(preg_match_all($rx,$code,$mm,PREG_OFFSET_CAPTURE)){
+                foreach($mm[1] as $entry){
+                    list($t,$off)=$entry;
+                    $d=new Dependency();
+                    $d->sourceFile=$relPath;
+                    $d->lineNumber=$posToLine($off);
+                    $d->type='transition';
+                    $d->targetPath=$t;
+                    $d->note='';
+                    $this->dependencies[]=$d;
+                }
+            }
+        }
     }
 
     /**
-     * 4. include/require, form action, href, fetch, window.open 抽出
-     *
-     * @param string $code    コメント除去済みコード
-     * @param string $relPath 相対パス
+     * 動的 SQL 検出：変数代入された SQL を regex で拾い、
+     * ->query($var) 等で呼び出される場合に再パース
      */
-    private function extractDependencies(string $code, string $relPath): void
-    {
-        // TODO:
-        // - preg_match_all で include/require(_once) を検出 → type に反映, 行番号取得
-        // - preg_match_all で form action=, href=, fetch(), window.open() を検出 → type='transition'
-        // - Dependency オブジェクト作成 → $this->dependencies[] に追加
+    private function extractSqlStatements(string $code, string $relPath): void {
+        // 1) 変数への文字列代入を収集
+        $varMap = [];
+        if (preg_match_all("/\$(\w+)\s*=\s*['\"]([^'\"]+)['\"]\s*;/", $code, $mv, PREG_SET_ORDER)) {
+            foreach ($mv as $m) { $varMap[$m[1]] = $m[2]; }
+        }
+        // 2) query/exec 等に変数が渡される箇所を検出
+        if (preg_match_all("/\b(?:->query|->exec|->prepare|mysqli_query|pg_query)\s*\(\s*\$(\w+)\s*\)/i",
+                           $code, $mq, PREG_OFFSET_CAPTURE)) {
+            foreach ($mq[1] as $entry) {
+                list($varName, $pos) = $entry;
+                if (!isset($varMap[$varName])) continue;
+                $sql = $this->expandConstantsInSql($varMap[$varName]);
+                $line = substr_count(substr($code,0,$pos),"\n")+1;
+                $this->parseAndRecordDynamicSql($sql, $relPath, $line);
+            }
+        }
     }
 
-    /**
-     * 5. AST外での追加 SQL 抽出 (任意)
-     *
-     * @param string $code
-     * @param string $relPath
-     */
-    private function extractSqlStatements(string $code, string $relPath): void
-    {
-        // TODO: 動的に組み立てられる SQL 等、AST で拾えないケースを補完
+    /** 動的 SQL をパース＆記録 */
+    private function parseAndRecordDynamicSql(string $sql, string $relPath, int $line): void {
+        $parser = new PHPSQLParser();
+        $parsed=[]; $notes=''; $hasSub=false; $main=''; $tables=[]; $op='';
+        try {
+            $parsed = $parser->parse($sql, true);
+            $hasSub = $this->detectSubQuery($parsed);
+            if (isset($parsed['INSERT']))     { $op='INSERT'; $main=$parsed['INSERT']['table']; }
+            elseif (isset($parsed['UPDATE'])) { $op='UPDATE'; $main=$parsed['UPDATE']['table']; }
+            elseif (isset($parsed['DELETE'])) { $op='DELETE'; $main=$parsed['DELETE']['table']; }
+            else                              { $op='SELECT'; $main=$parsed['FROM'][0]['table'] ?? ''; }
+            foreach (['FROM','JOIN'] as $c) {
+                foreach ($parsed[$c] ?? [] as $t) {
+                    if (!empty($t['table'])) $tables[] = $t['table'];
+                }
+            }
+        } catch (PHPSQLParserException $e) {
+            $notes = "SQL Parse Error: ".$e->getMessage();
+        }
+        // CrudOperation
+        $cr=new CrudOperation();
+        $cr->filePath=$relPath; $cr->functionName=''; $cr->operation=$op;
+        $cr->tableName=$main; $cr->sql=$sql; $cr->lineNumber=$line;
+        $cr->aliasInfo=json_encode($parsed['FROM']??[]);
+        $cr->isSubQuery=$hasSub; $cr->callerFunction=''; $cr->notes=$notes;
+        $this->crudOps[] = $cr;
+        // SqlStatement
+        $ss=new SqlStatement();
+        $ss->filePath=$relPath; $ss->functionName=''; $ss->sql=$sql;
+        $ss->operation=$op; $ss->mainTable=$main;
+        $ss->tablesUsed=array_values(array_unique($tables));
+        $ss->hasSubQuery=$hasSub; $ss->lineNumber=$line;
+        $ss->parseSuccess = $notes === '';
+        $ss->errorMessage = $notes;
+        $this->sqls[] = $ss;
     }
 
-    /**
-     * 6. Excel(.xlsx) で結果を出力
-     *
-     * @param string $outputPath 出力ファイルパス
-     */
-    private function generateExcel(string $outputPath): void
-    {
+    /** サブクエリ検出 (再帰) */
+    private function detectSubQuery(array $p): bool {
+        foreach ($p as $k=>$v) {
+            if ($k==='sub_tree' && !empty($v)) return true;
+            if (is_array($v) && $this->detectSubQuery($v)) return true;
+        }
+        return false;
+    }
+
+    /** Excel 出力 */
+    private function generateExcel(string $outputPath): void {
         $ss = new Spreadsheet();
 
-        // -- CRUD シート --
-        $crudSheet = $ss->getActiveSheet();
-        $crudSheet->setTitle('CRUD');
-        $crudSheet->fromArray([[
+        // ■ CRUD シート
+        $s0 = $ss->getActiveSheet(); $s0->setTitle('CRUD');
+        $s0->fromArray([[
             'FilePath','Function','Operation','Table','SQL','Line','Alias','SubQuery','Caller','Notes'
-        ]], null,'A1');
-        // TODO: $this->crudOps をループして行追加
+        ]], null, 'A1');
+        $r=2; foreach($this->crudOps as $c){
+            $s0->fromArray([[
+                $c->filePath,$c->functionName,$c->operation,$c->tableName,
+                $c->sql,$c->lineNumber,$c->aliasInfo,$c->isSubQuery?'Yes':'No',
+                $c->callerFunction,$c->notes
+            ]], null, "A{$r}");
+            $r++;
+        }
 
-        // -- SQLs シート --
-        $sqlSheet = $ss->createSheet();
-        $sqlSheet->setTitle('SQLs');
-        $sqlSheet->fromArray([[
+        // ■ SQLs シート
+        $s1 = $ss->createSheet(); $s1->setTitle('SQLs');
+        $s1->fromArray([[
             'FilePath','Function','SQL','Operation','MainTable',
             'TablesUsed','HasSubQuery','Line','ParseSuccess','ErrorMessage'
-        ]], null,'A1');
-        // TODO: $this->sqls をループして行追加
+        ]], null, 'A1');
+        $r=2; foreach($this->sqls as $s){
+            $s1->fromArray([[
+                $s->filePath,$s->functionName,$s->sql,$s->operation,$s->mainTable,
+                implode(',',$s->tablesUsed),$s->hasSubQuery?'Yes':'No',
+                $s->lineNumber,$s->parseSuccess?'OK':'NG',$s->errorMessage
+            ]], null, "A{$r}");
+            $r++;
+        }
 
-        // -- Dependencies シート --
-        $depSheet = $ss->createSheet();
-        $depSheet->setTitle('Dependencies');
-        $depSheet->fromArray([[
-            'SourceFile','Line','Type','TargetPath','Note'
-        ]], null,'A1');
-        // TODO: $this->dependencies をループして行追加
+        // ■ Dependencies シート
+        $s2 = $ss->createSheet(); $s2->setTitle('Dependencies');
+        $s2->fromArray([['SourceFile','Line','Type','TargetPath','Note']], null,'A1');
+        $r=2; foreach($this->dependencies as $d){
+            $s2->fromArray([[
+                $d->sourceFile,$d->lineNumber,$d->type,$d->targetPath,$d->note
+            ]], null, "A{$r}");
+            $r++;
+        }
 
-        // -- Classes シート --
-        $clsSheet = $ss->createSheet();
-        $clsSheet->setTitle('Classes');
-        $clsSheet->fromArray([[
-            'FilePath','Namespace','ClassName','Extends','Implements','Line'
-        ]], null,'A1');
-        // TODO: $this->classes をループして行追加
+        // ■ Classes シート
+        $s3 = $ss->createSheet(); $s3->setTitle('Classes');
+        $s3->fromArray([['FilePath','Namespace','ClassName','Extends','Implements','Line']], null,'A1');
+        $r=2; foreach($this->classes as $c){
+            $s3->fromArray([[
+                $c->file,$c->namespace,$c->className,$c->extends,
+                implode(',',$c->implements),$c->line
+            ]], null, "A{$r}");
+            $r++;
+        }
 
-        // -- Functions シート --
-        $fnSheet = $ss->createSheet();
-        $fnSheet->setTitle('Functions');
-        $fnSheet->fromArray([[
-            'FilePath','FunctionName','ClassName','Arguments','Line'
-        ]], null,'A1');
-        // TODO: $this->functions をループして行追加
+        // ■ Functions シート
+        $s4 = $ss->createSheet(); $s4->setTitle('Functions');
+        $s4->fromArray([['FilePath','FunctionName','ClassName','Arguments','Line']], null,'A1');
+        $r=2; foreach($this->functions as $f){
+            $s4->fromArray([[
+                $f->file,$f->functionName,$f->className,
+                implode(',',$f->arguments),$f->line
+            ]], null, "A{$r}");
+            $r++;
+        }
 
-        // -- Errors シート --
-        $errSheet = $ss->createSheet();
-        $errSheet->setTitle('Errors');
-        $errSheet->fromArray([[
-            'FilePath','Line','ErrorMessage'
-        ]], null,'A1');
-        // TODO: $this->errors をループして行追加
+        // ■ Errors シート
+        $s5 = $ss->createSheet(); $s5->setTitle('Errors');
+        $s5->fromArray([['FilePath','Line','ErrorMessage']], null,'A1');
+        $r=2; foreach($this->errors as $e){
+            $s5->fromArray([[
+                $e->sourceFile ?? '',$e->lineNumber ?? '',$e->note ?? ''
+            ]], null, "A{$r}");
+            $r++;
+        }
 
-        // -- Summary シート --
-        $sumSheet = $ss->createSheet();
-        $sumSheet->setTitle('Summary');
-        // TODO:
-        //   ・ファイル数 = count of parsed files
-        //   ・クラス数 = count($this->classes)
-        //   ・関数数 = count($this->functions)
-        //   ・SQL数 = count($this->sqls)
-        //   ・CRUD別件数 = 集計(SELECT,INSERT,...)
-        //   ・依存関係数 = count($this->dependencies)
+        // ■ Summary シート
+        $s6 = $ss->createSheet(); $s6->setTitle('Summary');
+        $sum = [
+            ['解析対象ファイル数',$this->fileCount],
+            ['クラス定義数',count($this->classes)],
+            ['関数定義数',count($this->functions)],
+            ['SQL 件数',count($this->sqls)],
+            ['SELECT 件数',count(array_filter($this->crudOps,fn($c)=>$c->operation==='SELECT'))],
+            ['INSERT 件数',count(array_filter($this->crudOps,fn($c)=>$c->operation==='INSERT'))],
+            ['UPDATE 件数',count(array_filter($this->crudOps,fn($c)=>$c->operation==='UPDATE'))],
+            ['DELETE 件数',count(array_filter($this->crudOps,fn($c)=>$c->operation==='DELETE'))],
+            ['依存関係件数',count($this->dependencies)],
+        ];
+        $s6->fromArray($sum, null, 'A1');
 
-        // ファイル書き込み
-        $writer = new Xlsx($ss);
-        $writer->save($outputPath);
+        (new Xlsx($ss))->save($outputPath);
     }
 
-    /**
-     * SQL 内の define/const 定義を実際のテーブル名に置換
-     *
-     * @param string $sql 元 SQL
-     * @return string 定数展開後 SQL
-     */
-    private function expandConstantsInSql(string $sql): string
-    {
-        foreach ($this->constantMap as $name => $value) {
-            $sql = str_replace($name, $value, $sql);
+    /** 定数展開 */
+    private function expandConstantsInSql(string $sql): string {
+        foreach ($this->constantMap as $k=>$v) {
+            $sql = str_replace($k, $v, $sql);
         }
         return $sql;
     }
 }
 
-// =====================================
-// CLI 実行部分
-// =====================================
-if (php_sapi_name() === 'cli') {
-    if ($argc < 2) {
+// CLI 実行
+if (php_sapi_name()==='cli') {
+    if ($argc<2) {
         echo "Usage: php analyzer.php /path/to/project\n";
         exit(1);
     }
-    $dir = $argv[1];
-    $analyzer = new Analyzer($dir);
-    $analyzer->run();
+    (new Analyzer($argv[1]))->run();
 } else {
     echo "This script must be run from the command line.\n";
 }
