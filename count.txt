@@ -1,0 +1,415 @@
+#!/usr/bin/env php
+<?php
+/**
+ * 行数解析スクリプト（拡張版）
+ *
+ * 対象ファイル:
+ *   - PHP:     .php, .inc
+ *   - HTML:    .html
+ *   - JavaScript: .js
+ *
+ * 出力項目:
+ *   - 対象ファイル数
+ *   - 総行数
+ *   - コメント除去後の行数
+ *
+ * 動作環境: PHP 5.6以上
+ */
+
+// --------------------------------------
+// 0. コマンドライン引数のチェック
+// --------------------------------------
+if ($argc < 2) {
+    fwrite(STDERR, "Usage: php {$argv[0]} <file_or_directory>\n");
+    exit(1);
+}
+$path = $argv[1];
+
+// --------------------------------------
+// 1. 対象ファイル一覧を取得
+// --------------------------------------
+$files = getTargetFiles($path);
+
+// --------------------------------------
+// 2. 各ファイルの行数を集計
+// --------------------------------------
+$totalLines = 0;  // 総行数
+$codeLines  = 0;  // コメント除去後の行数
+
+foreach ($files as $file) {
+    // --- ファイル内容を読み込む ---
+    $content = file_get_contents($file);
+
+    // --- 総行数をカウント ---
+    $lines = countLines($content);
+    $totalLines += $lines;
+
+    // --- 拡張子ごとにコメント除去 ---
+    $ext = strtolower(pathinfo($file, PATHINFO_EXTENSION));
+    switch ($ext) {
+        case 'php':
+        case 'inc':
+            $cleanCode = removePhpComments($content);
+            break;
+        case 'js':
+            $cleanCode = removeJsComments($content);
+            break;
+        case 'html':
+            $cleanCode = removeHtmlComments($content);
+            break;
+        default:
+            // 想定外の拡張子は何もしない
+            $cleanCode = $content;
+    }
+
+    // --- コメント除去後の行数をカウント ---
+    $cleanLines = countLines($cleanCode);
+    $codeLines += $cleanLines;
+}
+
+// --------------------------------------
+// 3. 結果を出力
+// --------------------------------------
+echo "対象ファイル数: " . count($files) . " 個\n";
+echo "総行数: "      . $totalLines       . " 行\n";
+echo "コメント除去後の行数: " . $codeLines . " 行\n\n";
+
+// ==== 関数定義 ==== //
+
+/**
+ * 指定パスがファイルなら対象拡張子をチェック、
+ * ディレクトリなら再帰的に配下の対象拡張子ファイルを取得する
+ *
+ * @param string $path ファイルまたはディレクトリ
+ * @return string[] 対象ファイルのパス配列
+ */
+function getTargetFiles(string $path): array
+{
+    $files = [];
+
+    if (is_file($path)) {
+        // ファイルなら拡張子チェック
+        if (preg_match('/\.(php|inc|html|js)$/i', $path)) {
+            $files[] = $path;
+        }
+    } elseif (is_dir($path)) {
+        // ディレクトリなら再帰探索
+        $iterator = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($path)
+        );
+        foreach ($iterator as $fileinfo) {
+            if ($fileinfo->isFile()) {
+                $name = $fileinfo->getFilename();
+                if (preg_match('/\.(php|inc|html|js)$/i', $name)) {
+                    $files[] = $fileinfo->getPathname();
+                }
+            }
+        }
+    }
+
+    return $files;
+}
+
+/**
+ * 文字列中の行数をカウントする
+ *
+ * - 改行コード(\r\n, \r, \n)で分割
+ * - 空ファイルでも1行とみなす
+ *
+ * @param string $text
+ * @return int
+ */
+function countLines(string $text): int
+{
+    $lines = preg_split('/\r\n|\r|\n/', $text);
+    return max(1, count($lines));
+}
+
+/**
+ * PHPソースからコメントを除去する
+ *
+ * - token_get_all() を用いて //, /* */, DocComment を安全に除去
+ *
+ * @param string $code
+ * @return string
+ */
+function removePhpComments(string $code): string
+{
+    $tokens = token_get_all($code);
+    $result = '';
+
+    foreach ($tokens as $token) {
+        if (is_array($token)) {
+            // コメント系トークンはスキップ
+            if ($token[0] === T_COMMENT || $token[0] === T_DOC_COMMENT) {
+                continue;
+            }
+            // その他は元の文字列を結合
+            $result .= $token[1];
+        } else {
+            // シングルキャラクタトークン（; {} など）
+            $result .= $token;
+        }
+    }
+
+    return $result;
+}
+
+/**
+ * JavaScriptコードからコメントを除去する（正規表現版）
+ *
+ * - 複数行コメント /* ... *​/ は中の改行数を維持
+ * - 行コメント //... は行末まで削除
+ *
+ * ※ 正規表現による大まかな除去です。文字列リテラル内の // や /* には対応しません。
+ *
+ * @param string $code
+ * @return string
+ */
+function removeJsComments(string $code): string
+{
+    // 1) 複数行コメントを除去（中の改行数を同数の "\n" に置換）
+    $code = preg_replace_callback(
+        '/\/\*[\s\S]*?\*\//',
+        function ($m) {
+            // コメント内の改行数を数えて、その数だけ "\n" を返す
+            $count = substr_count($m[0], "\n");
+            return str_repeat("\n", $count);
+        },
+        $code
+    );
+
+    // 2) 行コメントを除去
+    //    行末まで (改行は残す)
+    $code = preg_replace('/\/\/[^\r\n]*(\r\n|\r|\n)/', "\n", $code);
+
+    return $code;
+}
+
+/**
+ * HTMLからコメント <!-- ... --> を除去する
+ *
+ * - 正規表現による除去。コメント内の改行は維持。
+ *
+ * @param string $code
+ * @return string
+ */
+function removeHtmlComments(string $code): string
+{
+    return preg_replace_callback(
+        '/<!--[\s\S]*?-->/', 
+        function ($m) {
+            // コメント内の改行だけを戻す
+            $count = substr_count($m[0], "\n");
+            return str_repeat("\n", $count);
+        },
+        $code
+    );
+}p#!/usr/bin/env php
+<?php
+/**
+ * 行数解析スクリプト（拡張版）
+ *
+ * 対象ファイル:
+ *   - PHP:     .php, .inc
+ *   - HTML:    .html
+ *   - JavaScript: .js
+ *
+ * 出力項目:
+ *   - 対象ファイル数
+ *   - 総行数
+ *   - コメント除去後の行数
+ *
+ * 動作環境: PHP 5.6以上
+ */
+
+// --------------------------------------
+// 0. コマンドライン引数のチェック
+// --------------------------------------
+if ($argc < 2) {
+    fwrite(STDERR, "Usage: php {$argv[0]} <file_or_directory>\n");
+    exit(1);
+}
+$path = $argv[1];
+
+// --------------------------------------
+// 1. 対象ファイル一覧を取得
+// --------------------------------------
+$files = getTargetFiles($path);
+
+// --------------------------------------
+// 2. 各ファイルの行数を集計
+// --------------------------------------
+$totalLines = 0;  // 総行数
+$codeLines  = 0;  // コメント除去後の行数
+
+foreach ($files as $file) {
+    // --- ファイル内容を読み込む ---
+    $content = file_get_contents($file);
+
+    // --- 総行数をカウント ---
+    $lines = countLines($content);
+    $totalLines += $lines;
+
+    // --- 拡張子ごとにコメント除去 ---
+    $ext = strtolower(pathinfo($file, PATHINFO_EXTENSION));
+    switch ($ext) {
+        case 'php':
+        case 'inc':
+            $cleanCode = removePhpComments($content);
+            break;
+        case 'js':
+            $cleanCode = removeJsComments($content);
+            break;
+        case 'html':
+            $cleanCode = removeHtmlComments($content);
+            break;
+        default:
+            // 想定外の拡張子は何もしない
+            $cleanCode = $content;
+    }
+
+    // --- コメント除去後の行数をカウント ---
+    $cleanLines = countLines($cleanCode);
+    $codeLines += $cleanLines;
+}
+
+// --------------------------------------
+// 3. 結果を出力
+// --------------------------------------
+echo "対象ファイル数: " . count($files) . " 個\n";
+echo "総行数: "      . $totalLines       . " 行\n";
+echo "コメント除去後の行数: " . $codeLines . " 行\n\n";
+
+// ==== 関数定義 ==== //
+
+/**
+ * 指定パスがファイルなら対象拡張子をチェック、
+ * ディレクトリなら再帰的に配下の対象拡張子ファイルを取得する
+ *
+ * @param string $path ファイルまたはディレクトリ
+ * @return string[] 対象ファイルのパス配列
+ */
+function getTargetFiles(string $path): array
+{
+    $files = [];
+
+    if (is_file($path)) {
+        // ファイルなら拡張子チェック
+        if (preg_match('/\.(php|inc|html|js)$/i', $path)) {
+            $files[] = $path;
+        }
+    } elseif (is_dir($path)) {
+        // ディレクトリなら再帰探索
+        $iterator = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($path)
+        );
+        foreach ($iterator as $fileinfo) {
+            if ($fileinfo->isFile()) {
+                $name = $fileinfo->getFilename();
+                if (preg_match('/\.(php|inc|html|js)$/i', $name)) {
+                    $files[] = $fileinfo->getPathname();
+                }
+            }
+        }
+    }
+
+    return $files;
+}
+
+/**
+ * 文字列中の行数をカウントする
+ *
+ * - 改行コード(\r\n, \r, \n)で分割
+ * - 空ファイルでも1行とみなす
+ *
+ * @param string $text
+ * @return int
+ */
+function countLines(string $text): int
+{
+    $lines = preg_split('/\r\n|\r|\n/', $text);
+    return max(1, count($lines));
+}
+
+/**
+ * PHPソースからコメントを除去する
+ *
+ * - token_get_all() を用いて //, /* */, DocComment を安全に除去
+ *
+ * @param string $code
+ * @return string
+ */
+function removePhpComments(string $code): string
+{
+    $tokens = token_get_all($code);
+    $result = '';
+
+    foreach ($tokens as $token) {
+        if (is_array($token)) {
+            // コメント系トークンはスキップ
+            if ($token[0] === T_COMMENT || $token[0] === T_DOC_COMMENT) {
+                continue;
+            }
+            // その他は元の文字列を結合
+            $result .= $token[1];
+        } else {
+            // シングルキャラクタトークン（; {} など）
+            $result .= $token;
+        }
+    }
+
+    return $result;
+}
+
+/**
+ * JavaScriptコードからコメントを除去する（正規表現版）
+ *
+ * - 複数行コメント /* ... *​/ は中の改行数を維持
+ * - 行コメント //... は行末まで削除
+ *
+ * ※ 正規表現による大まかな除去です。文字列リテラル内の // や /* には対応しません。
+ *
+ * @param string $code
+ * @return string
+ */
+function removeJsComments(string $code): string
+{
+    // 1) 複数行コメントを除去（中の改行数を同数の "\n" に置換）
+    $code = preg_replace_callback(
+        '/\/\*[\s\S]*?\*\//',
+        function ($m) {
+            // コメント内の改行数を数えて、その数だけ "\n" を返す
+            $count = substr_count($m[0], "\n");
+            return str_repeat("\n", $count);
+        },
+        $code
+    );
+
+    // 2) 行コメントを除去
+    //    行末まで (改行は残す)
+    $code = preg_replace('/\/\/[^\r\n]*(\r\n|\r|\n)/', "\n", $code);
+
+    return $code;
+}
+
+/**
+ * HTMLからコメント <!-- ... --> を除去する
+ *
+ * - 正規表現による除去。コメント内の改行は維持。
+ *
+ * @param string $code
+ * @return string
+ */
+function removeHtmlComments(string $code): string
+{
+    return preg_replace_callback(
+        '/<!--[\s\S]*?-->/', 
+        function ($m) {
+            // コメント内の改行だけを戻す
+            $count = substr_count($m[0], "\n");
+            return str_repeat("\n", $count);
+        },
+        $code
+    );
+}
