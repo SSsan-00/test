@@ -1,7 +1,6 @@
 <?php
 /**
- * 完全版：PHP ソースコード解析ツール
- * 機能：ファイル走査 / コメント除去 / 定数展開 / SQL解析 / 関数解析 / include解析 / フロントアクセス / ストアド検出 / ログ出力 / Excel出力
+ * 完全版：PHP ソースコード解析ツール（メモリ最適化）
  * 対象：PHP5.6, PostgreSQL
  */
 
@@ -9,23 +8,14 @@ require_once __DIR__ . '/vendor/autoload.php';
 use PhpOffice\PhpSpreadsheet\Spreadsheet;
 use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 
-// 初期化
 $targetDir = $argv[1] ?? exit("Usage: php analyzer.php [target_directory]\n");
 if (!is_dir($targetDir)) exit("Invalid directory\n");
 $extensions = ['php', 'inc', 'html', 'js'];
 $log = [];
-
-function read_files($root, $exts) {
-    $res = [];
-    $it = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($root));
-    foreach ($it as $f) {
-        if ($f->isFile() && in_array(strtolower($f->getExtension()), $exts)) {
-            $p = ltrim(str_replace(realpath($root), '', realpath($f->getPathname())), '/\\');
-            $res[$p] = file_get_contents($f->getPathname());
-        }
-    }
-    return $res;
-}
+$results = [
+    'FileCRUD' => [], 'FuncCRUD' => [], 'FuncList' => [], 'Includes' => [],
+    'Frontend' => [], 'Procedures' => [], 'Logs' => []
+];
 
 function strip_comments($c, $e) {
     if (in_array($e, ['php','inc'])) {
@@ -65,11 +55,7 @@ function unify_sql_strings($code) {
 }
 
 function extract_sql($code) {
-    $sqls = [];
-    if (preg_match_all('/\b(WITH\s+.*?SELECT|SELECT|INSERT\s+INTO|UPDATE|DELETE\s+FROM)\b.*?;/is', $code, $m)) {
-        $sqls = $m[0];
-    }
-    return $sqls;
+    return preg_match_all('/\b(WITH\s+.*?SELECT|SELECT|INSERT\s+INTO|UPDATE|DELETE\s+FROM)\b.*?;/is', $code, $m) ? $m[0] : [];
 }
 
 function extract_crud($sqls) {
@@ -89,12 +75,7 @@ function extract_crud($sqls) {
 }
 
 function extract_functions($code) {
-    if (preg_match_all('/function\s+(\w+)\s*\([^)]*\)\s*\{(.*?)\}/is', $code, $m, PREG_SET_ORDER)) {
-        $fns = [];
-        foreach ($m as $fn) $fns[$fn[1]] = $fn[2];
-        return $fns;
-    }
-    return [];
+    return preg_match_all('/function\s+(\w+)\s*\([^)]*\)\s*\{(.*?)\}/is', $code, $m, PREG_SET_ORDER) ? array_column($m, 2, 1) : [];
 }
 
 function extract_includes($code, &$log, $file) {
@@ -130,55 +111,48 @@ function extract_procedures($sqls) {
     return array_unique($res);
 }
 
-// ----------------------- 実行本体 -------------------------
-$files = read_files($targetDir, $extensions);
-$results = [
-    'FileCRUD' => [], 'FuncCRUD' => [], 'FuncList' => [], 'Includes' => [],
-    'Frontend' => [], 'Procedures' => [], 'Logs' => []
-];
+function analyze_directory($root, $exts, &$results, &$log) {
+    $it = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($root));
+    foreach ($it as $f) {
+        if (!$f->isFile()) continue;
+        $ext = strtolower($f->getExtension());
+        if (!in_array($ext, $exts)) continue;
 
-foreach ($files as $file => $code) {
-    $ext = strtolower(pathinfo($file, PATHINFO_EXTENSION));
-    $code = strip_comments($code, $ext);
-    $defs = extract_defines($code, $results['Logs'], $file);
-    $code = apply_defines($code, $defs);
-    $code = unify_sql_strings($code);
+        $path = ltrim(str_replace(realpath($root), '', realpath($f->getPathname())), '/\');
+        $raw = file_get_contents($f->getPathname());
+        $code = strip_comments($raw, $ext);
+        $defs = extract_defines($code, $log, $path);
+        $code = apply_defines($code, $defs);
+        $code = unify_sql_strings($code);
 
-    // File-CRUD
-    $sqls = extract_sql($code);
-    $results['FileCRUD'][$file] = extract_crud($sqls);
+        $sqls = extract_sql($code);
+        $results['FileCRUD'][$path] = extract_crud($sqls);
 
-    // Function-CRUD + 関数一覧
-    foreach (extract_functions($code) as $fname => $body) {
-        $crud = extract_crud(extract_sql($body));
-        $results['FuncCRUD'][$fname . '@' . $file] = array_reduce($crud, function($a,$b){
-            foreach($b as $k=>$v){ if($v==='○')$a[$k]='○'; }
-            return $a;
-        }, ['C'=>'','R'=>'','U'=>'','D'=>'']);
-        $results['FuncList'][$file][$fname] = $results['FuncCRUD'][$fname . '@' . $file];
+        foreach (extract_functions($code) as $fname => $body) {
+            $crud = extract_crud(extract_sql($body));
+            $results['FuncCRUD'][$fname . '@' . $path] = array_reduce($crud, function($a,$b){
+                foreach($b as $k=>$v){ if($v==='○')$a[$k]='○'; }
+                return $a;
+            }, ['C'=>'','R'=>'','U'=>'','D'=>'']);
+            $results['FuncList'][$path][$fname] = $results['FuncCRUD'][$fname . '@' . $path];
+        }
+
+        $results['Includes'][$path] = extract_includes($code, $log, $path);
+        $results['Frontend'][$path] = extract_frontend($code);
+        $procs = extract_procedures($sqls);
+        if ($procs) $results['Procedures'][$path] = $procs;
     }
-
-    // Includes
-    $results['Includes'][$file] = extract_includes($code, $results['Logs'], $file);
-
-    // Frontend
-    $results['Frontend'][$file] = extract_frontend($code);
-
-    // Procedures
-    $procs = extract_procedures($sqls);
-    if ($procs) $results['Procedures'][$file] = $procs;
 }
 
-// ------------------- Excel 出力 --------------------
+analyze_directory($targetDir, $extensions, $results, $log);
+$results['Logs'] = $log;
+
 $sheet = new Spreadsheet();
 $sheet->removeSheetByIndex(0);
-
 function add_sheet($book, $title, $rows) {
     $s = $book->createSheet(); $s->setTitle($title);
     $r=1; foreach ($rows as $row) $s->fromArray($row, null, "A".$r++);
 }
-
-// 1. File-CRUD
 $rows = [];
 foreach ($results['FileCRUD'] as $f => $tables) {
     $rows[] = ["[{$f}]"]; $rows[] = ['テーブル','C','R','U','D'];
@@ -186,13 +160,9 @@ foreach ($results['FileCRUD'] as $f => $tables) {
     $rows[] = [''];
 }
 add_sheet($sheet, 'File-CRUD', $rows);
-
-// 2. Function-CRUD
 $rows = [['関数（定義元）','C','R','U','D']];
 foreach ($results['FuncCRUD'] as $k => $v) $rows[] = array_merge([$k], array_values($v));
 add_sheet($sheet, 'Function-CRUD', $rows);
-
-// 3. File-Functions
 $rows = [];
 foreach ($results['FuncList'] as $f => $list) {
     $rows[] = ["[{$f}]"]; $rows[] = ['関数名','C','R','U','D'];
@@ -200,21 +170,15 @@ foreach ($results['FuncList'] as $f => $list) {
     $rows[] = [''];
 }
 add_sheet($sheet, 'File-Functions', $rows);
-
-// 4. Include-Relations
 $rows = [['ファイル名','include1','include2','...']];
 foreach ($results['Includes'] as $f => $incs) $rows[] = array_merge([$f], $incs);
 add_sheet($sheet, 'Include-Relations', $rows);
-
-// 5. Frontend-Access
 $rows = [['項目'] + array_keys($results['Frontend'])];
 foreach (['action','location.href','window.open','XMLHttpRequest'] as $k) {
     $row = [$k]; foreach ($results['Frontend'] as $v) $row[] = $v[$k];
     $rows[] = $row;
 }
 add_sheet($sheet, 'Frontend-Access', $rows);
-
-// 6. Stored-Procedures
 $rows = [];
 foreach ($results['Procedures'] as $f => $ps) {
     $rows[] = ["[{$f}]"]; $rows[] = ['プロシージャ名','C','R','U','D'];
@@ -222,12 +186,9 @@ foreach ($results['Procedures'] as $f => $ps) {
     $rows[] = [''];
 }
 add_sheet($sheet, 'Stored-Procedures', $rows);
-
-// 7. Log
 $rows = [['ファイル名','処理種別','内容']];
 foreach ($results['Logs'] as $e) $rows[] = $e;
 add_sheet($sheet, 'Log', $rows);
-
 $writer = new Xlsx($sheet);
 $writer->save('analysis_result.xlsx');
 echo "Excel出力完了: analysis_result.xlsx\n";
