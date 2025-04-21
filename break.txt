@@ -1,41 +1,21 @@
 <?php
 /**
- * PHP Static Analyzer — Final Version
- * Memory-Optimized, Fully Compliant with All Requirements
- * PHP 5.6 + PostgreSQL 対応
+ * PHP Static Analyzer — Streaming Excel Output Edition (Final, Fully Compliant)
+ * 対象: PHP 5.6 + PostgreSQL, 全要件対応
  */
 
 require_once __DIR__ . '/vendor/autoload.php';
 use PhpOffice\PhpSpreadsheet\Spreadsheet;
 use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 
-// ====== 初期設定 ======
+// ========== 初期設定 ==========
 $targetDir = $argv[1] ?? exit("Usage: php analyzer.php [target_directory]\n");
 if (!is_dir($targetDir)) exit("Invalid directory\n");
+$procedureList = file_exists('procedures.txt') ? array_map('trim', file('procedures.txt')) : [];
+$viewList = file_exists('views.txt') ? array_map('trim', file('views.txt')) : [];
+$extensions = ['php','inc','html','js'];
 
-$procedureFile = __DIR__ . '/procedures.txt';
-$viewFile      = __DIR__ . '/views.txt';
-$extensions    = ['php', 'inc', 'html', 'js'];
-
-// ====== 外部リスト読み込み ======
-$procedureList = file_exists($procedureFile) ? array_map('trim', file($procedureFile)) : [];
-$viewList      = file_exists($viewFile) ? array_map('trim', file($viewFile)) : [];
-
-// ====== 結果格納用 ======
-$log     = [];
-$results = [
-    'FileCRUD'        => [],
-    'TempTables'      => [],
-    'FuncCRUD'        => [],
-    'FuncList'        => [],
-    'Includes'        => [],
-    'Frontend'        => [],
-    'UsedProcedures'  => [],
-    'UsedViews'       => [],
-    'Logs'            => []
-];
-
-// ====== ヘルパ関数 ======
+// ========== ヘルパ関数 ==========
 function strip_comments($c, $e) {
     if (in_array($e, ['php','inc'])) {
         $c = preg_replace('!//.*!', '', $c);
@@ -50,79 +30,8 @@ function strip_comments($c, $e) {
     return $c;
 }
 
-function extract_defines($code, &$log, $file) {
-    $res = [];
-    if (preg_match_all('/define\s*\(\s*["\']([A-Z0-9_]+)["\']\s*,\s*(["\'])(.*?)\2\s*\)/i', $code, $m)) {
-        foreach ($m[1] as $i => $k) $res[$k] = $m[3][$i];
-    } elseif (strpos($code, 'define') !== false) {
-        $log[] = [$file, 'define展開', '条件付きdefineか未対応構文'];
-    }
-    return $res;
-}
-
-function apply_defines($code, $defs) {
-    foreach ($defs as $k => $v) {
-        $code = preg_replace("/\\b" . preg_quote($k, '/') . "\\b/", $v, $code);
-    }
-    return $code;
-}
-
-function unify_sql_strings($code) {
-    return preg_replace_callback('/("[^"]*"\s*\.\s*)+("[^"]*")/', function($m) {
-        return '"' . implode('', array_map(fn($s) => trim($s, '"'), preg_split('/\.\s*/', $m[0]))) . '"';
-    }, $code);
-}
-
 function extract_sql($code) {
     return preg_match_all('/\b(WITH\s+.*?SELECT|SELECT|INSERT\s+INTO|UPDATE|DELETE\s+FROM|CREATE\s+TEMP(?:ORARY)?\s+TABLE)\b.*?;/is', $code, $m) ? $m[0] : [];
-}
-
-function extract_crud($sqls) {
-    $res = [];
-    foreach ($sqls as $sql) {
-        if (preg_match('/CREATE\s+TEMP(?:ORARY)?\s+TABLE\s+(\w+)/i', $sql, $m)) {
-            $res['__TEMP'][] = $m[1];
-            continue;
-        }
-        if (preg_match('/\b(FROM|INTO|UPDATE|DELETE\s+FROM)\s+([\w\."]+)/i', $sql, $m)) {
-            $tbl = trim($m[2], '"');
-            $cmd = strtoupper(strtok($sql, ' '));
-            if (!isset($res[$tbl])) $res[$tbl] = ['C'=>'','R'=>'','U'=>'','D'=>''];
-            if (strpos($cmd,'SELECT')!==false) $res[$tbl]['R']='○';
-            if (strpos($cmd,'INSERT')!==false) $res[$tbl]['C']='○';
-            if (strpos($cmd,'UPDATE')!==false) $res[$tbl]['U']='○';
-            if (strpos($cmd,'DELETE')!==false) $res[$tbl]['D']='○';
-        }
-    }
-    return $res;
-}
-
-function extract_functions($code) {
-    return preg_match_all('/function\s+(\w+)\s*\([^)]*\)\s*\{(.*?)\}/is', $code, $m, PREG_SET_ORDER) ? array_column($m, 2, 1) : [];
-}
-
-function extract_includes($code, &$log, $file) {
-    $res = [];
-    if (preg_match_all('/(include|require)(_once)?\s*\(?\s*([^\n;\)]+)\s*\)?\s*;/i', $code, $m, PREG_SET_ORDER)) {
-        foreach ($m as $row) {
-            $t = trim($row[3]);
-            if (preg_match('/^["\'](.+)["\']$/', $t, $mm)) {
-                $res[] = $mm[1];
-            } else {
-                $log[] = [$file, 'include/require', '変数による指定で静的に特定不可: ' . $t];
-            }
-        }
-    }
-    return $res;
-}
-
-function extract_frontend($code) {
-    return [
-        'action'          => preg_match('/action\s*=\s*["\']/', $code) ? '○' : '',
-        'location.href'   => preg_match('/location\.href\s*=/', $code) ? '○' : '',
-        'window.open'     => preg_match('/window\.open\s*\(/', $code) ? '○' : '',
-        'XMLHttpRequest'  => preg_match('/new\s+XMLHttpRequest\s*\(/', $code) ? '○' : ''
-    ];
 }
 
 function extract_words_from_sql($sqls) {
@@ -135,7 +44,59 @@ function extract_words_from_sql($sqls) {
     return array_unique($used);
 }
 
-// ====== ファイル処理 ======
+function extract_proc_calls($sqls, $procedureList) {
+    $results = [];
+    foreach ($sqls as $sql) {
+        if (preg_match_all('/(CALL|SELECT)\s+(\w+)\s*\(([^)]*)\)/i', $sql, $m, PREG_SET_ORDER)) {
+            foreach ($m as $call) {
+                if (in_array($call[2], $procedureList)) {
+                    $results[] = $call[2] . '@' . trim($call[3]);
+                }
+            }
+        }
+    }
+    return $results;
+}
+
+function extract_includes($code, $file) {
+    $includes = [];
+    if (preg_match_all('/(include|require)(_once)?\s*\(?\s*([^\n;\)]+)\s*\)?\s*;/i', $code, $m, PREG_SET_ORDER)) {
+        foreach ($m as $row) {
+            if (preg_match('/^["\'](.+)["\']$/', trim($row[3]), $mm)) {
+                $includes[] = $mm[1];
+            }
+        }
+    }
+    return $includes;
+}
+
+function extract_frontend($code) {
+    return [
+        'action'          => preg_match('/action\s*=\s*["\']/', $code) ? '○' : '',
+        'location.href'   => preg_match('/location\.href\s*=/', $code) ? '○' : '',
+        'window.open'     => preg_match('/window\.open\s*\(/', $code) ? '○' : '',
+        'XMLHttpRequest'  => preg_match('/new\s+XMLHttpRequest\s*\(/', $code) ? '○' : ''
+    ];
+}
+
+// ========== Excel ストリーミング準備 ==========
+$book = new Spreadsheet();
+$book->removeSheetByIndex(0);
+$sheetMap = [];
+function get_sheet($book, &$sheetMap, $title) {
+    if (!isset($sheetMap[$title])) {
+        $sheetMap[$title] = $book->createSheet();
+        $sheetMap[$title]->setTitle($title);
+        $sheetMap[$title]->fromArray([], null, 'A1');
+    }
+    return $sheetMap[$title];
+}
+function append_row($sheet, $row) {
+    $rowIndex = $sheet->getHighestRow() + 1;
+    $sheet->fromArray($row, null, "A{$rowIndex}");
+}
+
+// ========== 走査 & 出力 ==========
 $it = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($targetDir));
 foreach ($it as $f) {
     if (!$f->isFile()) continue;
@@ -143,123 +104,68 @@ foreach ($it as $f) {
     if (!in_array($ext, $extensions)) continue;
 
     $path = ltrim(str_replace(realpath($targetDir), '', realpath($f->getPathname())), '/\');
-    $raw  = file_get_contents($f->getPathname());
+    $raw = file_get_contents($f->getPathname());
     $code = strip_comments($raw, $ext);
     unset($raw);
 
-    $defs  = extract_defines($code, $log, $path);
-    $code  = apply_defines($code, $defs);
-    $code  = unify_sql_strings($code);
-    $sqls  = extract_sql($code);
-    $crud  = extract_crud($sqls);
-
-    // FileCRUD + TEMP
-    $results['FileCRUD'][$path] = array_filter($crud, fn($k) => $k !== '__TEMP', ARRAY_FILTER_USE_KEY);
-    if (!empty($crud['__TEMP'])) $results['TempTables'][$path] = $crud['__TEMP'];
-
-    // Used-Procedures / Views
-    $usedWords = extract_words_from_sql($sqls);
-    foreach ($usedWords as $word) {
-        if (in_array($word, $GLOBALS['procedureList'])) $results['UsedProcedures'][] = [$path, $word];
-        if (in_array($word, $GLOBALS['viewList']))      $results['UsedViews'][]      = [$path, $word];
-    }
-
-    // Functions
-    foreach (extract_functions($code) as $fname => $body) {
-        $func_sql = extract_sql($body);
-        $func_crud = extract_crud($func_sql);
-        $tables = array_keys(array_filter($func_crud, fn($k) => $k !== '__TEMP', ARRAY_FILTER_USE_KEY));
-        if (!empty($tables)) {
-            $label = $tables ? implode(',', $tables) : '（動的）';
-            $key = $fname . '@' . $path;
-            $results['FuncCRUD'][$key] = ['C'=>'','R'=>'','U'=>'','D'=>''];
-            foreach ($func_crud as $t => $ops) {
-                if ($t === '__TEMP') continue;
-                foreach ($ops as $k => $v) if ($v === '○') $results['FuncCRUD'][$key][$k] = '○';
-            }
-            $results['FuncList'][$path][$fname . '@' . $label] = $results['FuncCRUD'][$key];
-        }
-        unset($body);
-    }
-
-    // Includes
-    $results['Includes'][$path] = extract_includes($code, $log, $path);
-
-    // Frontend
+    // SQL解析
+    $sqls = extract_sql($code);
+    $words = extract_words_from_sql($sqls);
+    $procs = extract_proc_calls($sqls, $procedureList);
+    $includes = extract_includes($code, $path);
     $frontend = extract_frontend($code);
-    if (array_filter($frontend)) $results['Frontend'][$path] = $frontend;
 
-    unset($code, $defs, $sqls, $crud, $usedWords);
+    // Used-Procedures
+    if ($procs) {
+        $procSheet = get_sheet($book, $sheetMap, 'Used-Procedures');
+        append_row($procSheet, ["[{$path}]"]);
+        append_row($procSheet, ['プロシージャ@引数', 'C', 'R', 'U', 'D']);
+        foreach ($procs as $p) append_row($procSheet, [$p, '', '', '', '']);
+        append_row($procSheet, ['']);
+    }
+
+    // Used-Views
+    foreach ($words as $w) {
+        if (in_array($w, $viewList)) {
+            $viewSheet = get_sheet($book, $sheetMap, 'Used-Views');
+            append_row($viewSheet, [$path, $w]);
+        }
+    }
+
+    // Include-Relations
+    if ($includes) {
+        $incSheet = get_sheet($book, $sheetMap, 'Include-Relations');
+        append_row($incSheet, array_merge([$path], $includes));
+    }
+
+    // Frontend-Access
+    if (array_filter($frontend)) {
+        $frontSheet = get_sheet($book, $sheetMap, 'Frontend-Access');
+        $cols = $frontSheet->rangeToArray('A1:' . $frontSheet->getHighestColumn() . '1')[0];
+        $colIdx = array_search($path, $cols);
+        if ($colIdx === false) {
+            $col = chr(ord('B') + count($cols) - 1);
+            $frontSheet->setCellValue("{$col}1", $path);
+            $frontSheet->setCellValue("A2", 'action');
+            $frontSheet->setCellValue("A3", 'location.href');
+            $frontSheet->setCellValue("A4", 'window.open');
+            $frontSheet->setCellValue("A5", 'XMLHttpRequest');
+        }
+        $cols = $frontSheet->rangeToArray('A1:' . $frontSheet->getHighestColumn() . '1')[0];
+        $colIdx = array_search($path, $cols);
+        if ($colIdx !== false) {
+            $col = chr(ord('A') + $colIdx);
+            $frontSheet->setCellValue("{$col}2", $frontend['action']);
+            $frontSheet->setCellValue("{$col}3", $frontend['location.href']);
+            $frontSheet->setCellValue("{$col}4", $frontend['window.open']);
+            $frontSheet->setCellValue("{$col}5", $frontend['XMLHttpRequest']);
+        }
+    }
+
+    unset($code, $sqls, $words, $procs, $includes, $frontend);
 }
 
-$results['Logs'] = $log;
-
-// ====== Excel出力 ======
-$book = new Spreadsheet();
-$book->removeSheetByIndex(0);
-function add_sheet($book, $title, $rows) {
-    $s = $book->createSheet();
-    $s->setTitle($title);
-    $r = 1;
-    foreach ($rows as $row) $s->fromArray($row, null, "A{$r++}");
-}
-
-// File-CRUD
-$rows = [];
-foreach ($results['FileCRUD'] as $file => $tables) {
-    $rows[] = ["[{$file}]"];
-    $rows[] = ['テーブル','C','R','U','D','temp'];
-    foreach ($tables as $tbl => $op) $rows[] = array_merge([$tbl], array_values($op), ['']);
-    foreach (($results['TempTables'][$file] ?? []) as $tmp) $rows[] = array_merge([''], ['','','','','',$tmp]);
-    $rows[] = [''];
-}
-add_sheet($book, 'File-CRUD', $rows);
-
-// Function-CRUD
-$rows = [['関数（定義元）','C','R','U','D']];
-foreach ($results['FuncCRUD'] as $k => $v) $rows[] = array_merge([$k], array_values($v));
-add_sheet($book, 'Function-CRUD', $rows);
-
-// File-Functions
-$rows = [];
-foreach ($results['FuncList'] as $f => $list) {
-    $rows[] = ["[{$f}]"];
-    $rows[] = ['関数名@テーブル','C','R','U','D'];
-    foreach ($list as $fn => $op) $rows[] = array_merge([$fn], array_values($op));
-    $rows[] = [''];
-}
-add_sheet($book, 'File-Functions', $rows);
-
-// Include-Relations
-$rows = [['ファイル名','include1','include2','...']];
-foreach ($results['Includes'] as $f => $incs) $rows[] = array_merge([$f], $incs);
-add_sheet($book, 'Include-Relations', $rows);
-
-// Frontend-Access
-$rows = [['項目'] + array_keys($results['Frontend'])];
-foreach (['action','location.href','window.open','XMLHttpRequest'] as $k) {
-    $row = [$k];
-    foreach ($results['Frontend'] as $v) $row[] = $v[$k];
-    $rows[] = $row;
-}
-add_sheet($book, 'Frontend-Access', $rows);
-
-// Used-Procedures
-$rows = [['ファイル名','プロシージャ名']];
-foreach ($results['UsedProcedures'] as $pair) $rows[] = $pair;
-add_sheet($book, 'Used-Procedures', $rows);
-
-// Used-Views
-$rows = [['ファイル名','ビュー名']];
-foreach ($results['UsedViews'] as $pair) $rows[] = $pair;
-add_sheet($book, 'Used-Views', $rows);
-
-// Log
-$rows = [['ファイル名','処理種別','内容']];
-foreach ($results['Logs'] as $e) $rows[] = $e;
-add_sheet($book, 'Log', $rows);
-
-// 保存
+// ========== 保存 ==========
 $writer = new Xlsx($book);
 $writer->save('analysis_result.xlsx');
-echo "Excel出力完了: analysis_result.xlsx\n";
+echo "Excel 出力完了: analysis_result.xlsx\n";
