@@ -1,0 +1,27 @@
+<?php
+require_once __DIR__ . '/lib/AppConfig.php';
+require_once __DIR__ . '/lib/QueryEngine.php';
+
+use Lib\AppConfig;
+use Lib\QueryEngine;
+
+$dbh = pg_connect("host=localhost dbname=complex user=postgres password=secret");
+
+// 条件で定数を切り替え（例: テストモードか本番か）
+$env = getenv('APP_ENV') ?: 'production';
+AppConfig::setEnvironment($env); // この処理で定数が変化
+
+// SQL構築実行
+$engine = new QueryEngine();
+
+$status = 'active';
+$limit = 30;
+
+$sql = $engine->generateUserQuery($status, $limit);
+pg_query($dbh, $sql);
+
+// ビュー利用
+$engine->queryFromView($dbh);
+
+// ストアドプロシージャ呼び出し
+$engine->callStoredProcedure($dbh);
