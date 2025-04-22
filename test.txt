@@ -1,1 +1,27 @@
-Hello World!!!!
+<?php
+
+// SQLの直接代入（SELECT）
+$sql1 = "SELECT * FROM users WHERE id = 1";
+
+// SQLの直接代入（INSERT）
+$sql2 = "INSERT INTO logs (message, created_at) VALUES ('Logged', NOW())";
+
+// SQLの直接代入（UPDATE）
+$sql3 = "UPDATE posts SET title = 'New Title' WHERE id = 10";
+
+// SQLの直接代入（DELETE）
+$sql4 = "DELETE FROM temp_data WHERE expired = true";
+
+// コメントなど混在
+/*
+$sql5 = "SELECT * FROM hidden"; // コメントアウトされてる
+*/
+
+// 無関係な文字列
+$other = "This is not SQL";
+
+// 別変数で保持
+$tbl = "admins";
+$sql6 = "SELECT * FROM $tbl"; // このような変数展開は未対応（将来対応）
+
+?>
