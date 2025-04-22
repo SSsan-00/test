@@ -75,9 +75,7 @@ class Preprocessor
                 if (isset($args[0], $args[1])
                     && $args[0]->value instanceof Node\Scalar\String_
                     && $args[1]->value instanceof Node\Scalar\String_) {
-                    $name = $args[0]->value->value;
-                    $val  = $args[1]->value->value;
-                    $this->consts[$name] = $val;
+                    $this->consts[$args[0]->value->value] = $args[1]->value->value;
                 }
             }
         }
@@ -117,7 +115,6 @@ class FunctionAnalyzer
 
     public function __construct()
     {
-        // 最新サポートバージョンのパーサを生成
         $this->parser = (new ParserFactory())->createForNewestSupportedVersion();
     }
 
@@ -126,12 +123,12 @@ class FunctionAnalyzer
      */
     public function analyzeAll(array $fileCodeMap): void
     {
-        // 1) 関数定義収集
+        // 関数定義収集
         foreach ($fileCodeMap as $file => $code) {
             $ast = $this->parser->parse($code);
             $this->functions[$file] = $this->collectFunctions($ast);
         }
-        // 2) 呼び出し収集
+        // 呼び出し収集
         foreach ($fileCodeMap as $file => $code) {
             $ast = $this->parser->parse($code);
             $calls = $this->collectCalls($ast);
@@ -186,7 +183,7 @@ class FunctionAnalyzer
 }
 
 //--------------------------------------------------
-// SQLExtractor: PHPSQLParser を用いた SQL 抽出と CRUD 判定
+// SQLExtractor: PHPSQLParser + .=複数行対応
 //--------------------------------------------------
 class SQLExtractor
 {
@@ -197,12 +194,8 @@ class SQLExtractor
     public function __construct()
     {
         $this->parser = new PHPSQLParser();
-        $this->views = file_exists('views_list.txt')
-            ? array_map('trim', file('views_list.txt'))
-            : [];
-        $this->procs = file_exists('procs_list.txt')
-            ? array_map('trim', file('procs_list.txt'))
-            : [];
+        $this->views  = file_exists('views_list.txt')  ? array_map('trim', file('views_list.txt'))  : [];
+        $this->procs  = file_exists('procs_list.txt')  ? array_map('trim', file('procs_list.txt'))  : [];
     }
 
     /**
@@ -214,7 +207,33 @@ class SQLExtractor
         $results = [];
         $logs    = [];
 
-        $stmts = preg_split('/;\\s*/', $code);
+        // --- 1) .= による複数行文字列結合を再構築 ---
+        $lines   = explode("\n", $code);
+        $sqlVars = [];
+        foreach ($lines as $line) {
+            // 初期代入: $sql = "..."
+            if (preg_match('/\$(\w+)\s*=\s*["\']([^"\']*)["\']/', $line, $m)) {
+                $sqlVars[$m[1]] = $m[2];
+            }
+            // 連結代入: $sql .= "..."
+            elseif (preg_match('/\$(\w+)\s*\.=\s*["\']([^"\']*)["\']/', $line, $m)) {
+                $sqlVars[$m[1]] = ($sqlVars[$m[1]] ?? '') . $m[2];
+            }
+        }
+        // 再構築したSQLを解析
+        foreach ($sqlVars as $sql) {
+            try {
+                $ast = $this->parser->parse($sql, true);
+            } catch (PHPSQLParserException $e) {
+                continue;
+            }
+            foreach ($ast as $entry) {
+                $this->analyzeEntry($entry, $results);
+            }
+        }
+
+        // --- 2) インラインSQLステートメント解析 ---
+        $stmts = preg_split('/;\s*/', $code);
         foreach ($stmts as $stmt) {
             $stmt = trim($stmt);
             if ($stmt === '') continue;
@@ -228,6 +247,7 @@ class SQLExtractor
             }
         }
 
+        // --- 3) 条件分岐ログ ---
         if (preg_match_all('/\b(if|switch)\s*\((.*?)\)/i', $code, $m)) {
             foreach ($m[0] as $cond) {
                 $logs[] = ['cond' => $cond];
@@ -240,17 +260,26 @@ class SQLExtractor
     private function analyzeEntry(array $entry, array &$out)
     {
         $type = strtoupper(
-            $entry['INSERT']   ? 'INSERT' :
+            $entry['INSERT'] ? 'INSERT' :
             ($entry['UPDATE'] ? 'UPDATE' :
             ($entry['DELETE'] ? 'DELETE' :
             ($entry['CREATE'] ? 'CREATE' : 'SELECT')))
         );
 
         // CREATE TEMP TABLE
-        if ($type === 'CREATE' && !empty($entry['CREATE']['temporary'])
-            && stripos($entry['CREATE']['temporary'], 'TEMP') !== false) {
+        if ($type === 'CREATE'
+            && !empty($entry['CREATE']['temporary'])
+            && stripos($entry['CREATE']['temporary'], 'TEMP') !== false
+        ) {
             $tbl = $entry['CREATE']['table'];
-            $out[] = ['table'=> $tbl,'C'=>false,'R'=>false,'U'=>false,'D'=>false,'TEMP'=>$tbl];
+            $out[] = [
+                'table'=> $tbl,
+                'C'    => false,
+                'R'    => false,
+                'U'    => false,
+                'D'    => false,
+                'TEMP' => $tbl
+            ];
             return;
         }
 
@@ -273,14 +302,18 @@ class SQLExtractor
         }
 
         foreach (array_unique($tables) as $tbl) {
-            $clean = strtolower($tbl);
+            $clean  = strtolower($tbl);
             $isView = in_array($clean, array_map('strtolower', $this->views), true);
             $isProc = in_array($clean, array_map('strtolower', $this->procs), true);
 
             $out[] = [
-                'table' => $tbl . ($isView?'@view':''),
-                'C'     => in_array($type,['INSERT','CREATE'],true),
-                'R'     => $type==='SELECT' || $type==='UPDATE' || $type==='DELETE' || !empty($entry['JOIN']) || !empty($entry['WITH']),
+                'table' => $tbl . ($isView ? '@view' : ''),
+                'C'     => in_array($type, ['INSERT', 'CREATE'], true),
+                'R'     => $type==='SELECT'
+                          || $type==='UPDATE'
+                          || $type==='DELETE'
+                          || !empty($entry['JOIN'])
+                          || !empty($entry['WITH']),
                 'U'     => $type==='UPDATE',
                 'D'     => $type==='DELETE',
                 'TEMP'  => ''
@@ -303,28 +336,33 @@ class CRUDAggregator
 
     /**
      * @param array<string,array<array{table:string,C:bool,R:bool,U:bool,D:bool,TEMP:string}>> $fileSqlMap
-     * @return array<string,array<string,array{C:bool,R:bool,U:bool,D:bool,TEMP:string}>>
+     * @return array<string,array<string,array{C:bool,R:bool,U:bool,D:bool,TEMP:string}>> 
      */
     public function aggregate(array $fileSqlMap): array
     {
         $crudMap = [];
+
         // 直接集約
         foreach ($fileSqlMap as $file => $entries) {
             foreach ($entries as $e) {
                 $tbl = $e['table'];
                 $this->initTable($crudMap[$file], $tbl);
                 foreach (['C','R','U','D'] as $op) {
-                    $crudMap[$file][$tbl][$op] ||= $e[$op];
+                    // PHP7互換の OR 代入
+                    $crudMap[$file][$tbl][$op] = 
+                        $crudMap[$file][$tbl][$op] || $e[$op];
                 }
                 if ($e['TEMP']) {
                     $crudMap[$file][$tbl]['TEMP'] = $e['TEMP'];
                 }
             }
         }
-        // 伝播
+
+        // コールグラフ伝播
         foreach (array_keys($crudMap) as $file) {
             $this->propagate($file, $crudMap, []);
         }
+
         return $crudMap;
     }
 
@@ -332,12 +370,14 @@ class CRUDAggregator
     {
         if (isset($visited[$file])) return;
         $visited[$file] = true;
+
         foreach (($this->callGraph[$file] ?? []) as $callee => $_) {
             $this->propagate($callee, $map, $visited);
             foreach ($map[$callee] ?? [] as $tbl => $ops) {
                 $this->initTable($map[$file], $tbl);
                 foreach (['C','R','U','D'] as $op) {
-                    $map[$file][$tbl][$op] ||= $ops[$op];
+                    $map[$file][$tbl][$op] = 
+                        $map[$file][$tbl][$op] || $ops[$op];
                 }
                 if ($ops['TEMP']) {
                     $map[$file][$tbl]['TEMP'] = $ops['TEMP'];
@@ -372,10 +412,10 @@ class ExcelExporter
             $row++;
             foreach ($tables as $tbl => $ops) {
                 $ws->setCellValue("A{$row}", $tbl);
-                $ws->setCellValue("B{$row}", $ops['C']?'○':'');
-                $ws->setCellValue("C{$row}", $ops['R']?'○':'');
-                $ws->setCellValue("D{$row}", $ops['U']?'○':'');
-                $ws->setCellValue("E{$row}", $ops['D']?'○':'');
+                $ws->setCellValue("B{$row}", $ops['C'] ? '○' : '');
+                $ws->setCellValue("C{$row}", $ops['R'] ? '○' : '');
+                $ws->setCellValue("D{$row}", $ops['U'] ? '○' : '');
+                $ws->setCellValue("E{$row}", $ops['D'] ? '○' : '');
                 $ws->setCellValue("F{$row}", $ops['TEMP']);
                 $row++;
             }
@@ -406,8 +446,8 @@ function main(array $argv): void
         exit(1);
     }
 
-    // ファイル収集
-    $rii = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($projectDir));
+    // 再帰的に解析対象ファイルを収集
+    $rii   = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($projectDir));
     $files = [];
     foreach ($rii as $file) {
         if ($file->isFile() && preg_match('/\.(php|inc|html|js)$/i', $file->getFilename())) {
@@ -416,7 +456,7 @@ function main(array $argv): void
     }
 
     // 前処理
-    $pre = new Preprocessor();
+    $pre     = new Preprocessor();
     $cleaned = [];
     foreach ($files as $path) {
         $cleaned[$path] = $pre->process(file_get_contents($path));
@@ -427,17 +467,17 @@ function main(array $argv): void
     $funcAnalyzer->analyzeAll($cleaned);
 
     // SQL 抽出
-    $sqlExt = new SQLExtractor();
+    $sqlExt     = new SQLExtractor();
     $fileSqlMap = [];
-    $logs = [];
+    $logs       = [];
     foreach ($cleaned as $path => $code) {
         [$fileSqlMap[$path], $fileLogs] = $sqlExt->extractFromCode($code);
-        $logs = array_merge($logs, $fileLogs);
+        $logs       = array_merge($logs, $fileLogs);
     }
 
     // CRUD 集約・伝播
     $aggregator = new CRUDAggregator($funcAnalyzer->getCallGraph());
-    $crudMap = $aggregator->aggregate($fileSqlMap);
+    $crudMap    = $aggregator->aggregate($fileSqlMap);
 
     // Excel 出力
     $exporter = new ExcelExporter();
