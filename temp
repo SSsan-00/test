@@ -1,0 +1,459 @@
+#!/usr/bin/env php
+<?php
+/**
+ * Analyzer — PHP ソースコード静的解析ツール
+ *
+ * 仕様 v1.0 に従い、以下を行います：
+ *  1. 指定ディレクトリ配下の .php/.inc/.html/.js ファイルを再帰探索
+ *  2. コメント除去（PHP, HTML, JS）
+ *  3. include/require 依存解析
+ *  4. SQL 文抽出＆CRUD分類（SELECT, INSERT, UPDATE, DELETE）
+ *  5. フロントエンド通信依存（form, fetch, XMLHttpRequest）
+ *  6. 行数集計（全行数・コメント除去後行数）
+ *  7. ビュー／ストアドプロシージャ利用検出（views.txt, procedures.txt）
+ *  8. Excel（.xlsx）への出力
+ *  9. Graphviz DOT ファイルによる依存関係可視化
+ *
+ * 使い方:
+ *   php analyzer.php /path/to/project
+ */
+
+//--------------------------------------------------
+// 依存ライブラリの読み込み (Composer)
+//--------------------------------------------------
+require_once __DIR__ . '/vendor/autoload.php';
+
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+
+//--------------------------------------------------
+// 定数・設定
+//--------------------------------------------------
+define('SUPPORTED_EXTS', ['php','inc','html','js']);
+define('VIEW_LIST_FILE', 'views.txt');           // プロジェクトルートに置かれたビュー名リスト
+define('PROC_LIST_FILE', 'procedures.txt');      // プロジェクトルートに置かれたプロシージャ名リスト
+
+//--------------------------------------------------
+// エントリポイント
+//--------------------------------------------------
+function main(array $argv)
+{
+    if (count($argv) < 2) {
+        fwrite(STDERR, "Usage: php analyzer.php /path/to/project\n");
+        exit(1);
+    }
+
+    // 解析対象のルートディレクトリ
+    $rootDir = rtrim($argv[1], DIRECTORY_SEPARATOR);
+    if (!is_dir($rootDir)) {
+        fwrite(STDERR, "Error: ディレクトリが見つかりません: {$rootDir}\n");
+        exit(1);
+    }
+
+    // プロジェクトルート配下の全ファイルパスを取得
+    $allFiles = getAllFiles($rootDir);
+
+    // ビュー・プロシージャリストを読み込み
+    $views      = loadNameList($rootDir . DIRECTORY_SEPARATOR . VIEW_LIST_FILE);
+    $procs      = loadNameList($rootDir . DIRECTORY_SEPARATOR . PROC_LIST_FILE);
+
+    // 各シート用データを格納
+    $fileCrud      = [];
+    $includeEdges  = [];
+    $externalReqs  = [];
+    $locStats      = [];
+    $usedViews     = [];
+    $usedProcs     = [];
+
+    // 定義定数置換用マップ
+    $globalConsts  = [];
+
+    // まず全ファイルをスキャンして define() を収集
+    foreach ($allFiles as $file) {
+        $ext = strtolower(pathinfo($file, PATHINFO_EXTENSION));
+        if (!in_array($ext, SUPPORTED_EXTS, true)) {
+            continue;
+        }
+        $code = file_get_contents($file);
+        $defs = parseDefines($code);
+        $globalConsts = array_merge($globalConsts, $defs);
+    }
+
+    // 各ファイルを解析
+    foreach ($allFiles as $file) {
+        $ext = strtolower(pathinfo($file, PATHINFO_EXTENSION));
+        if (!in_array($ext, SUPPORTED_EXTS, true)) {
+            continue;
+        }
+        // プロジェクトルートからの相対パス
+        $relPath = substr($file, strlen($rootDir) + 1);
+
+        $rawCode = file_get_contents($file);
+        $totalLines = count(explode("\n", $rawCode));
+
+        // コメント除去
+        $cleanCode = removeComments($rawCode, $ext);
+        // 空行を除いて実行行数を算出
+        $codeLines = array_filter(
+            explode("\n", $cleanCode),
+            fn($line) => trim($line) !== ''
+        );
+        $execLines = count($codeLines);
+
+        // 依存関係解析
+        $incs = parseIncludes($cleanCode, $file, $allFiles, $rootDir);
+        foreach ($incs as $to) {
+            $includeEdges[] = ['from' => $relPath, 'to' => $to];
+        }
+
+        // SQL 抽出 & CRUD 分類
+        $sqlEntries = extractSQLs($cleanCode, $globalConsts);
+        foreach ($sqlEntries as $entry) {
+            foreach ($entry['tables'] as $tbl) {
+                $fileCrud[] = [
+                    'file'  => $relPath,
+                    'table' => $tbl,
+                    'C'     => $entry['type'] === 'INSERT' ? '○' : '',
+                    'R'     => $entry['type'] === 'SELECT' ? '○' : '',
+                    'U'     => $entry['type'] === 'UPDATE' ? '○' : '',
+                    'D'     => $entry['type'] === 'DELETE' ? '○' : '',
+                    'temp'  => '',
+                ];
+            }
+        }
+
+        // 外部リクエスト解析
+        $reqs = extractExternalRequests($cleanCode);
+        foreach ($reqs as $r) {
+            $externalReqs[] = array_merge(['from' => $relPath], $r);
+        }
+
+        // ビュー利用解析
+        $vUsed = extractUsedNames($cleanCode, $views);
+        foreach ($vUsed as $v) {
+            $usedViews[] = ['file' => $relPath, 'view' => $v];
+        }
+
+        // プロシージャ利用解析
+        $pUsed = extractUsedProcedures($cleanCode, $procs);
+        foreach ($pUsed as $p) {
+            $usedProcs[] = array_merge(['file' => $relPath], $p);
+        }
+
+        // 行数統計
+        $locStats[] = [
+            'file'        => $relPath,
+            'extension'   => $ext,
+            'totalLines'  => $totalLines,
+            'codeLines'   => $execLines,
+        ];
+    }
+
+    // Excel 出力
+    exportToExcel($fileCrud, $includeEdges, $usedProcs, $usedViews, $externalReqs, $locStats);
+
+    // Graphviz DOT ファイル出力
+    exportDotFile($includeEdges, 'include_graph.dot');
+
+    echo "解析が完了しました。\n";
+    echo " - Excel: analysis_result.xlsx\n";
+    echo " - Graphviz DOT: include_graph.dot\n";
+}
+
+//--------------------------------------------------
+// ディレクトリ再帰探索 (.php/.inc/.html/.js を収集)
+//--------------------------------------------------
+function getAllFiles(string $dir): array
+{
+    $rii = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($dir));
+    $files = [];
+    foreach ($rii as $file) {
+        if ($file->isDir()) {
+            continue;
+        }
+        $ext = strtolower(pathinfo($file->getPathname(), PATHINFO_EXTENSION));
+        if (in_array($ext, SUPPORTED_EXTS, true)) {
+            $files[] = $file->getPathname();
+        }
+    }
+    return $files;
+}
+
+//--------------------------------------------------
+// define('CONST', 'value') を解析
+//--------------------------------------------------
+function parseDefines(string $code): array
+{
+    $defines = [];
+    if (preg_match_all("/define\s*\(\s*['\"](\w+)['\"]\s*,\s*['\"]([^'\"]+)['\"]\s*\)/i", $code, $m)) {
+        foreach ($m[1] as $i => $name) {
+            $defines[$name] = $m[2][$i];
+        }
+    }
+    return $defines;
+}
+
+//--------------------------------------------------
+// コメント除去
+//--------------------------------------------------
+function removeComments(string $code, string $ext): string
+{
+    // PHP/INC
+    if (in_array($ext, ['php','inc'], true)) {
+        // PHPDoc, multi-line, //, # コメントを削除
+        $code = preg_replace('!/\*.*?\*/!s', '', $code);
+        $code = preg_replace('/\/\/.*$/m', '', $code);
+        $code = preg_replace('/\#.*$/m', '', $code);
+        return $code;
+    }
+
+    // HTML
+    if ($ext === 'html') {
+        return preg_replace('/<!--.*?-->/s', '', $code);
+    }
+
+    // JS
+    if ($ext === 'js') {
+        $code = preg_replace('!/\*.*?\*/!s', '', $code);
+        $code = preg_replace('/\/\/.*$/m', '', $code);
+        return $code;
+    }
+
+    return $code;
+}
+
+//--------------------------------------------------
+// include/require 依存解析
+//--------------------------------------------------
+function parseIncludes(string $code, string $currentFile, array $allFiles, string $rootDir): array
+{
+    $edges = [];
+    $dir = dirname($currentFile);
+
+    // include/require 文を検出
+    if (preg_match_all(
+        '/\b(include|require)(_once)?\s*\(?\s*[\'"]([^\'"]+)[\'"]\s*\)?\s*;/i',
+        $code, $m
+    )) {
+        foreach ($m[3] as $path) {
+            // 相対パス解決
+            $abs = realpath($dir . DIRECTORY_SEPARATOR . $path);
+            if ($abs && in_array($abs, $allFiles, true)) {
+                $edges[] = substr($abs, strlen($rootDir) + 1);
+            }
+        }
+    }
+    return $edges;
+}
+
+//--------------------------------------------------
+// SQL 抽出 & CRUD分類
+//--------------------------------------------------
+function extractSQLs(string $code, array $consts): array
+{
+    $results = [];
+
+    // SQL 文単位でマッチ (セミコロンまで)
+    if (preg_match_all('/\b(select|insert|update|delete)\b[\s\S]+?;/i', $code, $m, PREG_SET_ORDER)) {
+        foreach ($m as $row) {
+            $type = strtoupper($row[1]);
+            // 生 SQL テキストを連結式解決
+            $sqlText = resolveConcatenation($row[0], $consts);
+
+            // テーブル名抽出 (FROM, INTO, JOIN)
+            $tables = [];
+            if (preg_match_all('/\bfrom\s+([a-zA-Z0-9_]+)/i', $sqlText, $m2)) {
+                $tables = array_merge($tables, $m2[1]);
+            }
+            if (preg_match_all('/\binto\s+([a-zA-Z0-9_]+)/i', $sqlText, $m3)) {
+                $tables = array_merge($tables, $m3[1]);
+            }
+            if (preg_match_all('/\bjoin\s+([a-zA-Z0-9_]+)/i', $sqlText, $m4)) {
+                $tables = array_merge($tables, $m4[1]);
+            }
+            $tables = array_unique($tables);
+
+            $results[] = [
+                'type'   => $type,
+                'sql'    => $sqlText,
+                'tables' => $tables,
+            ];
+        }
+    }
+
+    return $results;
+}
+
+//--------------------------------------------------
+// 連結演算子 (., .=) を再帰的に解決
+//--------------------------------------------------
+function resolveConcatenation(string $expr, array $consts): string
+{
+    // "foo".CONST.'bar' などを分割
+    $parts = preg_split('/\.(?=(?:[^\'"]|\'[^\']*\'|"[^"]*")*$)/', $expr);
+    $out = '';
+
+    foreach ($parts as $part) {
+        $part = trim($part);
+        // 文字列リテラル
+        if (preg_match('/^["\'](.*)["\']$/s', $part, $m)) {
+            $out .= $m[1];
+        }
+        // 定数
+        elseif (isset($consts[$part])) {
+            $out .= $consts[$part];
+        }
+        // それ以外はそのまま (簡易対応)
+        else {
+            $out .= $part;
+        }
+    }
+    return $out;
+}
+
+//--------------------------------------------------
+// 外部リクエスト解析 (form, fetch, XMLHttpRequest.open)
+// 戻り値: [ ['to'=>URL, 'method'=>METHOD], ... ]
+//--------------------------------------------------
+function extractExternalRequests(string $code): array
+{
+    $res = [];
+
+    // form action
+    if (preg_match_all('/<form[^>]*action=["\']([^"\']+)["\'][^>]*method=["\']?(\w+)["\']?/i', $code, $m, PREG_SET_ORDER)) {
+        foreach ($m as $row) {
+            $res[] = ['to' => $row[1], 'method' => strtoupper($row[2] ?: 'GET')];
+        }
+    }
+
+    // fetch()
+    if (preg_match_all('/fetch\(\s*[\'"]([^\'"]+)[\'"]\s*(?:,\s*{[^}]*method\s*:\s*[\'"]?(\w+)[\'"]?[^}]*})?\s*\)/i', $code, $m, PREG_SET_ORDER)) {
+        foreach ($m as $row) {
+            $res[] = ['to' => $row[1], 'method' => strtoupper($row[2] ?: 'GET')];
+        }
+    }
+
+    // XMLHttpRequest.open(method, url)
+    if (preg_match_all('/\.open\(\s*[\'"](GET|POST|PUT|DELETE)[\'"]\s*,\s*[\'"]([^\'"]+)[\'"]/', $code, $m, PREG_SET_ORDER)) {
+        foreach ($m as $row) {
+            $res[] = ['to' => $row[2], 'method' => strtoupper($row[1])];
+        }
+    }
+
+    return $res;
+}
+
+//--------------------------------------------------
+// ビュー or プロシージャ名リストから利用検出
+//--------------------------------------------------
+function extractUsedNames(string $code, array $names): array
+{
+    $found = [];
+    foreach ($names as $name) {
+        if (preg_match('/\b'.preg_quote($name, '/').'\b/i', $code)) {
+            $found[] = $name;
+        }
+    }
+    return $found;
+}
+
+//--------------------------------------------------
+// ストアドプロシージャ呼び出し解析
+// 戻り値: [ ['procedure'=>名前, 'args'=>文字列, 'C'=>'','R'=>'',...], ... ]
+//--------------------------------------------------
+function extractUsedProcedures(string $code, array $procs): array
+{
+    $out = [];
+    $pattern = '/\b(' . implode('|', array_map('preg_quote', $procs)) . ')\s*\(([^)]*)\)/i';
+    if (preg_match_all($pattern, $code, $m, PREG_SET_ORDER)) {
+        foreach ($m as $row) {
+            $out[] = [
+                'procedure' => $row[1],
+                'args'      => trim($row[2]),
+                'C'         => '',
+                'R'         => '',
+                'U'         => '',
+                'D'         => '',
+            ];
+        }
+    }
+    return $out;
+}
+
+//--------------------------------------------------
+// Excel 出力
+//--------------------------------------------------
+function exportToExcel(
+    array $fileCrud,
+    array $includeEdges,
+    array $usedProcs,
+    array $usedViews,
+    array $externalReqs,
+    array $locStats
+) {
+    $spreadsheet = new Spreadsheet();
+
+    // 1. File-CRUD シート
+    $sheet = $spreadsheet->getActiveSheet();
+    $sheet->setTitle('File-CRUD');
+    $sheet->fromArray(
+        ['file','table','C','R','U','D','temp'],
+        null, 'A1'
+    );
+    $sheet->fromArray($fileCrud, null, 'A2');
+
+    // 2. Include-Graph
+    $sheet = $spreadsheet->createSheet();
+    $sheet->setTitle('Include-Graph');
+    $sheet->fromArray(['from','to'], null, 'A1');
+    $sheet->fromArray($includeEdges, null, 'A2');
+
+    // 3. Used-Procedures
+    $sheet = $spreadsheet->createSheet();
+    $sheet->setTitle('Used-Procedures');
+    $sheet->fromArray(['file','procedure','args','C','R','U','D'], null, 'A1');
+    $sheet->fromArray($usedProcs, null, 'A2');
+
+    // 4. Used-Views
+    $sheet = $spreadsheet->createSheet();
+    $sheet->setTitle('Used-Views');
+    $sheet->fromArray(['file','view'], null, 'A1');
+    $sheet->fromArray($usedViews, null, 'A2');
+
+    // 5. External-Requests
+    $sheet = $spreadsheet->createSheet();
+    $sheet->setTitle('External-Requests');
+    $sheet->fromArray(['from','to','method'], null, 'A1');
+    $sheet->fromArray($externalReqs, null, 'A2');
+
+    // 6. LOC-Stats
+    $sheet = $spreadsheet->createSheet();
+    $sheet->setTitle('LOC-Stats');
+    $sheet->fromArray(['file','extension','totalLines','codeLines'], null, 'A1');
+    $sheet->fromArray($locStats, null, 'A2');
+
+    // 保存
+    $writer = new Xlsx($spreadsheet);
+    $writer->save('analysis_result.xlsx');
+}
+
+//--------------------------------------------------
+// Graphviz DOT ファイル生成
+//--------------------------------------------------
+function exportDotFile(array $edges, string $outPath)
+{
+    $lines = ["digraph IncludeGraph {"];
+
+    foreach ($edges as $e) {
+        // ノード名に安全な引用符を付与
+        $from = addslashes($e['from']);
+        $to   = addslashes($e['to']);
+        $lines[] = "    \"{$from}\" -> \"{$to}\";";
+    }
+
+    $lines[] = "}";
+    file_put_contents($outPath, implode("\n", $lines));
+}
+
+// エントリポイント実行
+main($argv);
