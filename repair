@@ -6,100 +6,229 @@ use PhpParser\ParserFactory;
 use PhpParser\Node;
 use PhpParser\NodeTraverser;
 use PhpParser\NodeVisitorAbstract;
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 use PHPSQLParser\PHPSQLParser;
 
-class FileCRUDVisitor extends NodeVisitorAbstract {
-    private $file;
-    private $results = [];
+// ストアド・ビューリスト読み込み
+function loadList($filename): array {
+    $list = [];
+    if (file_exists($filename)) {
+        foreach (file($filename, FILE_IGNORE_NEW_LINES) as $line) {
+            $line = trim($line);
+            if ($line !== '') $list[] = $line;
+        }
+    }
+    return $list;
+}
 
-    public function __construct($file) {
-        $this->file = $file;
+$viewList = loadList("views.txt");
+$procList = loadList("procedures.txt");
+
+// ソースコード取得 + 定数定義
+$definedConsts = [];
+$collected = [];           // File-CRUD用
+$viewEntries = [];         // Viewsシート用
+$procEntries = [];         // StoredProceduresシート用
+
+function extractSqlFromAssigns($stmts, $file): array {
+    global $definedConsts;
+    $results = [];
+
+    foreach ($stmts as $stmt) {
+        if ($stmt instanceof Node\Stmt\Const_) {
+            foreach ($stmt->consts as $const) {
+                $definedConsts[$const->name->toString()] = $const->value->value ?? '';
+            }
+        }
+
+        if ($stmt instanceof Node\Stmt\Function_ || $stmt instanceof Node\Stmt\ClassMethod) {
+            $results = array_merge($results, extractSqlFromAssigns($stmt->stmts ?? [], $file));
+        }
+
+        if ($stmt instanceof Node\Stmt\Expression && $stmt->expr instanceof Node\Expr\Assign) {
+            $var = $stmt->expr->var;
+            $expr = $stmt->expr->expr;
+
+            // 文字列連結含む代入式を解決
+            if ($expr instanceof Node\Scalar\String_) {
+                $sql = $expr->value;
+            } elseif ($expr instanceof Node\Expr\BinaryOp\Concat) {
+                $sql = resolveConcat($expr);
+            } else {
+                continue;
+            }
+
+            $sql = normalizeQuotes($sql);
+
+            if (preg_match('/\b(SELECT|INSERT|UPDATE|DELETE|CREATE\s+TEMP)\b/i', $sql)) {
+                $results[] = ['sql' => $sql, 'file' => $file];
+            }
+        }
+
+        if ($stmt instanceof Node\Stmt\If_
+            || $stmt instanceof Node\Stmt\While_
+            || $stmt instanceof Node\Stmt\Foreach_
+            || $stmt instanceof Node\Stmt\For_
+            || $stmt instanceof Node\Stmt\TryCatch
+            || $stmt instanceof Node\Stmt\Switch_) {
+            $inner = [];
+            foreach ($stmt->getSubNodeNames() as $name) {
+                if (is_array($stmt->$name)) {
+                    foreach ($stmt->$name as $sub) {
+                        if ($sub instanceof Node\Stmt) {
+                            $inner[] = $sub;
+                        }
+                    }
+                }
+            }
+            $results = array_merge($results, extractSqlFromAssigns($inner, $file));
+        }
     }
 
-    public function enterNode(Node $node) {
-        if ($node instanceof Node\Expr\Assign && $node->expr instanceof Node\Scalar\String_) {
-            // 全角クォートを半角に直す（‘ → '）
-            $sql = str_replace(['‘', '’', '“', '”'], ["'", "'", '"', '"'], $node->expr->value);
+    return $results;
+}
 
-            if (preg_match('/\b(SELECT|INSERT|UPDATE|DELETE)\b/i', $sql)) {
-                $parser = new PHPSQLParser();
-                try {
-                    $parsed = $parser->parse($sql, true);
-                } catch (Exception $e) {
-                    return;
-                }
+function resolveConcat($expr): string {
+    if ($expr instanceof Node\Expr\BinaryOp\Concat) {
+        return resolveConcat($expr->left) . resolveConcat($expr->right);
+    } elseif ($expr instanceof Node\Scalar\String_) {
+        return $expr->value;
+    } elseif ($expr instanceof Node\Expr\ConstFetch) {
+        $name = $expr->name->toString();
+        global $definedConsts;
+        return $definedConsts[$name] ?? '';
+    } else {
+        return '';
+    }
+}
 
-                $crudType = '';
-                $tables = [];
+function normalizeQuotes($s) {
+    return str_replace(['‘', '’', '“', '”'], ["'", "'", '"', '"'], $s);
+}
 
-                if (isset($parsed['INSERT'])) {
-                    $crudType = 'C';
-                    // 【ここを修正】INTOがあればINTOを見る、なければINSERTを見る
-                    if (!empty($parsed['INTO'])) {
-                        $tables = $parsed['INTO'];
-                    } else {
-                        $tables = $parsed['INSERT'];
-                    }
-                } elseif (isset($parsed['SELECT'])) {
-                    $crudType = 'R';
-                    $tables = $parsed['FROM'] ?? [];
-                } elseif (isset($parsed['UPDATE'])) {
-                    $crudType = 'U';
-                    $tables = $parsed['UPDATE'] ?? [];
-                } elseif (isset($parsed['DELETE'])) {
-                    $crudType = 'D';
-                    $tables = $parsed['FROM'] ?? [];
-                }
+// 解析ディレクトリ走査
+$dir = $argv[1] ?? getcwd();
+$rii = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($dir));
 
-                foreach ($tables as $entry) {
-                    if (!is_array($entry)) continue;
-                    $tableName = $entry['table'] ?? null;
-                    if ($tableName) {
-                        $this->results[] = [
-                            'file' => $this->file,
-                            'table' => $tableName,
-                            'C' => $crudType === 'C' ? '○' : '',
-                            'R' => $crudType === 'R' ? '○' : '',
-                            'U' => $crudType === 'U' ? '○' : '',
-                            'D' => $crudType === 'D' ? '○' : '',
-                        ];
-                    }
+foreach ($rii as $fileinfo) {
+    if (!$fileinfo->isFile()) continue;
+    $ext = strtolower($fileinfo->getExtension());
+    if (!in_array($ext, ['php', 'inc'])) continue;
+
+    $code = file_get_contents($fileinfo->getPathname());
+    $parser = (new ParserFactory)->createForNewestSupportedVersion();
+    try {
+        $ast = $parser->parse($code);
+    } catch (Exception $e) {
+        continue;
+    }
+
+    $relPath = ltrim(str_replace(realpath($dir), '', realpath($fileinfo->getPathname())), '/');
+    $sqls = extractSqlFromAssigns($ast, $relPath);
+
+    foreach ($sqls as $entry) {
+        $parser = new PHPSQLParser();
+        try {
+            $parsed = $parser->parse($entry['sql'], true);
+        } catch (Exception $e) {
+            continue;
+        }
+
+        $crud = ['C'=>'','R'=>'','U'=>'','D'=>'','TEMP'=>''];
+        $tables = [];
+
+        if (preg_match('/CREATE\s+TEMP\s+TABLE\s+(\w+)/i', $entry['sql'], $m)) {
+            $crud['TEMP'] = $m[1];
+            $tables[] = $m[1];
+        } elseif (isset($parsed['INSERT'])) {
+            $crud['C'] = '○';
+            $tables = $parsed['INTO'] ?? $parsed['INSERT'];
+        } elseif (isset($parsed['SELECT'])) {
+            $crud['R'] = '○';
+            $tables = $parsed['FROM'] ?? [];
+        } elseif (isset($parsed['UPDATE'])) {
+            $crud['U'] = '○';
+            $tables = $parsed['UPDATE'] ?? [];
+        } elseif (isset($parsed['DELETE'])) {
+            $crud['D'] = '○';
+            $tables = $parsed['FROM'] ?? [];
+        }
+
+        foreach ($tables as $t) {
+            $tbl = is_array($t) ? ($t['table'] ?? '') : $t;
+            if ($tbl === '') continue;
+
+            $row = [
+                'file' => $entry['file'],
+                'table' => $tbl,
+                'C' => $crud['C'], 'R' => $crud['R'],
+                'U' => $crud['U'], 'D' => $crud['D'],
+                'TEMP' => $crud['TEMP'] === $tbl ? $tbl : ''
+            ];
+            $collected[] = $row;
+
+            // ビュー
+            if (in_array(strtolower($tbl), array_map('strtolower', $GLOBALS['viewList']))) {
+                $viewEntries[] = $row;
+            }
+
+            // ストアド
+            foreach ($GLOBALS['procList'] as $proc) {
+                $pname = strtolower(preg_replace('/\(.*\)$/', '', $proc));
+                if (preg_match('/\b' . preg_quote($pname, '/') . '\b/i', strtolower($entry['sql']))) {
+                    $args = trim(preg_replace('/^.*?\(/', '', $proc), ')');
+                    $procEntries[] = [
+                        'file' => $entry['file'],
+                        'procedure' => $pname,
+                        'args' => $args, 'C'=>'', 'R'=>'', 'U'=>'', 'D'=>''
+                    ];
                 }
             }
         }
     }
+}
 
-    public function getResults(): array {
-        return $this->results;
+// Excel出力
+$spreadsheet = new Spreadsheet();
+$sheet = $spreadsheet->getActiveSheet();
+$sheet->setTitle("File-CRUD");
+$sheet->fromArray(['File', 'Table', 'C', 'R', 'U', 'D', 'TEMP'], null, 'A1');
+
+$rowNum = 2;
+$currentFile = '';
+foreach ($collected as $row) {
+    if ($row['file'] !== $currentFile) {
+        if ($rowNum > 2) $rowNum++; // 1行空ける
+        $currentFile = $row['file'];
+        $sheet->setCellValue("A$rowNum", $row['file']);
     }
+    $sheet->setCellValue("B$rowNum", $row['table']);
+    $sheet->setCellValue("C$rowNum", $row['C']);
+    $sheet->setCellValue("D$rowNum", $row['R']);
+    $sheet->setCellValue("E$rowNum", $row['U']);
+    $sheet->setCellValue("F$rowNum", $row['D']);
+    $sheet->setCellValue("G$rowNum", $row['TEMP']);
+    $rowNum++;
 }
 
-// 実行ファイルチェック
-$targetFile = $argv[1] ?? null;
-if (!$targetFile || !file_exists($targetFile)) {
-    echo "Usage: php file_crud_analyzer.php path/to/target.php\n";
-    exit(1);
+// Views シート
+if (!empty($viewEntries)) {
+    $vSheet = $spreadsheet->createSheet();
+    $vSheet->setTitle("Views");
+    $vSheet->fromArray(['file','view_name','C','R','U','D'], null, 'A1');
+    $vSheet->fromArray(array_map(fn($r)=>[$r['file'],$r['table'],$r['C'],$r['R'],$r['U'],$r['D']], $viewEntries), null, 'A2');
 }
 
-// ソースコード読み込み
-$code = file_get_contents($targetFile);
-
-// PHP構文解析（最新版対応）
-$parser = (new ParserFactory)->createForNewestSupportedVersion();
-try {
-    $ast = $parser->parse($code);
-} catch (Exception $e) {
-    echo "Parse error: {$e->getMessage()}\n";
-    exit(1);
+// StoredProcedures シート
+if (!empty($procEntries)) {
+    $pSheet = $spreadsheet->createSheet();
+    $pSheet->setTitle("StoredProcedures");
+    $pSheet->fromArray(['file','procedure','args','C','R','U','D'], null, 'A1');
+    $pSheet->fromArray(array_map(fn($r)=>[$r['file'],$r['procedure'],$r['args'],'','','',''], $procEntries), null, 'A2');
 }
 
-// ASTをトラバース
-$traverser = new NodeTraverser();
-$visitor = new FileCRUDVisitor($targetFile);
-$traverser->addVisitor($visitor);
-$traverser->traverse($ast);
+$writer = new Xlsx($spreadsheet);
+$writer->save("analysis_result.xlsx");
 
-// 結果出力
-foreach ($visitor->getResults() as $row) {
-    echo implode("\t", [$row['file'], $row['table'], $row['C'], $row['R'], $row['U'], $row['D']]) . PHP_EOL;
-}
+echo "解析完了：analysis_result.xlsx に出力しました\n";
