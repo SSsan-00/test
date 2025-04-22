@@ -17,7 +17,6 @@ class FileCRUDVisitor extends NodeVisitorAbstract {
     }
 
     public function enterNode(Node $node) {
-        // SQL文字列を含む代入式を対象
         if ($node instanceof Node\Expr\Assign && $node->expr instanceof Node\Scalar\String_) {
             $sql = $node->expr->value;
 
@@ -26,10 +25,9 @@ class FileCRUDVisitor extends NodeVisitorAbstract {
                 try {
                     $parsed = $parser->parse($sql, true);
                 } catch (Exception $e) {
-                    return; // パース失敗時はスキップ
+                    return;
                 }
 
-                // CRUD判定 & テーブル抽出
                 $crudType = '';
                 $tables = [];
 
@@ -47,8 +45,10 @@ class FileCRUDVisitor extends NodeVisitorAbstract {
                     $tables = $parsed['FROM'] ?? [];
                 }
 
-                foreach ($tables as $tbl) {
-                    $tableName = $tbl['table'] ?? null;
+                // 正常にパースされたテーブルだけ出力
+                foreach ($tables as $entry) {
+                    if (!is_array($entry)) continue;
+                    $tableName = $entry['table'] ?? null;
                     if ($tableName) {
                         $this->results[] = [
                             'file' => $this->file,
@@ -69,7 +69,6 @@ class FileCRUDVisitor extends NodeVisitorAbstract {
     }
 }
 
-// 引数から対象ファイルを取得
 $targetFile = $argv[1] ?? null;
 if (!$targetFile || !file_exists($targetFile)) {
     echo "Usage: php file_crud_analyzer.php path/to/target.php\n";
@@ -77,8 +76,6 @@ if (!$targetFile || !file_exists($targetFile)) {
 }
 
 $code = file_get_contents($targetFile);
-
-// 最新サポートバージョンに対応したパーサを生成
 $parser = (new ParserFactory)->createForNewestSupportedVersion();
 try {
     $ast = $parser->parse($code);
@@ -87,13 +84,11 @@ try {
     exit(1);
 }
 
-// AST走査
 $traverser = new NodeTraverser();
 $visitor = new FileCRUDVisitor($targetFile);
 $traverser->addVisitor($visitor);
 $traverser->traverse($ast);
 
-// 出力
 foreach ($visitor->getResults() as $row) {
     echo implode("\t", [$row['file'], $row['table'], $row['C'], $row['R'], $row['U'], $row['D']]) . PHP_EOL;
 }
