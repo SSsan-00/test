@@ -1,0 +1,25 @@
+<?php
+namespace Lib;
+
+class AppConfig
+{
+    const ENV_PROD = 'production';
+    const ENV_TEST = 'testing';
+
+    public static $TABLE_USER;
+    public static $VIEW_NAME;
+    public static $PROC_NAME;
+
+    public static function setEnvironment($env)
+    {
+        if ($env === self::ENV_TEST) {
+            self::$TABLE_USER = 'users_test';
+            self::$VIEW_NAME  = 'view_test_user';
+            self::$PROC_NAME  = 'proc_test_summary';
+        } else {
+            self::$TABLE_USER = 'users';
+            self::$VIEW_NAME  = 'view_active_user';
+            self::$PROC_NAME  = 'proc_generate_summary';
+        }
+    }
+}
