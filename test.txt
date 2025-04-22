@@ -18,7 +18,8 @@ class FileCRUDVisitor extends NodeVisitorAbstract {
 
     public function enterNode(Node $node) {
         if ($node instanceof Node\Expr\Assign && $node->expr instanceof Node\Scalar\String_) {
-            $sql = $node->expr->value;
+            // 全角クォートを半角に直す（‘ → '）
+            $sql = str_replace(['‘', '’', '“', '”'], ["'", "'", '"', '"'], $node->expr->value);
 
             if (preg_match('/\b(SELECT|INSERT|UPDATE|DELETE)\b/i', $sql)) {
                 $parser = new PHPSQLParser();
@@ -34,6 +35,11 @@ class FileCRUDVisitor extends NodeVisitorAbstract {
                 if (isset($parsed['INSERT'])) {
                     $crudType = 'C';
                     $tables = $parsed['INTO'] ?? [];
+
+                    // フォールバック処理：INTOがない場合はINSERT本体からテーブル推定
+                    if (empty($tables) && isset($parsed['INSERT'][0]['table'])) {
+                        $tables[] = ['table' => $parsed['INSERT'][0]['table']];
+                    }
                 } elseif (isset($parsed['SELECT'])) {
                     $crudType = 'R';
                     $tables = $parsed['FROM'] ?? [];
@@ -45,7 +51,6 @@ class FileCRUDVisitor extends NodeVisitorAbstract {
                     $tables = $parsed['FROM'] ?? [];
                 }
 
-                // 正常にパースされたテーブルだけ出力
                 foreach ($tables as $entry) {
                     if (!is_array($entry)) continue;
                     $tableName = $entry['table'] ?? null;
@@ -69,13 +74,17 @@ class FileCRUDVisitor extends NodeVisitorAbstract {
     }
 }
 
+// 実行ファイルチェック
 $targetFile = $argv[1] ?? null;
 if (!$targetFile || !file_exists($targetFile)) {
     echo "Usage: php file_crud_analyzer.php path/to/target.php\n";
     exit(1);
 }
 
+// ソースコード読み込み
 $code = file_get_contents($targetFile);
+
+// PHP構文解析（最新版対応）
 $parser = (new ParserFactory)->createForNewestSupportedVersion();
 try {
     $ast = $parser->parse($code);
@@ -84,11 +93,13 @@ try {
     exit(1);
 }
 
+// ASTをトラバース
 $traverser = new NodeTraverser();
 $visitor = new FileCRUDVisitor($targetFile);
 $traverser->addVisitor($visitor);
 $traverser->traverse($ast);
 
+// 結果出力
 foreach ($visitor->getResults() as $row) {
     echo implode("\t", [$row['file'], $row['table'], $row['C'], $row['R'], $row['U'], $row['D']]) . PHP_EOL;
 }
