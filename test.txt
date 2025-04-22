@@ -1,27 +1,99 @@
+#!/usr/bin/env php
 <?php
+require_once __DIR__ . '/vendor/autoload.php';
 
-// SQLの直接代入（SELECT）
-$sql1 = "SELECT * FROM users WHERE id = 1";
+use PhpParser\ParserFactory;
+use PhpParser\Node;
+use PhpParser\NodeTraverser;
+use PhpParser\NodeVisitorAbstract;
+use PHPSQLParser\PHPSQLParser;
 
-// SQLの直接代入（INSERT）
-$sql2 = "INSERT INTO logs (message, created_at) VALUES ('Logged', NOW())";
+class FileCRUDVisitor extends NodeVisitorAbstract {
+    private $file;
+    private $results = [];
 
-// SQLの直接代入（UPDATE）
-$sql3 = "UPDATE posts SET title = 'New Title' WHERE id = 10";
+    public function __construct($file) {
+        $this->file = $file;
+    }
 
-// SQLの直接代入（DELETE）
-$sql4 = "DELETE FROM temp_data WHERE expired = true";
+    public function enterNode(Node $node) {
+        // SQL文字列を含む代入式を対象
+        if ($node instanceof Node\Expr\Assign && $node->expr instanceof Node\Scalar\String_) {
+            $sql = $node->expr->value;
 
-// コメントなど混在
-/*
-$sql5 = "SELECT * FROM hidden"; // コメントアウトされてる
-*/
+            if (preg_match('/\b(SELECT|INSERT|UPDATE|DELETE)\b/i', $sql)) {
+                $parser = new PHPSQLParser();
+                try {
+                    $parsed = $parser->parse($sql, true);
+                } catch (Exception $e) {
+                    return; // パース失敗時はスキップ
+                }
 
-// 無関係な文字列
-$other = "This is not SQL";
+                // CRUD判定 & テーブル抽出
+                $crudType = '';
+                $tables = [];
 
-// 別変数で保持
-$tbl = "admins";
-$sql6 = "SELECT * FROM $tbl"; // このような変数展開は未対応（将来対応）
+                if (isset($parsed['INSERT'])) {
+                    $crudType = 'C';
+                    $tables = $parsed['INTO'] ?? [];
+                } elseif (isset($parsed['SELECT'])) {
+                    $crudType = 'R';
+                    $tables = $parsed['FROM'] ?? [];
+                } elseif (isset($parsed['UPDATE'])) {
+                    $crudType = 'U';
+                    $tables = $parsed['UPDATE'] ?? [];
+                } elseif (isset($parsed['DELETE'])) {
+                    $crudType = 'D';
+                    $tables = $parsed['FROM'] ?? [];
+                }
 
-?>
+                foreach ($tables as $tbl) {
+                    $tableName = $tbl['table'] ?? null;
+                    if ($tableName) {
+                        $this->results[] = [
+                            'file' => $this->file,
+                            'table' => $tableName,
+                            'C' => $crudType === 'C' ? '○' : '',
+                            'R' => $crudType === 'R' ? '○' : '',
+                            'U' => $crudType === 'U' ? '○' : '',
+                            'D' => $crudType === 'D' ? '○' : '',
+                        ];
+                    }
+                }
+            }
+        }
+    }
+
+    public function getResults(): array {
+        return $this->results;
+    }
+}
+
+// 引数から対象ファイルを取得
+$targetFile = $argv[1] ?? null;
+if (!$targetFile || !file_exists($targetFile)) {
+    echo "Usage: php file_crud_analyzer.php path/to/target.php\n";
+    exit(1);
+}
+
+$code = file_get_contents($targetFile);
+
+// 最新サポートバージョンに対応したパーサを生成
+$parser = (new ParserFactory)->createForNewestSupportedVersion();
+try {
+    $ast = $parser->parse($code);
+} catch (Exception $e) {
+    echo "Parse error: {$e->getMessage()}\n";
+    exit(1);
+}
+
+// AST走査
+$traverser = new NodeTraverser();
+$visitor = new FileCRUDVisitor($targetFile);
+$traverser->addVisitor($visitor);
+$traverser->traverse($ast);
+
+// 出力
+foreach ($visitor->getResults() as $row) {
+    echo implode("\t", [$row['file'], $row['table'], $row['C'], $row['R'], $row['U'], $row['D']]) . PHP_EOL;
+}
