@@ -34,11 +34,11 @@ class FileCRUDVisitor extends NodeVisitorAbstract {
 
                 if (isset($parsed['INSERT'])) {
                     $crudType = 'C';
-                    $tables = $parsed['INTO'] ?? [];
-
-                    // フォールバック処理：INTOがない場合はINSERT本体からテーブル推定
-                    if (empty($tables) && isset($parsed['INSERT'][0]['table'])) {
-                        $tables[] = ['table' => $parsed['INSERT'][0]['table']];
+                    // 【ここを修正】INTOがあればINTOを見る、なければINSERTを見る
+                    if (!empty($parsed['INTO'])) {
+                        $tables = $parsed['INTO'];
+                    } else {
+                        $tables = $parsed['INSERT'];
                     }
                 } elseif (isset($parsed['SELECT'])) {
                     $crudType = 'R';
