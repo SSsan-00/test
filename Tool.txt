@@ -17,24 +17,30 @@ class FileCRUDVisitor extends NodeVisitorAbstract {
     }
 
     public function enterNode(Node $node) {
-        // 変数に代入されたSQL文字列を抽出
+        // SQL文字列の代入検出
         if ($node instanceof Node\Expr\Assign && $node->expr instanceof Node\Scalar\String_) {
             $sql = $node->expr->value;
 
             if (preg_match('/\b(SELECT|INSERT|UPDATE|DELETE)\b/i', $sql)) {
                 $parser = new PHPSQLParser();
-                $parsed = $parser->parse($sql, true);
+                try {
+                    $parsed = $parser->parse($sql, true);
+                } catch (Exception $e) {
+                    return; // パースに失敗したらスキップ
+                }
 
-                $crudType = strtoupper($parsed['INSERT'] ? 'C' :
-                            ($parsed['SELECT'] ? 'R' :
-                            ($parsed['UPDATE'] ? 'U' :
-                            ($parsed['DELETE'] ? 'D' : ''))));
+                // CRUD判定
+                $crudType = isset($parsed['INSERT']) ? 'C' :
+                            (isset($parsed['SELECT']) ? 'R' :
+                            (isset($parsed['UPDATE']) ? 'U' :
+                            (isset($parsed['DELETE']) ? 'D' : '')));
 
-                $tables = $parsed['FROM'] ?? $parsed['INTO'] ?? $parsed['UPDATE'] ?? $parsed['DELETE'];
-                if (!is_array($tables)) return;
+                // テーブルの特定
+                $sources = $parsed['FROM'] ?? $parsed['INTO'] ?? $parsed['UPDATE'] ?? $parsed['DELETE'];
+                if (!is_array($sources)) return;
 
-                foreach ($tables as $tbl) {
-                    $tableName = $tbl['table'] ?? null;
+                foreach ($sources as $entry) {
+                    $tableName = $entry['table'] ?? null;
                     if ($tableName) {
                         $this->results[] = [
                             'file' => $this->file,
@@ -55,7 +61,7 @@ class FileCRUDVisitor extends NodeVisitorAbstract {
     }
 }
 
-// 実行
+// 実行引数の検証
 $targetFile = $argv[1] ?? null;
 if (!$targetFile || !file_exists($targetFile)) {
     echo "Usage: php file_crud_analyzer.php path/to/target.php\n";
@@ -63,15 +69,23 @@ if (!$targetFile || !file_exists($targetFile)) {
 }
 
 $code = file_get_contents($targetFile);
-$parser = (new ParserFactory)->create(ParserFactory::PREFER_PHP8);
-$ast = $parser->parse($code);
 
+// 最新対応のパーサを使用
+$parser = (new ParserFactory)->createForNewestSupportedVersion();
+try {
+    $ast = $parser->parse($code);
+} catch (Exception $e) {
+    echo "Parse error: {$e->getMessage()}\n";
+    exit(1);
+}
+
+// ASTを走査してCRUD情報を収集
 $traverser = new NodeTraverser();
 $visitor = new FileCRUDVisitor($targetFile);
 $traverser->addVisitor($visitor);
 $traverser->traverse($ast);
 
-// 出力
+// 出力形式：ファイル名, テーブル名, CRUDフラグ
 foreach ($visitor->getResults() as $row) {
     echo implode("\t", [$row['file'], $row['table'], $row['C'], $row['R'], $row['U'], $row['D']]) . PHP_EOL;
 }
