@@ -1,0 +1,57 @@
+<?php
+namespace Lib;
+
+use Lib\AppConfig;
+
+class QueryEngine
+{
+    public function generateUserQuery($status, $limit)
+    {
+        $alias = 'u';
+        $table = AppConfig::$TABLE_USER;
+
+        if ($status === 'active') {
+            return self::buildActiveSql($table, $alias, $limit);
+        } else {
+            return self::buildInactiveSql($table, $alias, $limit);
+        }
+    }
+
+    private static function buildActiveSql($table, $alias, $limit)
+    {
+        return "
+            SELECT {$alias}.id, {$alias}.name, p.profile
+            FROM {$table} AS {$alias}
+            LEFT JOIN profiles p ON {$alias}.id = p.user_id
+            WHERE {$alias}.status = 'active'
+            AND EXISTS (
+                SELECT 1 FROM logins l
+                WHERE l.user_id = {$alias}.id AND l.success = true
+            )
+            ORDER BY {$alias}.created_at DESC
+            LIMIT {$limit}
+        ";
+    }
+
+    private static function buildInactiveSql($table, $alias, $limit)
+    {
+        return "
+            SELECT {$alias}.id, {$alias}.name
+            FROM {$table} AS {$alias}
+            WHERE {$alias}.status = 'inactive'
+            LIMIT {$limit}
+        ";
+    }
+
+    public function queryFromView($dbh)
+    {
+        $sql = "SELECT * FROM " . AppConfig::$VIEW_NAME . " WHERE accessed_at >= NOW() - INTERVAL '7 days'";
+        pg_query($dbh, $sql);
+    }
+
+    public function callStoredProcedure($dbh)
+    {
+        $sql = "CALL " . AppConfig::$PROC_NAME . "('" . date('Y-m-d') . "')";
+        pg_query($dbh, $sql);
+    }
+}
