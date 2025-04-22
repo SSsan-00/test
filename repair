@@ -1,0 +1,105 @@
+#!/usr/bin/env php
+<?php
+require_once __DIR__ . '/vendor/autoload.php';
+
+use PhpParser\ParserFactory;
+use PhpParser\Node;
+use PhpParser\NodeTraverser;
+use PhpParser\NodeVisitorAbstract;
+use PHPSQLParser\PHPSQLParser;
+
+class FileCRUDVisitor extends NodeVisitorAbstract {
+    private $file;
+    private $results = [];
+
+    public function __construct($file) {
+        $this->file = $file;
+    }
+
+    public function enterNode(Node $node) {
+        if ($node instanceof Node\Expr\Assign && $node->expr instanceof Node\Scalar\String_) {
+            // 全角クォートを半角に直す（‘ → '）
+            $sql = str_replace(['‘', '’', '“', '”'], ["'", "'", '"', '"'], $node->expr->value);
+
+            if (preg_match('/\b(SELECT|INSERT|UPDATE|DELETE)\b/i', $sql)) {
+                $parser = new PHPSQLParser();
+                try {
+                    $parsed = $parser->parse($sql, true);
+                } catch (Exception $e) {
+                    return;
+                }
+
+                $crudType = '';
+                $tables = [];
+
+                if (isset($parsed['INSERT'])) {
+                    $crudType = 'C';
+                    $tables = $parsed['INTO'] ?? [];
+
+                    // フォールバック処理：INTOがない場合はINSERT本体からテーブル推定
+                    if (empty($tables) && isset($parsed['INSERT'][0]['table'])) {
+                        $tables[] = ['table' => $parsed['INSERT'][0]['table']];
+                    }
+                } elseif (isset($parsed['SELECT'])) {
+                    $crudType = 'R';
+                    $tables = $parsed['FROM'] ?? [];
+                } elseif (isset($parsed['UPDATE'])) {
+                    $crudType = 'U';
+                    $tables = $parsed['UPDATE'] ?? [];
+                } elseif (isset($parsed['DELETE'])) {
+                    $crudType = 'D';
+                    $tables = $parsed['FROM'] ?? [];
+                }
+
+                foreach ($tables as $entry) {
+                    if (!is_array($entry)) continue;
+                    $tableName = $entry['table'] ?? null;
+                    if ($tableName) {
+                        $this->results[] = [
+                            'file' => $this->file,
+                            'table' => $tableName,
+                            'C' => $crudType === 'C' ? '○' : '',
+                            'R' => $crudType === 'R' ? '○' : '',
+                            'U' => $crudType === 'U' ? '○' : '',
+                            'D' => $crudType === 'D' ? '○' : '',
+                        ];
+                    }
+                }
+            }
+        }
+    }
+
+    public function getResults(): array {
+        return $this->results;
+    }
+}
+
+// 実行ファイルチェック
+$targetFile = $argv[1] ?? null;
+if (!$targetFile || !file_exists($targetFile)) {
+    echo "Usage: php file_crud_analyzer.php path/to/target.php\n";
+    exit(1);
+}
+
+// ソースコード読み込み
+$code = file_get_contents($targetFile);
+
+// PHP構文解析（最新版対応）
+$parser = (new ParserFactory)->createForNewestSupportedVersion();
+try {
+    $ast = $parser->parse($code);
+} catch (Exception $e) {
+    echo "Parse error: {$e->getMessage()}\n";
+    exit(1);
+}
+
+// ASTをトラバース
+$traverser = new NodeTraverser();
+$visitor = new FileCRUDVisitor($targetFile);
+$traverser->addVisitor($visitor);
+$traverser->traverse($ast);
+
+// 結果出力
+foreach ($visitor->getResults() as $row) {
+    echo implode("\t", [$row['file'], $row['table'], $row['C'], $row['R'], $row['U'], $row['D']]) . PHP_EOL;
+}
