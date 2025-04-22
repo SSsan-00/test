@@ -6,7 +6,83 @@
  */
 
 require_once __DIR__ . '/vendor/autoload.php';
-use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet#!/usr/bin/env php
+<?php
+require_once __DIR__ . '/vendor/autoload.php';
+
+use PhpParser\ParserFactory;
+use PhpParser\Node;
+use PhpParser\NodeTraverser;
+use PhpParser\NodeVisitorAbstract;
+use PHPSQLParser\PHPSQLParser;
+
+class FileCRUDVisitor extends NodeVisitorAbstract {
+    private $file;
+    private $results = [];
+
+    public function __construct($file) {
+        $this->file = $file;
+    }
+
+    public function enterNode(Node $node) {
+        // 変数に代入されたSQL文字列を抽出
+        if ($node instanceof Node\Expr\Assign && $node->expr instanceof Node\Scalar\String_) {
+            $sql = $node->expr->value;
+
+            if (preg_match('/\b(SELECT|INSERT|UPDATE|DELETE)\b/i', $sql)) {
+                $parser = new PHPSQLParser();
+                $parsed = $parser->parse($sql, true);
+
+                $crudType = strtoupper($parsed['INSERT'] ? 'C' :
+                            ($parsed['SELECT'] ? 'R' :
+                            ($parsed['UPDATE'] ? 'U' :
+                            ($parsed['DELETE'] ? 'D' : ''))));
+
+                $tables = $parsed['FROM'] ?? $parsed['INTO'] ?? $parsed['UPDATE'] ?? $parsed['DELETE'];
+                if (!is_array($tables)) return;
+
+                foreach ($tables as $tbl) {
+                    $tableName = $tbl['table'] ?? null;
+                    if ($tableName) {
+                        $this->results[] = [
+                            'file' => $this->file,
+                            'table' => $tableName,
+                            'C' => $crudType === 'C' ? '○' : '',
+                            'R' => $crudType === 'R' ? '○' : '',
+                            'U' => $crudType === 'U' ? '○' : '',
+                            'D' => $crudType === 'D' ? '○' : '',
+                        ];
+                    }
+                }
+            }
+        }
+    }
+
+    public function getResults(): array {
+        return $this->results;
+    }
+}
+
+// 実行
+$targetFile = $argv[1] ?? null;
+if (!$targetFile || !file_exists($targetFile)) {
+    echo "Usage: php file_crud_analyzer.php path/to/target.php\n";
+    exit(1);
+}
+
+$code = file_get_contents($targetFile);
+$parser = (new ParserFactory)->create(ParserFactory::PREFER_PHP8);
+$ast = $parser->parse($code);
+
+$traverser = new NodeTraverser();
+$visitor = new FileCRUDVisitor($targetFile);
+$traverser->addVisitor($visitor);
+$traverser->traverse($ast);
+
+// 出力
+foreach ($visitor->getResults() as $row) {
+    echo implode("\t", [$row['file'], $row['table'], $row['C'], $row['R'], $row['U'], $row['D']]) . PHP_EOL;
+}\Spreadsheet;
 use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 
 // 実行時引数
