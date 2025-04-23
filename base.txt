@@ -3,8 +3,12 @@
 /**
  * analyzer.php — 完全対応 PHPソースコード解析ツール
  *
- * 要件すべてを満たすファイル単位CRUD解析ツール
- * 対応：定数・変数・関数・結合・エイリアス・サブクエリ・ビュー・プロシージャ
+ * 要件：
+ * - CRUD操作の静的解析（変数・関数・定数・結合・エイリアス・サブクエリ含む）
+ * - ファイル単位でのExcel出力
+ * - ビュー / 一時テーブル / プロシージャへの明示的マーク（@view, @temp, @proc）
+ * - nikic/php-parser + greenlion/php-sql-parser の併用
+ * - TEMPカラムは削除し、明示マークに一本化
  */
 
 require 'vendor/autoload.php';
@@ -20,21 +24,19 @@ use PhpParser\NodeVisitorAbstract;
 date_default_timezone_set('Asia/Tokyo');
 error_reporting(E_ALL);
 
-// === 引数取得 ===
+// === 対象ディレクトリの取得（CLI引数） ===
 $target_dir = $argv[1] ?? '.';
 $view_list = @file('views.txt', FILE_IGNORE_NEW_LINES) ?: [];
 $proc_list = @file('procedures.txt', FILE_IGNORE_NEW_LINES) ?: [];
 $files = getTargetFiles($target_dir);
 
-// === グローバル解析用の定数・変数マップ ===
-$consts = [];
-$vars = [];
-
-// === 結果出力用データ ===
-$results = [];       // ファイル → [ [table, C,R,U,D,TEMP], ... ]
-$view_usage = [];    // [file, view, C, R, U, D]
-$proc_usage = [];    // [file, proc, args]
-
+// === グローバル変数（定義情報と解析結果の格納） ===
+$consts = [];       // define, const 定義
+$vars = [];         // 変数格納
+$funcs = [];        // 自作関数のSQL
+$results = [];      // file => [table, C,R,U,D]
+$view_usage = [];   // [file, view, C,R,U,D]
+$proc_usage = [];   // [file, procedure, args]
 /**
  * 指定ディレクトリ以下の対象ファイルを再帰的に取得
  */
@@ -42,8 +44,9 @@ function getTargetFiles($dir) {
     $rii = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($dir));
     $res = [];
     foreach ($rii as $file) {
-        if ($file->isFile() && preg_match('/\.(php|inc|html|js)$/', $file->getFilename()))
+        if ($file->isFile() && preg_match('/\.(php|inc|html|js)$/', $file->getFilename())) {
             $res[] = $file->getPathname();
+        }
     }
     return $res;
 }
@@ -53,35 +56,104 @@ function getTargetFiles($dir) {
  */
 function stripComments($code) {
     // PHPDoc, シングルラインコメント, マルチラインコメント, HTMLコメント
-    $code = preg_replace('#//.*#', '', $code);
-    $code = preg_replace('#/\*.*?\*/#s', '', $code);
-    $code = preg_replace('#<!--.*?-->#s', '', $code);
+    $code = preg_replace('#//.*#', '', $code);             // 単一行コメント
+    $code = preg_replace('#/\*.*?\*/#s', '', $code);       // ブロックコメント
+    $code = preg_replace('#<!--.*?-->#s', '', $code);      // HTMLコメント
     return $code;
 }
-
 /**
- * コードからSQL文を抽出（変数・定数・結合を考慮）
+ * nikic/php-parser を用いてPHPコード中の変数と関数定義を抽出する
+ */
+function analyzePhpAst($code) {
+    global $vars, $funcs;
+
+    $parser = (new ParserFactory())->create(ParserFactory::PREFER_PHP7);
+    try {
+        $ast = $parser->parse($code);
+    } catch (Exception $e) {
+        return;
+    }
+
+    $traverser = new NodeTraverser();
+    $traverser->addVisitor(new class extends NodeVisitorAbstract {
+        public function enterNode(Node $node) {
+            global $vars, $funcs;
+
+            // 変数への代入 ($sql = "...";)
+            if ($node instanceof Node\Expr\Assign &&
+                $node->var instanceof Node\Expr\Variable &&
+                is_string($node->var->name) &&
+                $node->expr instanceof Node\Scalar\String_) {
+                $name = $node->var->name;
+                $value = $node->expr->value;
+                $vars[$name] = ($vars[$name] ?? '') . $value;
+            }
+
+            // 変数への文字列結合 ($sql .= "...";)
+            if ($node instanceof Node\Expr\AssignOp\Concat &&
+                $node->var instanceof Node\Expr\Variable &&
+                is_string($node->var->name) &&
+                $node->expr instanceof Node\Scalar\String_) {
+                $name = $node->var->name;
+                $value = $node->expr->value;
+                $vars[$name] = ($vars[$name] ?? '') . $value;
+            }
+
+            // 関数定義の抽出
+            if ($node instanceof Node\Stmt\Function_ &&
+                is_string($node->name->name)) {
+                $fname = $node->name->name;
+                $body = $node->getStmts();
+
+                foreach ($body as $stmt) {
+                    // return "SELECT ...";
+                    if ($stmt instanceof Node\Stmt\Return_ &&
+                        $stmt->expr instanceof Node\Scalar\String_) {
+                        $funcs[$fname] = $stmt->expr->value;
+                    }
+                }
+            }
+        }
+    });
+
+    $traverser->traverse($ast);
+}
+/**
+ * SQL抽出用：変数・関数・定数を考慮してSQL文字列を生成する
  */
 function extractSQLFromCode($code, $file) {
-    global $consts, $vars;
+    global $consts, $vars, $funcs;
+
+    // 定数解析（define / const）
     $consts = extractConstants($code);
-    $vars = extractVariables($code);
+
+    // AST解析（変数代入 / 関数定義）
+    analyzePhpAst($code);
 
     $sqls = [];
 
+    // 変数からのSQL抽出
     foreach ($vars as $var => $val) {
-        $resolved = resolveConcatenation($val);
-        if (preg_match('/\b(select|insert|update|delete|create\s+temp\s+table)\b/i', $resolved)) {
+        $resolved = resolveSqlString($val);
+        if (isLikelySQL($resolved)) {
             $sqls[] = $resolved;
         }
     }
 
-    // グローバルスコープに直書きされたSQLも検出
+    // 関数の戻り値からのSQL抽出
+    foreach ($funcs as $fname => $val) {
+        $resolved = resolveSqlString($val);
+        if (isLikelySQL($resolved)) {
+            $sqls[] = $resolved;
+        }
+    }
+
+    // コード内の生SQLも対象にする（グローバルなSQL文）
     $lines = explode("\n", $code);
     foreach ($lines as $line) {
         $line = trim($line);
-        if (preg_match('/\b(select|insert|update|delete|create\s+temp\s+table)\b/i', $line)) {
-            $sqls[] = resolveConcatenation($line);
+        if (isLikelySQL($line)) {
+            $sqls[] = resolveSqlString($line);
         }
     }
 
@@ -89,7 +161,14 @@ function extractSQLFromCode($code, $file) {
 }
 
 /**
- * define(), const による定数定義の抽出
+ * SQLらしい構文かどうかをざっくり判定
+ */
+function isLikelySQL($str) {
+    return preg_match('/\b(select|insert|update|delete|create\s+temp\s+table)\b/i', $str);
+}
+
+/**
+ * define(), const の定数展開
  */
 function extractConstants($code) {
     $consts = [];
@@ -107,48 +186,34 @@ function extractConstants($code) {
 }
 
 /**
- * $sql = "..."; や $sql .= "..."; のような変数定義の抽出
+ * SQL構文として最終的に置換された文字列を返す
  */
-function extractVariables($code) {
-    $vars = [];
-    $lines = explode("\n", $code);
-    foreach ($lines as $line) {
-        if (preg_match('/^\s*\$([a-zA-Z0-9_]+)\s*(=|\.=)\s*(.+?);/', $line, $m)) {
-            $name = $m[1];
-            $op = $m[2];
-            $val = trim($m[3], " \t\n\r\0\x0B\"'");
-            if ($op === '=') {
-                $vars[$name] = $val;
-            } elseif ($op === '.=' && isset($vars[$name])) {
-                $vars[$name] .= $val;
-            }
-        }
-    }
-    return $vars;
-}
+function resolveSqlString($expr) {
+    global $consts, $vars, $funcs;
 
-/**
- * 定数・変数を置換して実際のSQL文字列に変換
- */
-function resolveConcatenation($expr) {
-    global $consts, $vars;
     $resolved = $expr;
 
-    // 定数置換
+    // 定数を置換
     foreach ($consts as $key => $val) {
         $resolved = str_replace($key, $val, $resolved);
     }
 
-    // 変数置換
+    // 変数を再帰的に置換
     foreach ($vars as $key => $val) {
         $resolved = str_replace('$' . $key, $val, $resolved);
     }
 
+    // 関数呼び出しも展開（引数省略の単純関数だけ）
+    foreach ($funcs as $fname => $body) {
+        if (strpos($resolved, $fname . '()') !== false) {
+            $resolved = str_replace($fname . '()', $body, $resolved);
+        }
+    }
+
     return $resolved;
 }
-
 /**
- * SQLを解析し、CRUD判定・対象テーブル・ビュー/プロシージャ使用を抽出
+ * SQL文を解析し、CRUD分類とビュー・プロシージャ使用記録を行う
  */
 function parseSQL($sql, $file) {
     global $results, $view_list, $proc_list, $view_usage, $proc_usage;
@@ -157,10 +222,10 @@ function parseSQL($sql, $file) {
     try {
         $parsed = $parser->parse($sql);
     } catch (Exception $e) {
-        return; // パース不能なSQLはスキップ
+        return; // パースできないSQLはスキップ
     }
 
-    $crud = ['C'=>'', 'R'=>'', 'U'=>'', 'D'=>'', 'TEMP'=>''];
+    $crud = ['C'=>'', 'R'=>'', 'U'=>'', 'D'=>''];
     $target = '';
 
     if (isset($parsed['INSERT'])) $crud['C'] = '○';
@@ -168,41 +233,45 @@ function parseSQL($sql, $file) {
     if (isset($parsed['UPDATE'])) $crud['U'] = '○';
     if (isset($parsed['DELETE'])) $crud['D'] = '○';
 
-    // TEMP TABLE 検出
+    // 一時テーブル（CREATE TEMP TABLE）特別扱い
     if (preg_match('/create\s+temp\s+table\s+([a-zA-Z0-9_]+)/i', $sql, $m)) {
-        $crud['TEMP'] = '○';
         $target = $m[1] . '@temp';
     }
 
-    // 対象テーブル名（FROM, INTO, UPDATE, TABLE）から抽出
-    foreach (['FROM','INTO','UPDATE','TABLE'] as $key) {
-        if (isset($parsed[$key][0]['table'])) {
-            $tname = $parsed[$key][0]['table'];
-            $target = in_array($tname, $view_list) ? $tname . '@view' : $tname;
-            break;
+    // 通常テーブル or ビュー検出
+    if (!$target) {
+        foreach (['FROM','INTO','UPDATE','TABLE'] as $key) {
+            if (!empty($parsed[$key][0]['table'])) {
+                $tname = $parsed[$key][0]['table'];
+                if (in_array($tname, $view_list)) {
+                    $target = $tname . '@view';
+                    $view_usage[] = [$file, $tname, $crud['C'], $crud['R'], $crud['U'], $crud['D']];
+                } else {
+                    $target = $tname;
+                }
+                break;
+            }
         }
     }
 
-    // ビュー使用検出
-    foreach ($view_list as $v) {
-        if (stripos($sql, $v) !== false) {
-            $view_usage[] = [$file, $v, $crud['C'], $crud['R'], $crud['U'], $crud['D']];
-        }
-    }
-
-    // ストアドプロシージャ使用検出
+    // ストアドプロシージャ使用検出（@proc）
     foreach ($proc_list as $p) {
         if (preg_match('/\b' . preg_quote($p) . '\s*\((.*?)\)/i', $sql, $m)) {
             $proc_usage[] = [$file, $p, $m[1]];
+            if (!$target) {
+                $target = $p . '@proc';
+            }
         }
     }
 
-    // File単位CRUD格納
+    // 出力対象があれば追加（重複排除のためマージ前に存在チェック）
     if ($target) {
-        $results[$file][] = array_merge(['table' => $target], $crud);
+        $entry = array_merge(['table' => $target], $crud);
+        if (!in_array($entry, $results[$file] ?? [])) {
+            $results[$file][] = $entry;
+        }
     }
 }
-
 /**
  * 解析結果を Excelファイル（.xlsx）に出力
  */
@@ -212,22 +281,38 @@ function outputExcel($results, $view_usage, $proc_usage) {
     $sheet->setTitle('File-CRUD');
 
     $row = 1;
+
+    // === ヘッダー行 ===
+    $sheet->setCellValue("A$row", 'Table');
+    $sheet->setCellValue("B$row", 'C');
+    $sheet->setCellValue("C$row", 'R');
+    $sheet->setCellValue("D$row", 'U');
+    $sheet->setCellValue("E$row", 'D');
+    $row++;
+
     foreach ($results as $file => $entries) {
         $sheet->setCellValue("A$row", $file);
         $row++;
+
+        // テーブル単位で重複排除（同一テーブル・CRUDの繰り返しを避ける）
+        $unique = [];
         foreach ($entries as $e) {
-            $sheet->setCellValue("A$row", $e['table']);
-            $sheet->setCellValue("B$row", $e['C']);
-            $sheet->setCellValue("C$row", $e['R']);
-            $sheet->setCellValue("D$row", $e['U']);
-            $sheet->setCellValue("E$row", $e['D']);
-            $sheet->setCellValue("F$row", $e['TEMP']);
-            $row++;
+            $key = $e['table'] . ':' . $e['C'] . $e['R'] . $e['U'] . $e['D'];
+            if (!isset($unique[$key])) {
+                $sheet->setCellValue("A$row", $e['table']);
+                $sheet->setCellValue("B$row", $e['C']);
+                $sheet->setCellValue("C$row", $e['R']);
+                $sheet->setCellValue("D$row", $e['U']);
+                $sheet->setCellValue("E$row", $e['D']);
+                $row++;
+                $unique[$key] = true;
+            }
         }
-        $row++; // ファイル間は1行空ける
+
+        $row++; // ファイルごとに1行空ける
     }
 
-    // Views シート
+    // === Views シート ===
     $vSheet = $spreadsheet->createSheet();
     $vSheet->setTitle('Views');
     $vSheet->fromArray([['file', 'view', 'C', 'R', 'U', 'D']], null, 'A1');
@@ -235,7 +320,7 @@ function outputExcel($results, $view_usage, $proc_usage) {
         $vSheet->fromArray($view_usage, null, 'A2');
     }
 
-    // Procedures シート
+    // === Procedures シート ===
     $pSheet = $spreadsheet->createSheet();
     $pSheet->setTitle('Procedures');
     $pSheet->fromArray([['file', 'procedure', 'args']], null, 'A1');
@@ -243,24 +328,25 @@ function outputExcel($results, $view_usage, $proc_usage) {
         $pSheet->fromArray($proc_usage, null, 'A2');
     }
 
+    // === 出力ファイル保存 ===
     $writer = new Xlsx($spreadsheet);
     $writer->save('crud_output.xlsx');
 }
-
-// === 全ファイルを対象に解析 ===
+// === メイン処理 ===
 foreach ($files as $file) {
     $relpath = ltrim(str_replace(realpath($target_dir), '', realpath($file)), '/\\');
+
+    // PHP/INC → AST + コメント除去、他 → そのまま読み込み
     $code = file_get_contents($file);
-    $clean_code = stripComments($code);
+    $clean = stripComments($code);
 
-    // SQL抽出（変数・定数・結合を展開）
-    $sql_list = extractSQLFromCode($clean_code, $relpath);
+    extractSQLFromCode($clean, $relpath); // ここで AST 解析・変数/関数収集・SQL抽出まで完了
+    $sql_list = extractSQLFromCode($clean, $relpath);
 
-    // 抽出されたSQLを解析して結果に反映
     foreach ($sql_list as $sql) {
         parseSQL($sql, $relpath);
     }
 }
 
-// === Excelに出力 ===
+// === Excel出力 ===
 outputExcel($results, $view_usage, $proc_usage);
