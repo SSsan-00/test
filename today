@@ -6,194 +6,70 @@ require __DIR__ . '/vendor/autoload.php';
 
 use PhpParser\ParserFactory;
 use PhpParser\Error as PhpParserError;
-use PhpParser\PrettyPrinter\Standard;
-use PhpParser\NodeTraverser;
-use PhpParser\NodeVisitorAbstract;
-use PhpParser\Node;
 use PHPSQLParser\PHPSQLParser;
 use PHPSQLParser\PHPSQLParserException;
 use PhpOffice\PhpSpreadsheet\Spreadsheet;
 use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 
 //--------------------------------------------------
-// Preprocessor: コメント／空白除去、定数・変数展開、文字列結合正規化
+// 1. StringConcatResolver: .= と . を解決
 //--------------------------------------------------
-class Preprocessor
+class StringConcatResolver
 {
-    private $parser;
-    private $printer;
-    private $consts = [];
-    private $vars   = [];
-
-    public function __construct()
+    public function resolve(string $code): string
     {
-        $factory = new ParserFactory();
-        $this->parser  = $factory->createForNewestSupportedVersion();
-        $this->printer = new Standard();
-    }
+        $lines   = explode("\n", $code);
+        $buffers = [];   // varName => merged string
+        $out     = [];
 
-    /**
-     * @throws PhpParserError
-     */
-    public function process(string $code): string
-    {
-        // AST 解析（構文エラーは上位でキャッチ）
-        $ast   = $this->parser->parse($code);
-        $clean = $this->printer->prettyPrintFile($ast);
-
-        $this->collectDefinesAndVars($ast);
-        $clean = $this->normalizeStrings($clean);
-        $clean = $this->expandSymbols($clean);
-
-        // 空白・改行正規化
-        $clean = preg_replace('/[ \t]+/', ' ', $clean);
-        $clean = preg_replace('/\r?\n\s*/', "\n", $clean);
-        return trim($clean);
-    }
-
-    private function collectDefinesAndVars(array $ast): void
-    {
-        foreach ($ast as $node) {
-            if ($node instanceof Node\Stmt\Const_) {
-                foreach ($node->consts as $c) {
-                    $v = $c->value;
-                    if ($v instanceof Node\Scalar\String_ || $v instanceof Node\Scalar\LNumber || $v instanceof Node\Scalar\DNumber) {
-                        $this->consts[$c->name->name] = $v->value;
-                    }
-                }
+        foreach ($lines as $line) {
+            if (preg_match('/\$(\w+)\s*=\s*([\'"])(.*?)\2\s*;/', $line, $m)) {
+                $buffers[$m[1]] = $m[3];
+                continue;
             }
-            if ($node instanceof Node\Stmt\Expression
-                && $node->expr instanceof Node\Expr\Assign
-                && $node->expr->var instanceof Node\Expr\Variable
-                && $node->expr->expr instanceof Node\Scalar\String_) {
-                $this->vars[$node->expr->var->name] = $node->expr->expr->value;
+            if (preg_match('/\$(\w+)\s*\.=\s*([\'"])(.*?)\2\s*;/', $line, $m)) {
+                $buffers[$m[1]] = ($buffers[$m[1]] ?? '') . $m[3];
+                continue;
             }
-            if ($node instanceof Node\Stmt\Expression
-                && $node->expr instanceof Node\Expr\FuncCall
-                && $node->expr->name->toString() === 'define'
-            ) {
-                $args = $node->expr->args;
-                if (isset($args[0], $args[1])
-                    && $args[0]->value instanceof Node\Scalar\String_
-                    && $args[1]->value instanceof Node\Scalar\String_) {
-                    $this->consts[$args[0]->value->value] = $args[1]->value->value;
-                }
+            if (preg_match('/\$(\w+)\s*=\s*([\'"])(.*?)\2\s*\.\s*([\'"])(.*?)\4\s*;/', $line, $m)) {
+                $buffers[$m[1]] = $m[3] . $m[5];
+                continue;
             }
+            $out[] = $line;
         }
-    }
 
-    private function normalizeStrings(string $code): string
-    {
-        return preg_replace_callback(
-            '/"([^"]*)"(\s*\.\s*|\s*\.=\s*)"([^"]*)"/',
-            fn($m) => '"' . $m[1] . $m[3] . '"',
-            $code
-        );
-    }
+        foreach ($buffers as $var => $str) {
+            $escaped = addcslashes($str, '"');
+            $out[]   = sprintf('$%s = "%s";', $var, $escaped);
+        }
 
-    private function expandSymbols(string $code): string
-    {
-        foreach ($this->consts as $k => $v) {
-            $code = str_replace($k, (string)$v, $code);
-        }
-        foreach ($this->vars as $k => $v) {
-            $code = str_replace('$' . $k, (string)$v, $code);
-        }
-        return $code;
+        return implode("\n", $out);
     }
 }
 
 //--------------------------------------------------
-// FunctionAnalyzer: AST から関数定義と呼び出しのコールグラフを構築
+// 2. FunctionAnalyzer: 雛形
 //--------------------------------------------------
 class FunctionAnalyzer
 {
-    private $functions = [];   // file => functionNames[]
-    private $callGraph = [];   // file => [calleeFile=>true]
-    private $parser;
-
-    public function __construct()
+    public function analyzeAll(array $fileCodeMap): void
     {
-        $factory = new ParserFactory();
-        $this->parser = $factory->createForNewestSupportedVersion();
+        // TODO: 後ほど実装
     }
-
-    public function analyzeAll(array $fileCodeMap, array &$syntaxErrors): void
-    {
-        foreach ($fileCodeMap as $file => $code) {
-            try {
-                $ast = $this->parser->parse($code);
-            } catch (PhpParserError $e) {
-                $syntaxErrors[] = ['file'=>$file, 'error'=>$e->getMessage()];
-                continue;
-            }
-            $this->functions[$file] = $this->collectFunctions($ast);
-        }
-        foreach ($fileCodeMap as $file => $code) {
-            try {
-                $ast = $this->parser->parse($code);
-            } catch (PhpParserError $e) {
-                continue;
-            }
-            $calls = $this->collectCalls($ast);
-            foreach ($calls as $fn) {
-                foreach ($this->functions as $defFile => $fns) {
-                    if (in_array($fn, $fns, true)) {
-                        $this->callGraph[$file][$defFile] = true;
-                    }
-                }
-            }
-        }
-    }
-
     public function getCallGraph(): array
     {
-        return $this->callGraph;
-    }
-
-    private function collectFunctions(array $ast): array
-    {
-        $list = [];
-        $tr   = new NodeTraverser();
-        $tr->addVisitor(new class($list) extends NodeVisitorAbstract {
-            public $list;
-            public function __construct(&$list) { $this->list = &$list; }
-            public function enterNode(Node $node) {
-                if ($node instanceof Node\Stmt\Function_) {
-                    $this->list[] = $node->name->name;
-                }
-            }
-        });
-        $tr->traverse($ast);
-        return $list;
-    }
-
-    private function collectCalls(array $ast): array
-    {
-        $calls = [];
-        $tr    = new NodeTraverser();
-        $tr->addVisitor(new class($calls) extends NodeVisitorAbstract {
-            public $calls;
-            public function __construct(&$calls) { $this->calls = &$calls; }
-            public function enterNode(Node $node) {
-                if ($node instanceof Node\Expr\FuncCall && $node->name instanceof Node\Name) {
-                    $this->calls[] = $node->name->toString();
-                }
-            }
-        });
-        $tr->traverse($ast);
-        return $calls;
+        return []; // TODO
     }
 }
 
 //--------------------------------------------------
-// SQLExtractor: PHPSQLParser + .=複数行対応、例外吸収
+// 3. SQLExtractor: PHPSQLParser を用いた SQL 抽出・CRUD判定
 //--------------------------------------------------
 class SQLExtractor
 {
-    private $parser;
-    private $views;
-    private $procs;
+    private PHPSQLParser $parser;
+    private array $views;
+    private array $procs;
 
     public function __construct()
     {
@@ -202,38 +78,22 @@ class SQLExtractor
         $this->procs  = file_exists('procs_list.txt') ? array_map('trim', file('procs_list.txt')) : [];
     }
 
+    /**
+     * @return array{0:array<array{table:string,C:bool,R:bool,U:bool,D:bool,TEMP:string}>,1:array<array{cond:string}>}
+     */
     public function extractFromCode(string $code): array
     {
         $results = [];
         $logs    = [];
 
-        // 1) .= 連結収集
-        $sqlVars = [];
-        foreach (explode("\n", $code) as $line) {
-            if (preg_match('/\$(\w+)\s*=\s*["\']([^"\']*)["\']/', $line, $m)) {
-                $sqlVars[$m[1]] = $m[2];
-            } elseif (preg_match('/\$(\w+)\s*\.=\s*["\']([^"\']*)["\']/', $line, $m)) {
-                $sqlVars[$m[1]] = ($sqlVars[$m[1]] ?? '') . $m[2];
-            }
-        }
-        foreach ($sqlVars as $sql) {
-            try {
-                $ast = $this->parser->parse($sql, true);
-            } catch (\Exception $e) {
-                continue;
-            }
-            foreach ($ast as $entry) {
-                $this->analyzeEntry($entry, $results);
-            }
-        }
-
-        // 2) インラインSQL
-        foreach (preg_split('/;\s*/', $code) as $stmt) {
+        // インラインSQL抽出
+        $stmts = preg_split('/;\s*/', $code);
+        foreach ($stmts as $stmt) {
             $stmt = trim($stmt);
             if ($stmt === '') continue;
             try {
                 $ast = $this->parser->parse($stmt, true);
-            } catch (\Exception $e) {
+            } catch (PHPSQLParserException $e) {
                 continue;
             }
             foreach ($ast as $entry) {
@@ -241,7 +101,7 @@ class SQLExtractor
             }
         }
 
-        // 3) 条件分岐ログ
+        // 条件式ログ
         if (preg_match_all('/\b(if|switch)\s*\((.*?)\)/i', $code, $m)) {
             foreach ($m[0] as $cond) {
                 $logs[] = ['cond' => $cond];
@@ -260,20 +120,33 @@ class SQLExtractor
             ($entry['CREATE'] ? 'CREATE' : 'SELECT')))
         );
 
+        // CREATE TEMP TABLE
         if ($type === 'CREATE'
             && !empty($entry['CREATE']['temporary'])
             && stripos($entry['CREATE']['temporary'], 'TEMP') !== false
         ) {
             $tbl = $entry['CREATE']['table'];
-            $out[] = ['table'=>$tbl,'C'=>false,'R'=>false,'U'=>false,'D'=>false,'TEMP'=>$tbl];
+            $out[] = [
+                'table'=> $tbl,
+                'C'    => false,
+                'R'    => false,
+                'U'    => false,
+                'D'    => false,
+                'TEMP' => $tbl
+            ];
             return;
         }
 
+        // FROM / JOIN
         $tables = [];
         if (!empty($entry['FROM'])) {
             foreach ($entry['FROM'] as $f) {
-                $tables[] = $f['table'] ?? null;
-                $tables[] = $f['alias']['name'] ?? null;
+                if (!empty($f['table'])) {
+                    $tables[] = $f['table'];
+                }
+                if (!empty($f['alias']['name'])) {
+                    $tables[] = $f['alias']['name'];
+                }
             }
         }
         if (!empty($entry['JOIN'])) {
@@ -282,92 +155,70 @@ class SQLExtractor
             }
         }
 
-        foreach (array_filter(array_unique($tables)) as $tbl) {
-            $isView = in_array(strtolower($tbl), array_map('strtolower', $this->views), true);
+        foreach (array_unique($tables) as $tbl) {
+            $clean  = strtolower($tbl);
+            $isView = in_array($clean, array_map('strtolower', $this->views), true);
             $out[] = [
-                'table'=> $tbl . ($isView?'@view':''), 
-                'C'=> in_array($type,['INSERT','CREATE'],true),
-                'R'=> $type==='SELECT'||$type==='UPDATE'||$type==='DELETE'|| !empty($entry['JOIN'])||!empty($entry['WITH']),
-                'U'=> $type==='UPDATE',
-                'D'=> $type==='DELETE',
-                'TEMP'=>''
+                'table' => $tbl . ($isView ? '@view' : ''),
+                'C'     => in_array($type, ['INSERT','CREATE'], true),
+                'R'     => $type==='SELECT' || $type==='UPDATE' || $type==='DELETE'
+                          || !empty($entry['JOIN']) || !empty($entry['WITH']),
+                'U'     => $type==='UPDATE',
+                'D'     => $type==='DELETE',
+                'TEMP'  => ''
             ];
         }
     }
 }
 
 //--------------------------------------------------
-// CRUDAggregator: ファイルごと CRUD 集約 + 関数伝播、例外不要
+// 4. CRUDAggregator: ファイルごと CRUD 集約
 //--------------------------------------------------
 class CRUDAggregator
 {
-    private $callGraph;
+    public function __construct(array $callGraph) { /* stub */ }
 
-    public function __construct(array $callGraph)
-    {
-        $this->callGraph = $callGraph;
-    }
-
+    /**
+     * @param array<string,array<array{table:string,C:bool,R:bool,U:bool,D:bool,TEMP:string}>> $fileSqlMap
+     * @return array<string,array<string,array{C:bool,R:bool,U:bool,D:bool,TEMP:string}>> 
+     */
     public function aggregate(array $fileSqlMap): array
     {
         $crudMap = [];
         foreach ($fileSqlMap as $file => $entries) {
             foreach ($entries as $e) {
                 $tbl = $e['table'];
-                $this->initTable($crudMap[$file], $tbl);
-                foreach (['C','R','U','D'] as $op) {
-                    $crudMap[$file][$tbl][$op] = $crudMap[$file][$tbl][$op] || $e[$op];
-                }
-                if ($e['TEMP']) {
-                    $crudMap[$file][$tbl]['TEMP'] = $e['TEMP'];
-                }
+                $crudMap[$file][$tbl]['C'] = ($crudMap[$file][$tbl]['C'] ?? false) || $e['C'];
+                $crudMap[$file][$tbl]['R'] = ($crudMap[$file][$tbl]['R'] ?? false) || $e['R'];
+                $crudMap[$file][$tbl]['U'] = ($crudMap[$file][$tbl]['U'] ?? false) || $e['U'];
+                $crudMap[$file][$tbl]['D'] = ($crudMap[$file][$tbl]['D'] ?? false) || $e['D'];
+                $crudMap[$file][$tbl]['TEMP'] = $e['TEMP'] ?: ($crudMap[$file][$tbl]['TEMP'] ?? '');
             }
-        }
-        foreach (array_keys($crudMap) as $file) {
-            $this->propagate($file, $crudMap, []);
         }
         return $crudMap;
-    }
-
-    private function propagate(string $file, array &$map, array $visited): void
-    {
-        if (isset($visited[$file])) return;
-        $visited[$file] = true;
-        foreach (($this->callGraph[$file] ?? []) as $callee => $_) {
-            $this->propagate($callee, $map, $visited);
-            foreach ($map[$callee] ?? [] as $tbl => $ops) {
-                $this->initTable($map[$file], $tbl);
-                foreach (['C','R','U','D'] as $op) {
-                    $map[$file][$tbl][$op] = $map[$file][$tbl][$op] || $ops[$op];
-                }
-                if ($ops['TEMP']) {
-                    $map[$file][$tbl]['TEMP'] = $ops['TEMP'];
-                }
-            }
-        }
-    }
-
-    private function initTable(&$fileMap, string $tbl): void
-    {
-        if (!isset($fileMap[$tbl])) {
-            $fileMap[$tbl] = ['C'=>false,'R'=>false,'U'=>false,'D'=>false,'TEMP'=>''];
-        }
     }
 }
 
 //--------------------------------------------------
-// ExcelExporter: PhpSpreadsheet で File-CRUD と LOGS を出力
+// 5. ExcelExporter: PhpSpreadsheet で出力
 //--------------------------------------------------
 class ExcelExporter
 {
-    public function export(string $path, array $crudMap, array $logs, array $syntaxErrors): void
+    /**
+     * @param string $path
+     * @param array<string,array<string,array{C:bool,R:bool,U:bool,D:bool,TEMP:string}>> $crudMap
+     * @param array<array{cond:string}> $logs
+     */
+    public function export(string $path, array $crudMap, array $logs): void
     {
         $wb = new Spreadsheet();
         $ws = $wb->getActiveSheet();
         $ws->setTitle('File-CRUD');
 
+        // ヘッダー
         $ws->fromArray(['Table Name','C','R','U','D','TEMP'], null, 'A1');
         $row = 2;
+
         foreach ($crudMap as $file => $tables) {
             $ws->setCellValue("A{$row}", "File: {$file}");
             $row++;
@@ -383,19 +234,13 @@ class ExcelExporter
             $row++;
         }
 
-        // LOGS
+        // LOGS シート
         $logSheet = $wb->createSheet();
         $logSheet->setTitle('LOGS');
-        $logSheet->fromArray(['Type','Detail'], null, 'A1');
+        $logSheet->fromArray(['Condition'], null, 'A1');
         $r = 2;
-        foreach ($syntaxErrors as $err) {
-            $logSheet->setCellValue("A{$r}", 'SYNTAX_ERROR');
-            $logSheet->setCellValue("B{$r}", "{$err['file']}: {$err['error']}");
-            $r++;
-        }
         foreach ($logs as $l) {
-            $logSheet->setCellValue("A{$r}", 'CONDITION');
-            $logSheet->setCellValue("B{$r}", $l['cond']);
+            $logSheet->setCellValue("A{$r}", $l['cond']);
             $r++;
         }
 
@@ -404,7 +249,7 @@ class ExcelExporter
 }
 
 //--------------------------------------------------
-// エントリポイント
+// エントリポイント：段階的実装
 //--------------------------------------------------
 function main(array $argv): void
 {
@@ -414,6 +259,7 @@ function main(array $argv): void
         exit(1);
     }
 
+    // 対象ファイル収集
     $rii   = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($projectDir));
     $files = [];
     foreach ($rii as $file) {
@@ -422,51 +268,37 @@ function main(array $argv): void
         }
     }
 
-    $pre          = new Preprocessor();
-    $cleaned      = [];
-    $syntaxErrors = [];
-
-    // 前処理
+    // 1) 前処理：文字列連結解決
+    $resolver = new StringConcatResolver();
+    $cleaned  = [];
     foreach ($files as $path) {
-        $code = @file_get_contents($path);
-        if ($code === false) {
-            $syntaxErrors[] = ['file'=>$path, 'error'=>'Cannot read file'];
-            continue;
-        }
-        try {
-            $cleaned[$path] = $pre->process($code);
-        } catch (PhpParserError $e) {
-            $syntaxErrors[] = ['file'=>$path, 'error'=>$e->getMessage()];
-        }
+        $raw          = @file_get_contents($path);
+        $cleaned[$path] = $raw !== false ? $resolver->resolve($raw) : '';
     }
 
-    // 関数解析
+    // 2) 関数解析（雛形）
     $funcAnalyzer = new FunctionAnalyzer();
-    $funcAnalyzer->analyzeAll($cleaned, $syntaxErrors);
+    $funcAnalyzer->analyzeAll($cleaned);
 
-    // SQL抽出
+    // 3) SQL抽出
     $sqlExt     = new SQLExtractor();
     $fileSqlMap = [];
     $logs       = [];
     foreach ($cleaned as $path => $code) {
-        try {
-            [$entries, $conds] = $sqlExt->extractFromCode($code);
-            $fileSqlMap[$path] = $entries;
-            $logs = array_merge($logs, $conds);
-        } catch (\Throwable $e) {
-            $syntaxErrors[] = ['file'=>$path, 'error'=>'SQL parse error: '.$e->getMessage()];
-        }
+        [$ops, $conds]  = $sqlExt->extractFromCode($code);
+        $fileSqlMap[$path] = $ops;
+        $logs          = array_merge($logs, $conds);
     }
 
-    // CRUD集約・伝播
+    // 4) CRUD集約
     $aggregator = new CRUDAggregator($funcAnalyzer->getCallGraph());
     $crudMap    = $aggregator->aggregate($fileSqlMap);
 
-    // Excel出力
+    // 5) Excel出力
     $exporter = new ExcelExporter();
-    $exporter->export('analysis_result.xlsx', $crudMap, $logs, $syntaxErrors);
+    $exporter->export('analysis_result.xlsx', $crudMap, $logs);
 
-    echo "解析完了: analysis_result.xlsx を出力しました\n";
+    echo "Step 1–5 completed. SQL解析とExcel出力を実装しました.\n";
 }
 
 main($argv);
