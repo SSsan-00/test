@@ -1,0 +1,57 @@
+#!/usr/bin/env php
+<?php
+// ast_dump.php — PHP AST 解析結果を出力する簡易アプリケーション
+
+require 'vendor/autoload.php';
+
+use PhpParser\ParserFactory;
+use PhpParser\Node;
+use PhpParser\NodeTraverser;
+use PhpParser\PrettyPrinter;
+use PhpParser\NodeVisitorAbstract;
+
+if ($argc < 2) {
+    echo "使い方: php ast_dump.php 解析対象ファイル\n";
+    exit(1);
+}
+
+$filepath = $argv[1];
+if (!file_exists($filepath)) {
+    echo "ファイルが存在しません: $filepath\n";
+    exit(1);
+}
+
+$code = file_get_contents($filepath);
+$parser = (new ParserFactory())->create(ParserFactory::PREFER_PHP7);
+
+try {
+    $ast = $parser->parse($code);
+    echo "=== AST出力（構文木） ===\n";
+    printAst($ast);
+} catch (PhpParser\Error $e) {
+    echo "構文エラー: ", $e->getMessage(), "\n";
+}
+
+// === ASTをテキストで表示する関数 ===
+function printAst($nodes, $indent = 0) {
+    $pad = str_repeat('  ', $indent);
+    foreach ((array)$nodes as $node) {
+        if ($node instanceof Node) {
+            echo $pad . get_class($node) . "\n";
+            foreach ($node->getSubNodeNames() as $name) {
+                $value = $node->$name;
+                if (is_array($value)) {
+                    echo $pad . "  [$name] => array\n";
+                    printAst($value, $indent + 2);
+                } elseif ($value instanceof Node) {
+                    echo $pad . "  [$name] => " . get_class($value) . "\n";
+                    printAst([$value], $indent + 2);
+                } else {
+                    echo $pad . "  [$name] => " . var_export($value, true) . "\n";
+                }
+            }
+        } else {
+            echo $pad . var_export($node, true) . "\n";
+        }
+    }
+}
