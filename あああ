@@ -1,7 +1,6 @@
 function fallbackParse($code, $rel_path) {
     global $crud_data, $log_data, $defines;
 
-    // ビュー・プロシージャ定義ファイルの読み込み
     $view_list = file_exists("view_list.txt") ? file("view_list.txt", FILE_IGNORE_NEW_LINES) : [];
     $proc_list = file_exists("procedure_list.txt") ? file("procedure_list.txt", FILE_IGNORE_NEW_LINES) : [];
 
@@ -9,49 +8,52 @@ function fallbackParse($code, $rel_path) {
     $sql_vars = [];
     $vars = [];
 
-    // 変数・定数の定義をスキャン
+    $full_sql_candidates = [];
+
     foreach ($lines as $line) {
-        // define("TBL", "orders")
+        // 定数 define("TBL", "orders")
         if (preg_match('/define\s*\(\s*[\'"](\w+)[\'"]\s*,\s*[\'"](\w+)[\'"]\s*\)/i', $line, $m)) {
             $defines[$m[1]] = $m[2];
         }
 
-        // $table = 'orders';
+        // 単純変数代入 $table = 'orders';
         if (preg_match('/\$(\w+)\s*=\s*[\'"]([\w@]+)[\'"]\s*;/', $line, $m)) {
             $vars[$m[1]] = $m[2];
         }
 
-        // $sql = "..."; または $sql .= "...";
+        // SQL組み立て（.=, =）$sql .= "...";
         if (preg_match('/\$(\w+)\s*(=|\.=)\s*["\'](.*?)["\']\s*;/', $line, $m)) {
             $var = $m[1];
             $op = $m[2];
             $val = $m[3];
 
-            // 定数や変数の展開
-            $val = preg_replace_callback('/\b([A-Z_][A-Z0-9_]*)\b/', function ($matches) use ($defines) {
-                return $defines[$matches[1]] ?? $matches[1];
-            }, $val);
-            $val = preg_replace_callback('/\$(\w+)/', function ($matches) use ($vars) {
-                return $vars[$matches[1]] ?? $matches[0];
-            }, $val);
+            // 定数・変数展開
+            $val = preg_replace_callback('/\b([A-Z_][A-Z0-9_]*)\b/', fn($matches) => $defines[$matches[1]] ?? $matches[1], $val);
+            $val = preg_replace_callback('/\$(\w+)/', fn($matches) => $vars[$matches[1]] ?? $matches[0], $val);
 
             if (!isset($sql_vars[$var])) $sql_vars[$var] = '';
-            if ($op === '=') {
-                $sql_vars[$var] = $val;
-            } else {
-                $sql_vars[$var] .= ' ' . $val;
-            }
+            $sql_vars[$var] = ($op === '=') ? $val : $sql_vars[$var] . ' ' . $val;
+        }
+
+        // 生SQLっぽい文字列を拾う
+        if (preg_match('/(select|insert|update|delete|create\s+temp)\s+.+/i', $line)) {
+            $clean = cleanSQL($line);
+            $full_sql_candidates[] = $clean;
         }
     }
 
+    // 通常のSQL変数展開も処理
     foreach ($sql_vars as $sql) {
-        $sql = cleanSQL($sql);
+        $full_sql_candidates[] = cleanSQL($sql);
+    }
+
+    // 重複除去して処理
+    foreach (array_unique($full_sql_candidates) as $sql) {
         if (empty($sql)) continue;
 
         try {
             $parser = new PHPSQLParser($sql, true);
 
-            // 操作種別
             $op = '';
             if (isset($parser->parsed['SELECT'])) $op = 'R';
             if (isset($parser->parsed['INSERT'])) $op = 'C';
@@ -59,16 +61,14 @@ function fallbackParse($code, $rel_path) {
             if (isset($parser->parsed['DELETE'])) $op = 'D';
             if (isset($parser->parsed['CREATE']) && stripos($sql, 'temp') !== false) $op = 'C@temp';
 
-            // 対象候補句（FROM, JOIN, UPDATE, INTO, TABLE）
             foreach (['FROM', 'JOIN', 'UPDATE', 'INTO', 'TABLE'] as $clause) {
                 if (!isset($parser->parsed[$clause])) continue;
 
                 foreach ($parser->parsed[$clause] as $entry) {
+                    if ($clause === 'FROM' && isset($entry['sub_tree'])) continue;
                     if (!isset($entry['no_quotes']['parts'][0])) continue;
 
                     $tname = $entry['no_quotes']['parts'][0];
-
-                    // ビュー or プロシージャ名チェック
                     if (in_array($tname, $view_list)) {
                         $tname .= '@view';
                     } elseif (in_array($tname, $proc_list)) {
