@@ -4,62 +4,81 @@ function fallbackParse($code, $rel_path) {
     $view_list = file_exists("view_list.txt") ? file("view_list.txt", FILE_IGNORE_NEW_LINES) : [];
     $proc_list = file_exists("procedure_list.txt") ? file("procedure_list.txt", FILE_IGNORE_NEW_LINES) : [];
 
-    $lines = explode("\n", $code);
-    $sql_vars = [];
+    // 初期スキャン：定数・変数定義（単純代入のみ）
     $vars = [];
-
-    $full_sql_candidates = [];
-
+    $lines = explode("\n", $code);
     foreach ($lines as $line) {
-        // 定数 define("TBL", "orders")
         if (preg_match('/define\s*\(\s*[\'"](\w+)[\'"]\s*,\s*[\'"](\w+)[\'"]\s*\)/i', $line, $m)) {
             $defines[$m[1]] = $m[2];
         }
-
-        // 単純変数代入 $table = 'orders';
         if (preg_match('/\$(\w+)\s*=\s*[\'"]([\w@]+)[\'"]\s*;/', $line, $m)) {
             $vars[$m[1]] = $m[2];
         }
+    }
 
-        // SQL組み立て（.=, =）$sql .= "...";
-        if (preg_match('/\$(\w+)\s*(=|\.=)\s*["\'](.*?)["\']\s*;/', $line, $m)) {
-            $var = $m[1];
-            $op = $m[2];
-            $val = $m[3];
+    // すべてのSQL構築文を統一的に抽出（複数行でも順序保証）
+    $sql_vars = [];
+    $clean_code = preg_replace('#//.*?$|/\*.*?\*/#ms', '', $code);
+    preg_match_all('/\$(\w+)\s*(=|\.=)\s*([\'"])(.*?)\3\s*;?/', $clean_code, $matches, PREG_SET_ORDER);
+    foreach ($matches as $m) {
+        $var = $m[1];
+        $op = $m[2];
+        $val = $m[4];
 
-            // 定数・変数展開
-            $val = preg_replace_callback('/\b([A-Z_][A-Z0-9_]*)\b/', fn($matches) => $defines[$matches[1]] ?? $matches[1], $val);
-            $val = preg_replace_callback('/\$(\w+)/', fn($matches) => $vars[$matches[1]] ?? $matches[0], $val);
+        // 定数・変数展開
+        $val = preg_replace_callback('/\b([A-Z_][A-Z0-9_]*)\b/', fn($m) => $defines[$m[1]] ?? $m[1], $val);
+        $val = preg_replace_callback('/\$(\w+)/', fn($m) => $vars[$m[1]] ?? $m[0], $val);
 
-            if (!isset($sql_vars[$var])) $sql_vars[$var] = '';
-            $sql_vars[$var] = ($op === '=') ? $val : $sql_vars[$var] . ' ' . $val;
-        }
+        if (!isset($sql_vars[$var])) $sql_vars[$var] = '';
+        $sql_vars[$var] = ($op === '=') ? $val : $sql_vars[$var] . ' ' . $val;
+    }
 
-        // 生SQLっぽい文字列を拾う
+    // 生SQLも含めて走査（保険）
+    $sql_candidates = array_values($sql_vars);
+    foreach ($lines as $line) {
         if (preg_match('/(select|insert|update|delete|create\s+temp)\s+.+/i', $line)) {
-            $clean = cleanSQL($line);
-            $full_sql_candidates[] = $clean;
+            $sql_candidates[] = cleanSQL($line);
         }
     }
 
-    // 通常のSQL変数展開も処理
-    foreach ($sql_vars as $sql) {
-        $full_sql_candidates[] = cleanSQL($sql);
-    }
-
-    // 重複除去して処理
-    foreach (array_unique($full_sql_candidates) as $sql) {
+    // 重複を除いて処理開始
+    foreach (array_unique($sql_candidates) as $sql) {
+        $sql = cleanSQL($sql);
         if (empty($sql)) continue;
 
         try {
             $parser = new PHPSQLParser($sql, true);
-
             $op = '';
+            $is_temp = stripos($sql, 'temp') !== false;
+
+            // PostgreSQL 特有: SELECT INTO TEMP 構文（source = R, target@temp = C）
+            if (isset($parser->parsed['SELECT']) && isset($parser->parsed['INTO']) && $is_temp) {
+                foreach ($parser->parsed['INTO'] as $into) {
+                    if (!isset($into['no_quotes']['parts'][0])) continue;
+                    $tname = $into['no_quotes']['parts'][0] . '@temp';
+                    $crud_data["$rel_path|$tname"] = [
+                        'file' => $rel_path, 'table' => $tname,
+                        'C' => '○', 'R' => '', 'U' => '', 'D' => ''
+                    ];
+                }
+                foreach ($parser->parsed['FROM'] ?? [] as $from) {
+                    if (!isset($from['no_quotes']['parts'][0])) continue;
+                    $tname = $from['no_quotes']['parts'][0];
+                    if (in_array($tname, $view_list)) $tname .= '@view';
+                    $crud_data["$rel_path|$tname"] = array_merge(
+                        $crud_data["$rel_path|$tname"] ?? [],
+                        ['file' => $rel_path, 'table' => $tname, 'R' => '○']
+                    );
+                }
+                continue; // この構文はここで終了
+            }
+
+            // 通常の操作種別判定
             if (isset($parser->parsed['SELECT'])) $op = 'R';
             if (isset($parser->parsed['INSERT'])) $op = 'C';
             if (isset($parser->parsed['UPDATE'])) $op = 'U';
             if (isset($parser->parsed['DELETE'])) $op = 'D';
-            if (isset($parser->parsed['CREATE']) && stripos($sql, 'temp') !== false) $op = 'C@temp';
+            if (isset($parser->parsed['CREATE']) && $is_temp) $op = 'C@temp';
 
             foreach (['FROM', 'JOIN', 'UPDATE', 'INTO', 'TABLE'] as $clause) {
                 if (!isset($parser->parsed[$clause])) continue;
@@ -69,22 +88,18 @@ function fallbackParse($code, $rel_path) {
                     if (!isset($entry['no_quotes']['parts'][0])) continue;
 
                     $tname = $entry['no_quotes']['parts'][0];
-                    if (in_array($tname, $view_list)) {
-                        $tname .= '@view';
-                    } elseif (in_array($tname, $proc_list)) {
-                        $tname .= '@proc';
-                    } elseif (strpos($op, '@temp') !== false) {
-                        $tname .= '@temp';
-                    }
+                    if (in_array($tname, $view_list)) $tname .= '@view';
+                    elseif (in_array($tname, $proc_list)) $tname .= '@proc';
+                    elseif (strpos($op, '@temp') !== false) $tname .= '@temp';
 
                     $key = "$rel_path|$tname";
-                    $entry_ref = &$crud_data[$key];
-                    $entry_ref['file'] = $rel_path;
-                    $entry_ref['table'] = $tname;
-                    $entry_ref['C'] = ($op === 'C' || $op === 'C@temp') ? '○' : ($entry_ref['C'] ?? '');
-                    $entry_ref['R'] = $op === 'R' ? '○' : ($entry_ref['R'] ?? '');
-                    $entry_ref['U'] = $op === 'U' ? '○' : ($entry_ref['U'] ?? '');
-                    $entry_ref['D'] = $op === 'D' ? '○' : ($entry_ref['D'] ?? '');
+                    $ref = &$crud_data[$key];
+                    $ref['file'] = $rel_path;
+                    $ref['table'] = $tname;
+                    $ref['C'] = ($op === 'C' || $op === 'C@temp') ? '○' : ($ref['C'] ?? '');
+                    $ref['R'] = $op === 'R' ? '○' : ($ref['R'] ?? '');
+                    $ref['U'] = $op === 'U' ? '○' : ($ref['U'] ?? '');
+                    $ref['D'] = $op === 'D' ? '○' : ($ref['D'] ?? '');
                 }
             }
         } catch (Exception $e) {
