@@ -246,3 +246,21 @@ function outputExcel($results, $view_usage, $proc_usage) {
     $writer = new Xlsx($spreadsheet);
     $writer->save('crud_output.xlsx');
 }
+
+// === 全ファイルを対象に解析 ===
+foreach ($files as $file) {
+    $relpath = ltrim(str_replace(realpath($target_dir), '', realpath($file)), '/\\');
+    $code = file_get_contents($file);
+    $clean_code = stripComments($code);
+
+    // SQL抽出（変数・定数・結合を展開）
+    $sql_list = extractSQLFromCode($clean_code, $relpath);
+
+    // 抽出されたSQLを解析して結果に反映
+    foreach ($sql_list as $sql) {
+        parseSQL($sql, $relpath);
+    }
+}
+
+// === Excelに出力 ===
+outputExcel($results, $view_usage, $proc_usage);
