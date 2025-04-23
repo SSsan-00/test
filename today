@@ -19,18 +19,21 @@ class StringConcatResolver
     public function resolve(string $code): string
     {
         $lines   = explode("\n", $code);
-        $buffers = [];   // varName => merged string
+        $buffers = []; // varName => merged string
         $out     = [];
 
         foreach ($lines as $line) {
+            // $var = "..."
             if (preg_match('/\$(\w+)\s*=\s*([\'"])(.*?)\2\s*;/', $line, $m)) {
                 $buffers[$m[1]] = $m[3];
                 continue;
             }
+            // $var .= "..."
             if (preg_match('/\$(\w+)\s*\.=\s*([\'"])(.*?)\2\s*;/', $line, $m)) {
                 $buffers[$m[1]] = ($buffers[$m[1]] ?? '') . $m[3];
                 continue;
             }
+            // $var = "..." . "..."
             if (preg_match('/\$(\w+)\s*=\s*([\'"])(.*?)\2\s*\.\s*([\'"])(.*?)\4\s*;/', $line, $m)) {
                 $buffers[$m[1]] = $m[3] . $m[5];
                 continue;
@@ -48,14 +51,35 @@ class StringConcatResolver
 }
 
 //--------------------------------------------------
-// 2. FunctionAnalyzer: 雛形
+// 2. SymbolResolver: 定数・変数展開の雛形
+//--------------------------------------------------
+class SymbolResolver
+{
+    private array $consts = [];
+    private array $vars   = [];
+
+    public function collect(string $code): void
+    {
+        // TODO: AST解析で define()/const と $var＝リテラル を収集
+    }
+
+    public function expand(string $code): string
+    {
+        // TODO: $this->consts と $this->vars を使ってコード中を置換
+        return $code;
+    }
+}
+
+//--------------------------------------------------
+// 3. FunctionAnalyzer: 雛形
 //--------------------------------------------------
 class FunctionAnalyzer
 {
     public function analyzeAll(array $fileCodeMap): void
     {
-        // TODO: 後ほど実装
+        // TODO
     }
+
     public function getCallGraph(): array
     {
         return []; // TODO
@@ -63,7 +87,7 @@ class FunctionAnalyzer
 }
 
 //--------------------------------------------------
-// 3. SQLExtractor: PHPSQLParser を用いた SQL 抽出・CRUD判定
+// 4. SQLExtractor: PHPSQLParser を用いた SQL 抽出・CRUD判定
 //--------------------------------------------------
 class SQLExtractor
 {
@@ -87,8 +111,7 @@ class SQLExtractor
         $logs    = [];
 
         // インラインSQL抽出
-        $stmts = preg_split('/;\s*/', $code);
-        foreach ($stmts as $stmt) {
+        foreach (preg_split('/;\s*/', $code) as $stmt) {
             $stmt = trim($stmt);
             if ($stmt === '') continue;
             try {
@@ -101,7 +124,7 @@ class SQLExtractor
             }
         }
 
-        // 条件式ログ
+        // 条件分岐ログ
         if (preg_match_all('/\b(if|switch)\s*\((.*?)\)/i', $code, $m)) {
             foreach ($m[0] as $cond) {
                 $logs[] = ['cond' => $cond];
@@ -126,27 +149,18 @@ class SQLExtractor
             && stripos($entry['CREATE']['temporary'], 'TEMP') !== false
         ) {
             $tbl = $entry['CREATE']['table'];
-            $out[] = [
-                'table'=> $tbl,
-                'C'    => false,
-                'R'    => false,
-                'U'    => false,
-                'D'    => false,
-                'TEMP' => $tbl
-            ];
+            $out[] = ['table'=>$tbl,'C'=>false,'R'=>false,'U'=>false,'D'=>false,'TEMP'=>$tbl];
             return;
         }
 
-        // FROM / JOIN
+        // FROM/JOIN/Alias
         $tables = [];
         if (!empty($entry['FROM'])) {
             foreach ($entry['FROM'] as $f) {
-                if (!empty($f['table'])) {
-                    $tables[] = $f['table'];
-                }
-                if (!empty($f['alias']['name'])) {
-                    $tables[] = $f['alias']['name'];
-                }
+                $tables[] = $f['table'] ?? null;
+                // AS alias 解決雛形
+                // TODO: マッピング処理を入れる
+                $tables[] = $f['alias']['name'] ?? null;
             }
         }
         if (!empty($entry['JOIN'])) {
@@ -155,14 +169,16 @@ class SQLExtractor
             }
         }
 
-        foreach (array_unique($tables) as $tbl) {
-            $clean  = strtolower($tbl);
-            $isView = in_array($clean, array_map('strtolower', $this->views), true);
+        foreach (array_filter(array_unique($tables)) as $tbl) {
+            $isView = in_array(strtolower($tbl), array_map('strtolower', $this->views), true);
             $out[] = [
                 'table' => $tbl . ($isView ? '@view' : ''),
                 'C'     => in_array($type, ['INSERT','CREATE'], true),
-                'R'     => $type==='SELECT' || $type==='UPDATE' || $type==='DELETE'
-                          || !empty($entry['JOIN']) || !empty($entry['WITH']),
+                'R'     => $type==='SELECT'
+                          || $type==='UPDATE'
+                          || $type==='DELETE'
+                          || !empty($entry['JOIN'])
+                          || !empty($entry['WITH']),
                 'U'     => $type==='UPDATE',
                 'D'     => $type==='DELETE',
                 'TEMP'  => ''
@@ -172,16 +188,12 @@ class SQLExtractor
 }
 
 //--------------------------------------------------
-// 4. CRUDAggregator: ファイルごと CRUD 集約
+// 5. CRUDAggregator: ファイルごと CRUD 集約
 //--------------------------------------------------
 class CRUDAggregator
 {
-    public function __construct(array $callGraph) { /* stub */ }
+    public function __construct(array $callGraph) { /* TODO */ }
 
-    /**
-     * @param array<string,array<array{table:string,C:bool,R:bool,U:bool,D:bool,TEMP:string}>> $fileSqlMap
-     * @return array<string,array<string,array{C:bool,R:bool,U:bool,D:bool,TEMP:string}>> 
-     */
     public function aggregate(array $fileSqlMap): array
     {
         $crudMap = [];
@@ -200,7 +212,7 @@ class CRUDAggregator
 }
 
 //--------------------------------------------------
-// 5. ExcelExporter: PhpSpreadsheet で出力
+// 6. ExcelExporter: PhpSpreadsheet で出力
 //--------------------------------------------------
 class ExcelExporter
 {
@@ -215,10 +227,9 @@ class ExcelExporter
         $ws = $wb->getActiveSheet();
         $ws->setTitle('File-CRUD');
 
-        // ヘッダー
+        // File-CRUD シート
         $ws->fromArray(['Table Name','C','R','U','D','TEMP'], null, 'A1');
         $row = 2;
-
         foreach ($crudMap as $file => $tables) {
             $ws->setCellValue("A{$row}", "File: {$file}");
             $row++;
@@ -259,7 +270,7 @@ function main(array $argv): void
         exit(1);
     }
 
-    // 対象ファイル収集
+    // ファイル収集
     $rii   = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($projectDir));
     $files = [];
     foreach ($rii as $file) {
@@ -268,7 +279,7 @@ function main(array $argv): void
         }
     }
 
-    // 1) 前処理：文字列連結解決
+    // 1) 文字列連結解決
     $resolver = new StringConcatResolver();
     $cleaned  = [];
     foreach ($files as $path) {
@@ -276,11 +287,18 @@ function main(array $argv): void
         $cleaned[$path] = $raw !== false ? $resolver->resolve($raw) : '';
     }
 
-    // 2) 関数解析（雛形）
+    // 2) 定数・変数展開雛形
+    $symbolResolver = new SymbolResolver();
+    foreach ($cleaned as $path => $code) {
+        $symbolResolver->collect($code);
+        $cleaned[$path] = $symbolResolver->expand($code);
+    }
+
+    // 3) FunctionAnalyzer 雛形
     $funcAnalyzer = new FunctionAnalyzer();
     $funcAnalyzer->analyzeAll($cleaned);
 
-    // 3) SQL抽出
+    // 4) SQL抽出
     $sqlExt     = new SQLExtractor();
     $fileSqlMap = [];
     $logs       = [];
@@ -290,15 +308,15 @@ function main(array $argv): void
         $logs          = array_merge($logs, $conds);
     }
 
-    // 4) CRUD集約
+    // 5) CRUD集約
     $aggregator = new CRUDAggregator($funcAnalyzer->getCallGraph());
     $crudMap    = $aggregator->aggregate($fileSqlMap);
 
-    // 5) Excel出力
+    // 6) Excel出力
     $exporter = new ExcelExporter();
     $exporter->export('analysis_result.xlsx', $crudMap, $logs);
 
-    echo "Step 1–5 completed. SQL解析とExcel出力を実装しました.\n";
+    echo "Step 1–6 completed. String concat, SQL parsing, and Excel export implemented.\n";
 }
 
 main($argv);
