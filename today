@@ -8,7 +8,6 @@ use PhpParser\NodeTraverser;
 use PhpParser\NodeVisitorAbstract;
 use PhpParser\Node;
 use PHPSQLParser\PHPSQLParser;
-use PHPSQLParser\PHPSQLParserException;
 use PhpOffice\PhpSpreadsheet\Spreadsheet;
 use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 
@@ -32,7 +31,7 @@ class Preprocessor
     public function process(string $code): string
     {
         // 1) コメント除去＆AST→コード生成
-        $ast = $this->parser->parse($code);
+        $ast   = $this->parser->parse($code);
         $clean = $this->printer->prettyPrintFile($ast);
 
         // 2) 定数と単純変数代入の収集
@@ -54,10 +53,25 @@ class Preprocessor
     private function collectDefinesAndVars(array $ast)
     {
         foreach ($ast as $node) {
-            // const Foo = "bar";
+            // const FOO = ...;
             if ($node instanceof Node\Stmt\Const_) {
-                foreach ($node->consts as $c) {
-                    $this->consts[$c->name->name] = $c->value->value;
+                foreach ($node->consts as $const) {
+                    $name    = $const->name->name;
+                    $valNode = $const->value;
+                    if ($valNode instanceof Node\Scalar\String_
+                        || $valNode instanceof Node\Scalar\LNumber
+                        || $valNode instanceof Node\Scalar\DNumber) {
+                        $this->consts[$name] = $valNode->value;
+                    } elseif ($valNode instanceof Node\Expr\ConstFetch) {
+                        $cn = strtolower($valNode->name->toString());
+                        if ($cn === 'true') {
+                            $this->consts[$name] = true;
+                        } elseif ($cn === 'false') {
+                            $this->consts[$name] = false;
+                        } elseif ($cn === 'null') {
+                            $this->consts[$name] = null;
+                        }
+                    }
                 }
             }
             // $foo = "bar";
@@ -70,11 +84,13 @@ class Preprocessor
             // define("FOO","bar");
             if ($node instanceof Node\Stmt\Expression
                 && $node->expr instanceof Node\Expr\FuncCall
-                && $node->expr->name->toString() === 'define') {
+                && $node->expr->name->toString() === 'define'
+            ) {
                 $args = $node->expr->args;
                 if (isset($args[0], $args[1])
                     && $args[0]->value instanceof Node\Scalar\String_
-                    && $args[1]->value instanceof Node\Scalar\String_) {
+                    && $args[1]->value instanceof Node\Scalar\String_
+                ) {
                     $this->consts[$args[0]->value->value] = $args[1]->value->value;
                 }
             }
@@ -94,11 +110,11 @@ class Preprocessor
     {
         // 定数展開
         foreach ($this->consts as $k => $v) {
-            $code = str_replace($k, $v, $code);
+            $code = str_replace($k, (string)$v, $code);
         }
         // 変数展開
         foreach ($this->vars as $k => $v) {
-            $code = str_replace('$' . $k, $v, $code);
+            $code = str_replace('$' . $k, (string)$v, $code);
         }
         return $code;
     }
@@ -130,7 +146,7 @@ class FunctionAnalyzer
         }
         // 呼び出し収集
         foreach ($fileCodeMap as $file => $code) {
-            $ast = $this->parser->parse($code);
+            $ast   = $this->parser->parse($code);
             $calls = $this->collectCalls($ast);
             foreach ($calls as $fn) {
                 foreach ($this->functions as $defFile => $fns) {
@@ -150,7 +166,7 @@ class FunctionAnalyzer
     private function collectFunctions(array $ast): array
     {
         $list = [];
-        $tr = new NodeTraverser();
+        $tr   = new NodeTraverser();
         $tr->addVisitor(new class($list) extends NodeVisitorAbstract {
             public $list;
             public function __construct(&$list) { $this->list = &$list; }
@@ -167,7 +183,7 @@ class FunctionAnalyzer
     private function collectCalls(array $ast): array
     {
         $calls = [];
-        $tr = new NodeTraverser();
+        $tr    = new NodeTraverser();
         $tr->addVisitor(new class($calls) extends NodeVisitorAbstract {
             public $calls;
             public function __construct(&$calls) { $this->calls = &$calls; }
@@ -211,20 +227,16 @@ class SQLExtractor
         $lines   = explode("\n", $code);
         $sqlVars = [];
         foreach ($lines as $line) {
-            // 初期代入: $sql = "..."
             if (preg_match('/\$(\w+)\s*=\s*["\']([^"\']*)["\']/', $line, $m)) {
                 $sqlVars[$m[1]] = $m[2];
-            }
-            // 連結代入: $sql .= "..."
-            elseif (preg_match('/\$(\w+)\s*\.=\s*["\']([^"\']*)["\']/', $line, $m)) {
+            } elseif (preg_match('/\$(\w+)\s*\.=\s*["\']([^"\']*)["\']/', $line, $m)) {
                 $sqlVars[$m[1]] = ($sqlVars[$m[1]] ?? '') . $m[2];
             }
         }
-        // 再構築したSQLを解析
         foreach ($sqlVars as $sql) {
             try {
                 $ast = $this->parser->parse($sql, true);
-            } catch (PHPSQLParserException $e) {
+            } catch (\Exception $e) {
                 continue;
             }
             foreach ($ast as $entry) {
@@ -239,7 +251,7 @@ class SQLExtractor
             if ($stmt === '') continue;
             try {
                 $ast = $this->parser->parse($stmt, true);
-            } catch (PHPSQLParserException $e) {
+            } catch (\Exception $e) {
                 continue;
             }
             foreach ($ast as $entry) {
@@ -273,12 +285,8 @@ class SQLExtractor
         ) {
             $tbl = $entry['CREATE']['table'];
             $out[] = [
-                'table'=> $tbl,
-                'C'    => false,
-                'R'    => false,
-                'U'    => false,
-                'D'    => false,
-                'TEMP' => $tbl
+                'table'=> $tbl, 'C'=>false, 'R'=>false,
+                'U'=>false, 'D'=>false, 'TEMP'=>$tbl
             ];
             return;
         }
@@ -304,8 +312,6 @@ class SQLExtractor
         foreach (array_unique($tables) as $tbl) {
             $clean  = strtolower($tbl);
             $isView = in_array($clean, array_map('strtolower', $this->views), true);
-            $isProc = in_array($clean, array_map('strtolower', $this->procs), true);
-
             $out[] = [
                 'table' => $tbl . ($isView ? '@view' : ''),
                 'C'     => in_array($type, ['INSERT', 'CREATE'], true),
@@ -349,7 +355,7 @@ class CRUDAggregator
                 $this->initTable($crudMap[$file], $tbl);
                 foreach (['C','R','U','D'] as $op) {
                     // PHP7互換の OR 代入
-                    $crudMap[$file][$tbl][$op] = 
+                    $crudMap[$file][$tbl][$op] =
                         $crudMap[$file][$tbl][$op] || $e[$op];
                 }
                 if ($e['TEMP']) {
@@ -376,7 +382,7 @@ class CRUDAggregator
             foreach ($map[$callee] ?? [] as $tbl => $ops) {
                 $this->initTable($map[$file], $tbl);
                 foreach (['C','R','U','D'] as $op) {
-                    $map[$file][$tbl][$op] = 
+                    $map[$file][$tbl][$op] =
                         $map[$file][$tbl][$op] || $ops[$op];
                 }
                 if ($ops['TEMP']) {
@@ -395,7 +401,7 @@ class CRUDAggregator
 }
 
 //--------------------------------------------------
-// ExcelExporter: PhpSpreadsheet で File‑CRUD と LOGS を出力
+// ExcelExporter: PhpSpreadsheet で File-CRUD と LOGS を出力
 //--------------------------------------------------
 class ExcelExporter
 {
@@ -422,6 +428,7 @@ class ExcelExporter
             $row++;
         }
 
+        // LOGS シート
         $logSheet = $wb->createSheet();
         $logSheet->setTitle('LOGS');
         $logSheet->fromArray(['Condition'], null, 'A1');
@@ -446,7 +453,7 @@ function main(array $argv): void
         exit(1);
     }
 
-    // 再帰的に解析対象ファイルを収集
+    // ファイル収集
     $rii   = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($projectDir));
     $files = [];
     foreach ($rii as $file) {
