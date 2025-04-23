@@ -1,0 +1,94 @@
+function fallbackParse($code, $rel_path) {
+    global $crud_data, $log_data, $defines;
+
+    // ビュー・プロシージャ定義ファイルの読み込み
+    $view_list = file_exists("view_list.txt") ? file("view_list.txt", FILE_IGNORE_NEW_LINES) : [];
+    $proc_list = file_exists("procedure_list.txt") ? file("procedure_list.txt", FILE_IGNORE_NEW_LINES) : [];
+
+    $lines = explode("\n", $code);
+    $sql_vars = [];
+    $vars = [];
+
+    // 変数・定数の定義をスキャン
+    foreach ($lines as $line) {
+        // define("TBL", "orders")
+        if (preg_match('/define\s*\(\s*[\'"](\w+)[\'"]\s*,\s*[\'"](\w+)[\'"]\s*\)/i', $line, $m)) {
+            $defines[$m[1]] = $m[2];
+        }
+
+        // $table = 'orders';
+        if (preg_match('/\$(\w+)\s*=\s*[\'"]([\w@]+)[\'"]\s*;/', $line, $m)) {
+            $vars[$m[1]] = $m[2];
+        }
+
+        // $sql = "..."; または $sql .= "...";
+        if (preg_match('/\$(\w+)\s*(=|\.=)\s*["\'](.*?)["\']\s*;/', $line, $m)) {
+            $var = $m[1];
+            $op = $m[2];
+            $val = $m[3];
+
+            // 定数や変数の展開
+            $val = preg_replace_callback('/\b([A-Z_][A-Z0-9_]*)\b/', function ($matches) use ($defines) {
+                return $defines[$matches[1]] ?? $matches[1];
+            }, $val);
+            $val = preg_replace_callback('/\$(\w+)/', function ($matches) use ($vars) {
+                return $vars[$matches[1]] ?? $matches[0];
+            }, $val);
+
+            if (!isset($sql_vars[$var])) $sql_vars[$var] = '';
+            if ($op === '=') {
+                $sql_vars[$var] = $val;
+            } else {
+                $sql_vars[$var] .= ' ' . $val;
+            }
+        }
+    }
+
+    foreach ($sql_vars as $sql) {
+        $sql = cleanSQL($sql);
+        if (empty($sql)) continue;
+
+        try {
+            $parser = new PHPSQLParser($sql, true);
+
+            // 操作種別
+            $op = '';
+            if (isset($parser->parsed['SELECT'])) $op = 'R';
+            if (isset($parser->parsed['INSERT'])) $op = 'C';
+            if (isset($parser->parsed['UPDATE'])) $op = 'U';
+            if (isset($parser->parsed['DELETE'])) $op = 'D';
+            if (isset($parser->parsed['CREATE']) && stripos($sql, 'temp') !== false) $op = 'C@temp';
+
+            // 対象候補句（FROM, JOIN, UPDATE, INTO, TABLE）
+            foreach (['FROM', 'JOIN', 'UPDATE', 'INTO', 'TABLE'] as $clause) {
+                if (!isset($parser->parsed[$clause])) continue;
+
+                foreach ($parser->parsed[$clause] as $entry) {
+                    if (!isset($entry['no_quotes']['parts'][0])) continue;
+
+                    $tname = $entry['no_quotes']['parts'][0];
+
+                    // ビュー or プロシージャ名チェック
+                    if (in_array($tname, $view_list)) {
+                        $tname .= '@view';
+                    } elseif (in_array($tname, $proc_list)) {
+                        $tname .= '@proc';
+                    } elseif (strpos($op, '@temp') !== false) {
+                        $tname .= '@temp';
+                    }
+
+                    $key = "$rel_path|$tname";
+                    $entry_ref = &$crud_data[$key];
+                    $entry_ref['file'] = $rel_path;
+                    $entry_ref['table'] = $tname;
+                    $entry_ref['C'] = ($op === 'C' || $op === 'C@temp') ? '○' : ($entry_ref['C'] ?? '');
+                    $entry_ref['R'] = $op === 'R' ? '○' : ($entry_ref['R'] ?? '');
+                    $entry_ref['U'] = $op === 'U' ? '○' : ($entry_ref['U'] ?? '');
+                    $entry_ref['D'] = $op === 'D' ? '○' : ($entry_ref['D'] ?? '');
+                }
+            }
+        } catch (Exception $e) {
+            $log_data[] = ['file' => $rel_path, 'message' => "fallback SQL解析失敗: " . $e->getMessage()];
+        }
+    }
+}
