@@ -1,0 +1,229 @@
+#!/usr/bin/env php
+<?php
+require 'vendor/autoload.php';
+
+use PhpParser\ParserFactory;
+use PhpParser\NodeTraverser;
+use PhpParser\NodeVisitorAbstract;
+use PhpParser\Node;
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+use PHPSQLParser\PHPSQLParser;
+
+date_default_timezone_set('Asia/Tokyo');
+error_reporting(E_ALL);
+
+$target_dir = $argv[1] ?? getcwd();
+$parser = (new ParserFactory)->create(ParserFactory::PREFER_PHP7);
+
+$crud_data = [];     // ファイルごとのCRUD
+$log_data = [];      // ログ出力用
+$defines = [];       // 定数定義
+$functions = [];     // 関数とSQL
+$resolved_funcs = []; // 関数キャッシュ
+
+function relPath($path) {
+    global $target_dir;
+    return ltrim(str_replace(realpath($target_dir), '', realpath($path)), '/\\');
+}
+
+function cleanSQL($sql) {
+    $sql = preg_replace('/--.*?\n/', '', $sql);
+    $sql = preg_replace('#/\*.*?\*/#s', '', $sql);
+    return trim($sql);
+}
+
+function extractSQLStrings($code) {
+    preg_match_all('/\$[a-zA-Z0-9_]+\s*(=|\.=)\s*(["\'])(.*?)\2\s*;/', $code, $matches, PREG_SET_ORDER);
+    $results = [];
+    foreach ($matches as $m) {
+        $sql = cleanSQL($m[3]);
+        if (stripos($sql, 'select') !== false || stripos($sql, 'insert') !== false ||
+            stripos($sql, 'update') !== false || stripos($sql, 'delete') !== false ||
+            stripos($sql, 'create temp table') !== false) {
+            $results[] = $sql;
+        }
+    }
+    return $results;
+}
+
+function registerFunctionsFromAST($code, $rel_path) {
+    global $parser, $functions, $defines, $log_data;
+
+    try {
+        $ast = $parser->parse($code);
+        if (!$ast) return;
+
+        $traverser = new NodeTraverser();
+        $traverser->addVisitor(new class extends NodeVisitorAbstract {
+            public function enterNode(Node $node) {
+                global $functions, $defines;
+
+                if ($node instanceof Node\Stmt\Function_) {
+                    $fname = $node->name->name;
+                    $body = $node->getStmts();
+                    $sqls = [];
+                    foreach ($body as $stmt) {
+                        if ($stmt instanceof Node\Stmt\Expression && $stmt->expr instanceof Node\Expr\AssignOp\Concat) {
+                            $right = $stmt->expr->expr;
+                            if ($right instanceof Node\Scalar\String_) {
+                                $sqls[] = $right->value;
+                            }
+                        }
+                    }
+                    if ($sqls) $functions[$fname] = implode(" ", $sqls);
+                }
+
+                if ($node instanceof Node\Expr\FuncCall &&
+                    $node->name instanceof Node\Name &&
+                    strtolower($node->name->toString()) === 'define') {
+                    $args = $node->args;
+                    if (count($args) == 2 && $args[0]->value instanceof Node\Scalar\String_ && $args[1]->value instanceof Node\Scalar\String_) {
+                        $defines[$args[0]->value->value] = $args[1]->value->value;
+                    }
+                }
+            }
+        });
+        $traverser->traverse($ast);
+    } catch (PhpParser\Error $e) {
+        $log_data[] = ['file' => $rel_path, 'message' => "AST parse error: " . $e->getMessage()];
+        fallbackParse($code, $rel_path);
+    }
+}
+
+function fallbackParse($code, $rel_path) {
+    global $crud_data;
+
+    $sqls = extractSQLStrings($code);
+    foreach ($sqls as $sql) {
+        try {
+            $parser = new PHPSQLParser($sql, true);
+            $tables = [];
+            $op = '';
+            if (isset($parser->parsed['SELECT'])) $op = 'R';
+            if (isset($parser->parsed['INSERT'])) $op = 'C';
+            if (isset($parser->parsed['UPDATE'])) $op = 'U';
+            if (isset($parser->parsed['DELETE'])) $op = 'D';
+            if (isset($parser->parsed['CREATE']) && stripos($sql, 'temp') !== false) $op = 'C@temp';
+
+            foreach (['FROM', 'INTO', 'UPDATE', 'TABLE'] as $clause) {
+                if (isset($parser->parsed[$clause])) {
+                    foreach ($parser->parsed[$clause] as $tbl) {
+                        if (isset($tbl['no_quotes']['parts'][0])) {
+                            $tname = $tbl['no_quotes']['parts'][0];
+                            if (strpos($op, '@temp') !== false) $tname .= '@temp';
+
+                            $entry = &$crud_data["$rel_path|$tname"];
+                            $entry['file'] = $rel_path;
+                            $entry['table'] = $tname;
+                            $entry['C'] = ($op === 'C' || $op === 'C@temp') ? '○' : ($entry['C'] ?? '');
+                            $entry['R'] = $op === 'R' ? '○' : ($entry['R'] ?? '');
+                            $entry['U'] = $op === 'U' ? '○' : ($entry['U'] ?? '');
+                            $entry['D'] = $op === 'D' ? '○' : ($entry['D'] ?? '');
+                        }
+                    }
+                }
+            }
+        } catch (Exception $e) {
+            global $log_data;
+            $log_data[] = ['file' => $rel_path, 'message' => "fallback SQL parse error: " . $e->getMessage()];
+        }
+    }
+}
+
+function resolveFunctionsInCode($code, $rel_path) {
+    global $functions, $crud_data;
+
+    foreach ($functions as $fname => $sql) {
+        if (strpos($code, $fname) !== false) {
+            try {
+                $parser = new PHPSQLParser(cleanSQL($sql), true);
+                foreach (['FROM', 'INTO', 'UPDATE', 'TABLE'] as $clause) {
+                    if (isset($parser->parsed[$clause])) {
+                        foreach ($parser->parsed[$clause] as $tbl) {
+                            if (isset($tbl['no_quotes']['parts'][0])) {
+                                $tname = $tbl['no_quotes']['parts'][0];
+                                $entry = &$crud_data["$rel_path|$tname"];
+                                $entry['file'] = $rel_path;
+                                $entry['table'] = $tname;
+                                $entry['C'] = isset($parser->parsed['INSERT']) || isset($parser->parsed['CREATE']) ? '○' : ($entry['C'] ?? '');
+                                $entry['R'] = isset($parser->parsed['SELECT']) ? '○' : ($entry['R'] ?? '');
+                                $entry['U'] = isset($parser->parsed['UPDATE']) ? '○' : ($entry['U'] ?? '');
+                                $entry['D'] = isset($parser->parsed['DELETE']) ? '○' : ($entry['D'] ?? '');
+                            }
+                        }
+                    }
+                }
+            } catch (Exception $e) {
+                global $log_data;
+                $log_data[] = ['file' => $rel_path, 'message' => "関数内SQL解析失敗 ($fname): " . $e->getMessage()];
+            }
+        }
+    }
+}
+
+// === ファイル処理本体 ===
+$rii = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($target_dir));
+foreach ($rii as $file) {
+    if ($file->isDir()) continue;
+    $path = $file->getPathname();
+    if (!preg_match('/\.(php|inc|html|js)$/', $path)) continue;
+
+    $rel_path = relPath($path);
+    $code = file_get_contents($path);
+    registerFunctionsFromAST($code, $rel_path);
+    fallbackParse($code, $rel_path);
+    resolveFunctionsInCode($code, $rel_path);
+}
+
+// === Excel出力 ===
+$spreadsheet = new Spreadsheet();
+$sheet = $spreadsheet->getActiveSheet();
+$sheet->setTitle("File-CRUD");
+
+$sheet->setCellValue('A1', 'ファイル名');
+$sheet->setCellValue('B1', 'テーブル名');
+$sheet->setCellValue('C1', 'C');
+$sheet->setCellValue('D1', 'R');
+$sheet->setCellValue('E1', 'U');
+$sheet->setCellValue('F1', 'D');
+
+$row = 2;
+$lastFile = null;
+ksort($crud_data);
+foreach ($crud_data as $key => $entry) {
+    $file = $entry['file'];
+    $table = $entry['table'];
+
+    if ($file !== $lastFile) {
+        if ($lastFile !== null) $row++; // 1行空ける
+        $sheet->setCellValue("A$row", $file);
+        $lastFile = $file;
+    }
+
+    $sheet->setCellValue("B$row", $table);
+    $sheet->setCellValue("C$row", $entry['C'] ?? '');
+    $sheet->setCellValue("D$row", $entry['R'] ?? '');
+    $sheet->setCellValue("E$row", $entry['U'] ?? '');
+    $sheet->setCellValue("F$row", $entry['D'] ?? '');
+    $row++;
+}
+
+// === ログシート ===
+$logSheet = $spreadsheet->createSheet();
+$logSheet->setTitle("ログ");
+$logSheet->setCellValue('A1', 'ファイル名');
+$logSheet->setCellValue('B1', 'メッセージ');
+
+$row = 2;
+foreach ($log_data as $log) {
+    $logSheet->setCellValue("A$row", $log['file']);
+    $logSheet->setCellValue("B$row", $log['message']);
+    $row++;
+}
+
+$writer = new Xlsx($spreadsheet);
+$writer->save("crud_result.xlsx");
+
+echo "完了: crud_result.xlsx を出力しました\n";
+
