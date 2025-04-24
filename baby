@@ -1,0 +1,197 @@
+<?php
+#!/usr/bin/env php
+/**
+ * analyzer.php — PHPソースコード解析ツール 雛形
+ *
+ * 作成者向け実装フローコメントを追加し、全要件を満たす構造を明示
+ *
+ * 要件一覧：
+ * 1. コメント除去 (PHPDoc, // コメント, /* */ コメント, HTML コメント)
+ * 2. include/require の再帰解析 (依存ファイル取り込み)
+ * 3. define() による定数展開
+ * 4. AST解析: nikic/php-parser を利用し createForNewestSupportedVersion() でパーサー生成
+ * 5. SQL解析: PHPSQLParser (greenlion/php-sql-parser) を使用
+ * 6. 文字列連結解決 (複数行にわたる .= を単一文字列に統合)
+ * 7. 変数・定数・関数呼び出しの解析 (AST またはフォールバック)
+ * 8. サブクエリ、JOIN、テーブルエイリアス解析
+ * 9. ビュー検出 (view_list.txt に記載のビュー→テーブル名@view)
+ * 10. ストアドプロシージャ検出 (procedure_list.txt に記載のプロシージャ→テーブル名@proc)
+ * 11. 一時テーブル検出 (SELECT INTO TEMP → テーブル名@temp)
+ * 12. CRUD分類: C, R, U, D 列への ○ マーク設定
+ * 13. ログ出力 (エラー・警告・解析ステップ記録)
+ * 14. Excel出力: PhpSpreadsheet を用い、File-CRUD と Log の2シート構成
+ * 15. File-CRUD シートレイアウト:
+ *     - 各ファイルの見出し行にファイル名を表示
+ *     - 続く行に A=テーブル名 (@temp/@view/@proc付き), B=C, C=R, D=U, E=D
+ *     - ファイル間に1行空行を挿入
+ * 16. Log シートレイアウト: タイムスタンプ順にログメッセージを出力
+ *
+ * 依存ライブラリ:
+ *   "phpoffice/phpspreadsheet": "^4.2",
+ *   "nikic/php-parser": "^5.4",
+ *   "greenlion/php-sql-parser": "^4.7"
+ */
+
+require __DIR__ . '/vendor/autoload.php';
+
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+use PHPSQLParser\PHPSQLParser;
+use PhpParser\ParserFactory;
+
+// 実行環境設定
+date_default_timezone_set('Asia/Tokyo');  // Asia/Tokyo タイムゾーンを明示
+error_reporting(E_ALL);
+
+// ===== グローバルデータ構造 =====
+$crud_data = [];  // File-CRUD シート用データ: [ ['file'=>'','table'=>'','C'=>bool,'R'=>bool,'U'=>bool,'D'=>bool], ... ]
+$log_data  = [];  // Log シート用データ: [ ['time'=>'YYYY-MM-DD HH:MM:SS','message'=>''], ... ]
+$defines   = [];  // define() で展開した定数マップ
+
+// ビュー・プロシージャリストを読み込み (存在しない場合は空配列)
+$view_list = file_exists('view_list.txt') ? file('view_list.txt', FILE_IGNORE_NEW_LINES) : [];
+$proc_list = file_exists('procedure_list.txt') ? file('procedure_list.txt', FILE_IGNORE_NEW_LINES) : [];
+
+/**
+ * エントリポイント：コマンドライン引数で解析対象ディレクトリを受け取る
+ */
+function main(array $argv) {
+    global $crud_data, $log_data;
+
+    // 1. 引数チェック
+    $targetDir = $argv[1] ?? null;
+    if (!$targetDir) {
+        fwrite(STDERR, "Usage: php analyzer.php /path/to/project\n");
+        exit(1);
+    }
+    logMessage("解析開始: ディレクトリ={$targetDir}");
+
+    // 2. 対象ファイルを収集 (.php, .inc, .html, .js 拡張子)
+    $files = collectFiles($targetDir);
+    logMessage("対象ファイル数: " . count($files));
+
+    // 3. 各ファイルを順次解析
+    foreach ($files as $file) {
+        $relPath = getRelativePath($file, $targetDir);
+        logMessage("解析中: {$relPath}");
+        $code    = file_get_contents($file);
+
+        // 3.1. コメント除去
+        $code = removeComments($code);
+
+        // 3.2. include/require の再帰解析
+        // TODO: analyzer.php を再帰呼び出しして依存ファイルを統合解析
+
+        // 3.3. AST解析による構文解析
+        $parser = (new ParserFactory())->createForNewestSupportedVersion();
+        // TODO: AST で define, 変数, 関数呼び出し, クラス依存などを抽出
+
+        // 3.4. SQL解析: 文字列結合解決 + PHPSQLParser でクエリ取得
+        // TODO: resolveConcatenation と PHPSQLParser による SQL 文検出
+
+        // 3.5. フォールバック解析と AST 結果の統合
+        parseFile($code, $relPath);
+    }
+
+    // 4. Excel 出力
+    writeExcel($crud_data, $log_data);
+    logMessage("解析完了: Excelファイル 'analysis_result.xlsx' を出力");
+}
+
+/**
+ * 対象ファイル一覧収集
+ */
+function collectFiles(string $dir): array {
+    $extensions = ['php','inc','html','js'];
+    $result = [];
+    $it = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($dir));
+    foreach ($it as $file) {
+        if ($file->isFile()) {
+            $ext = strtolower(pathinfo($file->getFilename(), PATHINFO_EXTENSION));
+            if (in_array($ext, $extensions)) {
+                $result[] = $file->getPathname();
+            }
+        }
+    }
+    return $result;
+}
+
+/**
+ * コメント除去
+ */
+function removeComments(string $code): string {
+    // TODO: preg_replace による PHPDoc, //, /* */, HTML コメント除去
+    return $code;
+}
+
+/**
+ * 相対パス計算
+ */
+function getRelativePath(string $file, string $root): string {
+    return ltrim(str_replace(realpath($root), '', realpath($file)), DIRECTORY_SEPARATOR);
+}
+
+/**
+ * ファイル解析 (AST とフォールバックの組み合わせ)
+ */
+function parseFile(string $code, string $relPath) {
+    global $crud_data, $log_data;
+    // TODO:
+    // 1) AST 解析結果から SQL クエリ候補を収集
+    // 2) fallbackParse() で正規表現ベースの解析を実行
+    // 3) 両者をマージし、CRUD分類を行い $crud_data に追加
+    // 4) 解析中やエラーは logMessage() で記録
+}
+
+/**
+ * フォールバック解析: 正規表現ベースで文字列結合解決 & CRUD抽出
+ */
+function fallbackParse(string $code, string $relPath) {
+    // TODO: 複数行 .= を統合して1つの SQL 文にまとめる
+    // TODO: /\b(select|insert|update|delete)\b.../i で CRUD 抽出
+    // TODO: VIEW/PROC/TEMP 判定しテーブル名に @view/@proc/@temp を付与
+}
+
+/**
+ * 文字列連結解決
+ */
+function resolveConcatenation($expr, array $context = []) {
+    // TODO: 抽出した PHP 文字列連結表現を解析し、最終的な SQL 文字列を構築
+}
+
+/**
+ * Excel ファイル出力
+ */
+function writeExcel(array $crudData, array $logData) {
+    // 1) スプレッドシート生成
+    $spreadsheet = new Spreadsheet();
+
+    // 2) File-CRUD シート作成
+    $sheet1 = $spreadsheet->getActiveSheet();
+    $sheet1->setTitle('File-CRUD');
+    // TODO:
+    // - 見出し: ファイル名
+    // - 続行: テーブル名(@temp/@view/@proc), C, R, U, D 列
+    // - ファイル切替時に空行挿入
+
+    // 3) Log シート作成
+    $sheet2 = $spreadsheet->createSheet();
+    $sheet2->setTitle('Log');
+    // TODO: タイムスタンプとメッセージを時系列で出力
+
+    // 4) ファイル保存
+    $writer = new Xlsx($spreadsheet);
+    $writer->save('analysis_result.xlsx');
+}
+
+/**
+ * ログ出力ユーティリティ
+ */
+function logMessage(string $message) {
+    global $log_data;
+    $time = date('Y-m-d H:i:s');
+    $log_data[] = ['time' => $time, 'message' => $message];
+}
+
+// スクリプト実行
+main($argv);
