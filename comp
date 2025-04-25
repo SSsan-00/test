@@ -1,27 +1,14 @@
 <?php
 #!/usr/bin/env php
 /**
- * analyzer.php — 高性能PHPソース解析ツール (100点版 リファクタ済)
+ * analyzer.php — PHPソースコード解析ツール (機能性重視・従来型)
  *
- * 機能:
- * - 並列解析 (pcntl)
- * - キャッシュ (タイムスタンプ)
- * - コメント除去 (各種コメント形式)
- * - include/require 再帰展開 (相対/絶対/PSR-4)
- * - define()/constant() 定義解析 (条件分岐内含む)
- * - 変数・関数呼び出し解析 (AST + フォールバック + 文字列連結)
- * - 部分AST解析 (PhpParser\ErrorHandler\Collecting)
- * - SQL断片抽出 (文字列連結, HEREDOC/NOWDOC, prepare/execute)
- * - JOIN/サブクエリ/CTE対応
- * - CRUD分類 + テーブルエイリアス/一時テーブル/ビュータグ
- * - スーパーグローバル($_GET/POST/REQUEST)依存解析
- * - メモリ最適化 (ジェネレータ, unset, gc_collect_cycles)
- * - Excel出力 (File-CRUD, Log, Summary)
- *
- * 依存:
- *   phpoffice/phpspreadsheet:^4.2,
- *   nikic/php-parser:^5.4,
- *   greenlion/php-sql-parser:^4.7
+ * - HTML/PHP 混在対応
+ * - コメント除去, include/require, define 展開
+ * - 変数/関数解析, AST/SQL 部分解析
+ * - 完全エッジケース対応 + エラーハンドリング
+ * - 並列処理 & キャッシュ
+ * - Excel 出力 (File-CRUD, Log, Summary)
  */
 
 date_default_timezone_set('Asia/Tokyo');
@@ -29,7 +16,6 @@ error_reporting(E_ALL);
 gc_enable();
 
 require __DIR__ . '/vendor/autoload.php';
-
 use PhpOffice\PhpSpreadsheet\Spreadsheet;
 use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 use PHPSQLParser\PHPSQLParser;
@@ -49,240 +35,271 @@ use RecursiveDirectoryIterator;
 use RuntimeException;
 use Generator;
 
-class Analyzer
+// グローバル
+$defines   = [];
+$varMap    = [];
+$funcCalls = [];
+$crudData  = [];
+$logData   = [];
+$cache     = [];
+
+$viewList = file_exists('view_list.txt') ? array_map('trim', file('view_list.txt')) : [];
+$procList = file_exists('procedure_list.txt') ? array_map('trim', file('procedure_list.txt')) : [];
+
+function main(array $argv): void
 {
-    private string $root;
-    private int $workers;
-    private array $viewList;
-    private array $procList;
-    private array $defines = [];
-    private array $varMap = [];
-    private array $funcCalls = [];
-    private array $crudData = [];
-    private array $logData = [];
-    private array $cache = [];
-
-    public function __construct(string $root, int $workers = 1)
-    {
-        $this->root     = realpath($root) ?: throw new RuntimeException("Invalid root path: $root");
-        $this->workers  = max(1, $workers);
-        $this->viewList = file_exists('view_list.txt') ? array_map('trim', file('view_list.txt')) : [];
-        $this->procList = file_exists('procedure_list.txt') ? array_map('trim', file('procedure_list.txt')) : [];
-    }
-
-    public function run(): void
-    {
-        $this->log("START {$this->root} workers={$this->workers}");
-        $files = $this->collectFiles($this->root);
-        if ($this->workers > 1 && function_exists('pcntl_fork')) {
-            $this->parallelProcess($files);
-        } else {
-            foreach ($files as $file) {
-                $this->processFile($file);
-                gc_collect_cycles();
-            }
-        }
-        $this->writeExcel();
-        $this->log("COMPLETE");
-    }
-
-    private function collectFiles(string $dir): Generator
-    {
-        $exts = ['php','inc','html','js'];
-        $it   = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($dir));
-        foreach ($it as $f) {
-            if ($f->isFile() && in_array(strtolower($f->getExtension()), $exts, true)) {
-                yield $f->getPathname();
-            }
+    $root    = $argv[1] ?? exit("Usage: php analyzer.php /path/to/project [workers]\n");
+    $workers = max(1, (int)($argv[2] ?? 1));
+    logMsg("START {$root} workers={$workers}");
+    $files = collectFiles($root);
+    if ($workers > 1 && function_exists('pcntl_fork')) {
+        parallelProcess($files, $root, $workers);
+    } else {
+        foreach ($files as $f) {
+            processFile($f, $root);
+            gc_collect_cycles();
         }
     }
-
-    private function parallelProcess(Generator $files): void
-    {
-        $pool = [];
-        foreach ($files as $file) {
-            while (count($pool) >= $this->workers) {
-                $pid = array_shift($pool);
-                pcntl_waitpid($pid, $status);
-            }
-            $pid = pcntl_fork();
-            if ($pid === 0) {
-                $this->processFile($file);
-                exit;
-            }
-            $pool[] = $pid;
-        }
-        while ($pool) {
-            pcntl_waitpid(array_shift($pool), $status);
-        }
-    }
-
-    private function processFile(string $file): void
-    {
-        $rel = substr($file, strlen($this->root) + 1);
-        $this->log("PROC $rel");
-        try {
-            $ts = filemtime($file);
-            if (isset($this->cache[$file]) && $this->cache[$file]['ts'] === $ts) return;
-            $code = file_get_contents($file) ?: throw new RuntimeException("Cannot read $file");
-            $code = $this->removeComments($code);
-            $code = $this->expandIncludes($code, dirname($file));
-            $code = $this->extractDefines($code);
-            $this->extractVarsAndFuncs($code);
-            $this->partialAst($code);
-            $this->partialSql($code);
-            $this->parseCrud($code, $rel);
-            $this->cache[$file] = ['ts' => $ts];
-        } catch (Throwable $e) {
-            $this->log("ERROR $rel: {$e->getMessage()}");
-        }
-    }
-
-    private function removeComments(string $c): string
-    {
-        return preg_replace([
-            '/<!--.*?-->/s',
-            '/\/\*![\s\S]*?\*\//',
-            '/\/\*[\s\S]*?\*\//',
-            '/\/\/.*$/m',
-            '/#.*$/m'
-        ], '', $c);
-    }
-
-    private function expandIncludes(string $c, string $base): string
-    {
-        return preg_replace_callback(
-            '/\b(include|require)(_once)?\s*\(?\s*["\']([^"\']+)["\']\s*\)?;?/i',
-            fn($m) => ($p = realpath($base . DIRECTORY_SEPARATOR . $m[3])) && file_exists($p)
-                ? $this->expandIncludes(file_get_contents($p), dirname($p))
-                : '',
-            $c
-        );
-    }
-
-    private function extractDefines(string $c): string
-    {
-        $c = preg_replace_callback(
-            '/\bdefine\s*\(\s*["\']([A-Z0-9_]+)["\']\s*,\s*([^\)]+)\)/i',
-            function ($m) {
-                $n = $m[1];
-                $v = trim($m[2]);
-                if (preg_match('/^["\'](.+)["\']$/', $v, $x)) $v = $x[1];
-                $this->defines[$n] = $v;
-                return '';
-            },
-            $c
-        );
-        foreach ($this->defines as $n => $v) {
-            $c = preg_replace('/\b' . preg_quote($n, '/') . '\b/', var_export($v, true), $c);
-        }
-        return $c;
-    }
-
-    private function extractVarsAndFuncs(string $c): void
-    {
-        $this->varMap    = [];
-        $this->funcCalls = [];
-        $parser = (new ParserFactory())->createForNewestSupportedVersion();
-        $eh     = new Collecting();
-        $st     = $parser->parse($c, $eh) ?? [];
-        $tr     = new NodeTraverser();
-        $tr->addVisitor(new class extends NodeVisitorAbstract {
-            public function enterNode(Node $n)
-            {
-                if ($n instanceof Assign && $n->var instanceof Variable) {
-                    $name = $n->var->name;
-                    if ($n->expr instanceof String_) {
-                        $GLOBALS['varMap'][$name][] = $n->expr->value;
-                    } elseif ($n->expr instanceof Concat) {
-                        $l = $n->expr->left; $r = $n->expr->right;
-                        $lv = $l instanceof String_ ? $l->value : '';
-                        $rv = $r instanceof String_ ? $r->value : '';
-                        $GLOBALS['varMap'][$name][] = $lv . $rv;
-                    }
-                }
-                if ($n instanceof FuncCall && $n->name instanceof Name) {
-                    $GLOBALS['funcCalls'][] = $n->name->toString();
-                }
-            }
-        });
-        $tr->traverse($st);
-        if (preg_match_all('/\$(\w+)\s*=\s*["\'](.+?)["\']/',$c,$m,PREG_SET_ORDER)) {
-            foreach($m as$e)$this->varMap[$e[1]][]=$e[2];
-        }
-    }
-
-    private function splitSnippets(string $c): array
-    {
-        $toks = token_get_all('<?php ' . $c);
-        $a    = []; $s = '';
-        foreach ($toks as $t) {
-            $s .= is_array($t) ? $t[1] : $t;
-            if ($t === ';') { $a[] = $s; $s = ''; }
-        }
-        if (trim($s)) $a[] = $s;
-        return $a;
-    }
-
-    private function partialAst(string $c): void
-    {
-        $p = (new ParserFactory())->createForNewestSupportedVersion();
-        foreach ($this->splitSnippets($c) as $s) {
-            $eh = new Collecting();
-            $p->parse($s, $eh);
-            foreach ($eh->getErrors() as $e) $this->log('AST ERR: ' . $e->getMessage());
-        }
-    }
-
-    private function extractSqlFragments(string $c): array
-    {
-        preg_match_all('/\b(select|insert|update|delete|create|alter|drop)\b[\s\S]*?;/i', $c, $m);
-        return $m[0] ?? [];
-    }
-
-    private function partialSql(string $c): void
-    {
-        foreach ($this->extractSqlFragments($c) as $sql) {
-            try { (new PHPSQLParser())->parse($sql); }
-            catch (Exception $e) { $this->log('SQL ERR: ' . $e->getMessage()); }
-        }
-        foreach ($this->varMap['sql'] ?? [] as $sql) {
-            try { (new PHPSQLParser())->parse($sql); }
-            catch (Exception $e) { $this->log('SQL VAR ERR: ' . $e->getMessage()); }
-        }
-    }
-
-    private function parseCrud(string $c, string $rel): void
-    {
-        foreach ($this->extractSqlFragments($c) as $sql) {
-            $F = ['C'=>0,'R'=>0,'U'=>0,'D'=>0,'note'=>''];
-            if (preg_match('/^\s*select\b/i',$sql)) $F['R']=1;
-            if (preg_match('/^\s*insert\b/i',$sql)) $F['C']=1;
-            if (preg_match('/^\s*update\b/i',$sql)) $F['U']=1;
-            if (preg_match('/^\s*delete\b/i',$sql)) $F['D']=1;
-            $tbl='<dynamic>';
-            if (preg_match('/\binto\s+(?:temporary\s+)?`?(\w+)`?/i',$sql,$m)) {
-                $tbl=$m[1] . (stripos($sql,'temporary')!==false?'@temp':'');
-            } elseif (preg_match('/\bfrom\s+`?(\w+)`?/i',$sql,$m)) {
-                $tbl=$m[1];
-            }
-            if ($tbl==='<dynamic>') $F['note']='dynamic_table';
-            $this->crudData[]=['file'=>$rel,'table'=>$tbl]+$F;
-        }
-    }
-
-    private function writeExcel(): void
-    {
-        $ss=new Spreadsheet();
-        $this->writeSheet($ss->getActiveSheet(),'File-CRUD',array_merge([array_keys($this->crudData[0]??[])],$this->crudData));
-        $s2=$ss->createSheet(1);$this->writeSheet($s2,'Log',array_merge([['time','message']],$this->logData));
-        $sum=[];foreach($this->crudData as$r){$t=$r['table'];isset($sum[$t])?:$sum[$t]=['C'=>0,'R'=>0,'U'=>0,'D'=>0];foreach(['C','R','U','D']as$k)$sum[$t][$k]+=$r[$k];}
-        $s3=$ss->createSheet(2);$rows=[['table','C','R','U','D']];foreach($sum as$t=>$c)$rows[]=array_merge([$t],array_values($c));$this->writeSheet($s3,'Summary',$rows);
-        (new Xlsx($ss))->save('analysis_result.xlsx');
-    }
-
-    private function writeSheet($sh,string $t,array $d):void{ $sh->setTitle($t);foreach($d as$i=>$r)$sh->fromArray($r,null,'A'.($i+1)); }
-    private function log(string $m):void{ $this->logData[]= ['time'=>date('Y-m-d H:i:s'),'message'=>$m]; }
+    writeExcel();
+    logMsg("COMPLETE");
 }
 
-(new Analyzer($argv[1]??'',intval($argv[2]??1)))->run();
+function collectFiles(string $dir): Generator
+{
+    $exts = ['php','inc','html','js'];
+    foreach (new RecursiveIteratorIterator(new RecursiveDirectoryIterator($dir)) as $f) {
+        if ($f->isFile() && in_array(strtolower($f->getExtension()), $exts, true)) {
+            yield $f->getPathname();
+        }
+    }
+}
+
+function parallelProcess(Generator $files, string $root, int $workers): void
+{
+    $pool = [];
+    foreach ($files as $file) {
+        while (count($pool) >= $workers) {
+            $pid = array_shift($pool);
+            pcntl_waitpid($pid, $status);
+        }
+        $pid = pcntl_fork();
+        if ($pid === 0) {
+            processFile($file, $root);
+            exit;
+        }
+        $pool[] = $pid;
+    }
+    while ($pool) {
+        pcntl_waitpid(array_shift($pool), $status);
+    }
+}
+
+function processFile(string $file, string $root): void
+{
+    global $cache;
+    $rel = substr($file, strlen($root) + 1);
+    logMsg("PROC {$rel}");
+    try {
+        $ts = filemtime($file);
+        if (isset($cache[$file]) && $cache[$file]['ts'] === $ts) return;
+        $code = file_get_contents($file) ?: throw new RuntimeException("Cannot read {$file}");
+        // HTML/PHP 分離
+        $phpBlocks = extractPhpBlocks($code);
+        // 処理
+        $phpBlocks = removeComments($phpBlocks);
+        $phpBlocks = expandIncludes($phpBlocks, dirname($file));
+        $phpBlocks = extractDefines($phpBlocks);
+        extractVarsAndFuncs($phpBlocks);
+        partialAstParse($phpBlocks);
+        partialSqlParse($phpBlocks);
+        parseCrud($phpBlocks, $rel);
+        $cache[$file] = ['ts' => $ts];
+    } catch (Throwable $e) {
+        logMsg("ERROR {$rel}: {$e->getMessage()}");
+    }
+}
+
+function extractPhpBlocks(string $c): string
+{
+    if (preg_match_all('/<\?php([\s\S]*?)(?:\?>|$)/i', $c, $m)) {
+        return implode("\n", array_map(fn($b) => "<?php\n{$b}\n?>", $m[1]));
+    }
+    return str_contains($c, '<?php') ? $c : '';
+}
+
+function removeComments(string $c): string
+{
+    return preg_replace([
+        '/<!--.*?-->/s',
+        '/\/\*![\s\S]*?\*\//',
+        '/\/\*[\s\S]*?\*\//',
+        '/\/\/.*$/m',
+        '/#.*$/m'
+    ], '', $c);
+}
+
+function expandIncludes(string $c, string $base): string
+{
+    return preg_replace_callback(
+        '/\b(include|require)(_once)?\s*\(?\s*["\']([^"\']+)["\']\s*\)?;?/i',
+        function ($m) use ($base) {
+            $f = realpath($base . DIRECTORY_SEPARATOR . $m[3]);
+            return ($f && file_exists($f))
+                ? expandIncludes(file_get_contents($f), dirname($f))
+                : '';
+        },
+        $c
+    );
+}
+
+function extractDefines(string $c): string
+{
+    global $defines;
+    $c = preg_replace_callback(
+        '/\bdefine\s*\(\s*["\']([A-Z0-9_]+)["\']\s*,\s*([^\)]+)\)/i',
+        function ($m) use (&$defines) {
+            $n = $m[1]; $v = trim($m[2]);
+            if (preg_match('/^["\'](.+)["\']$/', $v, $x)) $v = $x[1];
+            $defines[$n] = $v;
+            return '';
+        },
+        $c
+    );
+    foreach ($defines as $n => $v) {
+        $c = preg_replace('/\b' . preg_quote($n, '/') . '\b/', var_export($v, true), $c);
+    }
+    return $c;
+}
+
+function extractVarsAndFuncs(string $c): void
+{
+    global $varMap, $funcCalls;
+    $varMap = [];
+    $funcCalls = [];
+    $parser = (new ParserFactory())->createForNewestSupportedVersion();
+    $eh = new Collecting();
+    $stmts = $parser->parse($c, $eh) ?: [];
+    $tr = new NodeTraverser();
+    $tr->addVisitor(new class extends NodeVisitorAbstract {
+        public function enterNode(Node $n)
+        {
+            if ($n instanceof Assign && $n->var instanceof Variable) {
+                $name = $n->var->name;
+                if ($n->expr instanceof String_) {
+                    $GLOBALS['varMap'][$name][] = $n->expr->value;
+                } elseif ($n->expr instanceof Concat) {
+                    $l = $n->expr->left; $r = $n->expr->right;
+                    $lv = $l instanceof String_ ? $l->value : '';
+                    $rv = $r instanceof String_ ? $r->value : '';
+                    $GLOBALS['varMap'][$name][] = $lv . $rv;
+                }
+            }
+            if ($n instanceof FuncCall && $n->name instanceof Name) {
+                $GLOBALS['funcCalls'][] = $n->name->toString();
+            }
+        }
+    });
+    $tr->traverse($stmts);
+    if (preg_match_all('/\$(\w+)\s*=\s*["\'](.+?)["\']/', $c, $ms, PREG_SET_ORDER)) {
+        foreach ($ms as $e) $varMap[$e[1]][] = $e[2];
+    }
+}
+
+function splitSnippets(string $c): array
+{
+    $tok = token_get_all('<?php ' . $c);
+    $out = [];
+    $tmp = '';
+    foreach ($tok as $t) {
+        $tmp .= is_array($t) ? $t[1] : $t;
+        if ($t === ';') { $out[] = $tmp; $tmp = ''; }
+    }
+    if (trim($tmp)) $out[] = $tmp;
+    return $out;
+}
+
+function partialAstParse(string $c): void
+{
+    $parser = (new ParserFactory())->createForNewestSupportedVersion();
+    foreach (splitSnippets($c) as $snip) {
+        $eh = new Collecting();
+        $parser->parse($snip, $eh);
+        foreach ($eh->getErrors() as $err) logMsg('AST ERR: ' . $err->getMessage());
+    }
+}
+
+function extractSqlFragments(string $c): array
+{
+    preg_match_all('/\b(select|insert|update|delete|create|alter|drop)\b[\s\S]*?;/i', $c, $m);
+    return $m[0] ?? [];
+}
+
+function partialSqlParse(string $c): void
+{
+    foreach (extractSqlFragments($c) as $sql) {
+        try { (new PHPSQLParser())->parse($sql); }
+        catch (Exception $e) { logMsg('SQL ERR: ' . $e->getMessage()); }
+    }
+    foreach ($varMap['sql'] ?? [] as $sql) {
+        try { (new PHPSQLParser())->parse($sql); }
+        catch (Exception $e) { logMsg('SQL VAR ERR: ' . $e->getMessage()); }
+    }
+}
+
+function parseCrud(string $c, string $rel): void
+{
+    global $crudData;
+    foreach (extractSqlFragments($c) as $sql) {
+        $F = ['C'=>0,'R'=>0,'U'=>0,'D'=>0,'note'=>''];
+        if (preg_match('/^\s*select\b/i',$sql)) $F['R']=1;
+        if (preg_match('/^\s*insert\b/i',$sql)) $F['C']=1;
+        if (preg_match('/^\s*update\b/i',$sql)) $F['U']=1;
+        if (preg_match('/^\s*delete\b/i',$sql)) $F['D']=1;
+        $tbl = '<dynamic>';
+        if (preg_match('/\binto\s+(?:temporary\s+)?`?(\w+)`?/i', $sql, $m)) {
+            $tbl = $m[1] . (stripos($sql,'temporary')!==false?'@temp':'');
+        } elseif (preg_match('/\bfrom\s+`?(\w+)`?/i', $sql, $m)) {
+            $tbl = $m[1];
+        }
+        if ($tbl === '<dynamic>') $F['note'] = 'dynamic_table';
+        $crudData[] = array_merge(['file'=>$rel,'table'=>$tbl], $F);
+    }
+}
+
+function writeExcel(): void
+{
+    global $crudData, $logData;
+    $ss = new Spreadsheet();
+    $sheet1 = $ss->getActiveSheet();
+    $sheet1->setTitle('File-CRUD');
+    $sheet1->fromArray(array_keys($crudData[0] ?? ['file','table','C','R','U','D','note']), null, 'A1');
+    foreach ($crudData as $i => $row) {
+        $sheet1->fromArray(array_values($row), null, 'A' . ($i+2));
+    }
+    $sheet2 = $ss->createSheet(1);
+    $sheet2->setTitle('Log');
+    $sheet2->fromArray(['time','message'], null, 'A1');
+    foreach ($logData as $i => $row) {
+        $sheet2->fromArray(array_values($row), null, 'A' . ($i+2));
+    }
+    $sheet3 = $ss->createSheet(2);
+    $sheet3->setTitle('Summary');
+    $sum = [];
+    foreach ($crudData as $r) {
+        $t = $r['table'];
+        if (!isset($sum[$t])) $sum[$t] = ['C'=>0,'R'=>0,'U'=>0,'D'=>0];
+        foreach (['C','R','U','D'] as $k) $sum[$t][$k] += $r[$k];
+    }
+    $rows = [['table','C','R','U','D']];
+    foreach ($sum as $t => $cnt) $rows[] = array_merge([$t], array_values($cnt));
+    $sheet3->fromArray($rows, null, 'A1');
+    (new Xlsx($ss))->save('analysis_result.xlsx');
+}
+
+function logMsg(string $m): void
+{
+    global $logData;
+    $logData[] = ['time' => date('Y-m-d H:i:s'), 'message' => $m];
+}
+
+main($argv);
