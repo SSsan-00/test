@@ -1,14 +1,51 @@
-#!/usr/bin/env php
 <?php
+#!/usr/bin/env php
 /**
- * analyzer.php — PHPソースコード解析ツール 雛形 (堅牢＆メモリ効率設計)
+ * analyzer.php — PHPソースコード解析ツール 雛形 (堅牢＆文法ミス耐性設計)
  *
- * 下記の実装フローに従い、TODO部分を実装してください。
+ * この雛形は以下のステップで実装を進めることを想定しています。
+ * 各セクションには実装の詳細手順を記載しています。
  *
- * 依存ライブラリ:
- *   "phpoffice/phpspreadsheet": "^4.2"
- *   "nikic/php-parser": "^5.4"
- *   "greenlion/php-sql-parser": "^4.7"
+ * 【実装フロー】
+ * 1. **エントリポイント (main)**
+ *    - コマンドライン引数で解析対象ディレクトリを取得しチェック
+ *    - collectFiles() でファイルパスをジェネレータで逐次取得
+ *    - processFile() でファイル単位の解析を実行し、gc_collect_cycles() でメモリ解放
+ *    - writeExcel() で最終結果を Excel (.xlsx) に保存
+ *
+ * 2. **ファイル列挙 (collectFiles)**
+ *    - RecursiveDirectoryIterator でディレクトリを再帰スキャン
+ *    - 対象拡張子 (php, inc, html, js) のみ yield
+ *    - 大規模環境でもメモリ使用量を最小化
+ *
+ * 3. **ファイル解析 (processFile)**
+ *    - (1) コード読み込み: file_get_contents()
+ *    - (2) コメント除去: 正規表現で PHPDoc, //, /* */, HTMLコメントを一括削除
+ *    - (3) include/require 展開: AST または preg_match_all で検出し再帰的展開
+ *    - (4) define() 定数解析・展開: define() を抽出して定数マップに保存しコードを置換
+ *    - (5) 変数・関数呼び出し解析: AST と正規表現併用で Assign/FuncCall を収集
+ *    - (6) 部分AST解析: Collecting を使いステートメント単位でトークン分割→AST解析
+ *    - (7) 部分SQL解析: SQL断片を抽出し PHPSQLParser で個別解析
+ *    - (8) CRUD抽出と統合: fallbackParse() との結果をマージし CRUD フラグ付与
+ *    - (9) メモリ解放: $code, $varMap, $funcCalls を unset し次ファイルへ
+ *
+ * 4. **コード補助関数**
+ *    - removeComments(): コメント削除の正規表現実装ガイド
+ *    - expandIncludes(): include/require 文の抽出と再帰的ファイル統合
+ *    - extractAndReplaceDefines(): define() の検出と置換手順
+ *    - extractVariablesAndFunctions(): AST/正規表現での変数・関数呼び出し収集
+ *    - splitPhpSnippets(): token_get_all でトークン化後ステートメント単位に分割
+ *    - extractSqlFragments(): SQLリテラルや連結済み文字列の抽出方法
+ *    - partialAstParse(): Collecting を利用した堅牢AST解析フロー
+ *    - partialSqlParse(): 断片ごとの SQL パース手順
+ *    - parseFile(): CRUD 判定、@view/@proc/@temp タグ付与、note 設定
+ *    - writeExcel(): PhpSpreadsheet を使った 2-sheet 出力手順
+ *    - logMessage(): タイムスタンプ付きログ蓄積
+ *
+ * 【依存ライブラリ】
+ *   - phpoffice/phpspreadsheet ^4.2
+ *   - nikic/php-parser ^5.4
+ *   - greenlion/php-sql-parser ^4.7
  */
 
 require __DIR__ . '/vendor/autoload.php';
@@ -17,37 +54,29 @@ use PhpOffice\PhpSpreadsheet\Spreadsheet;
 use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 use PHPSQLParser\PHPSQLParser;
 use PhpParser\ParserFactory;
-use PhpParser\Error as PhpParserError;
+use PhpParser\ErrorHandler\Collecting;
 
-// 設定: タイムゾーンとエラーレポート
+// 設定
 date_default_timezone_set('Asia/Tokyo');
 error_reporting(E_ALL);
-// メモリ管理: ガーベジコレクション有効化
 gc_enable();
 
-// グローバル変数の宣言
-$crud_data = [];    // ['file'=>string,'table'=>string,'C'=>bool,'R'=>bool,'U'=>bool,'D'=>bool,'note'=>string]
-$log_data  = [];    // ['time'=>string,'message'=>string]
-$defines   = [];    // define() で登録した定数マップ
-$varMap    = [];    // 変数名=>値 のマップ
-$funcCalls = [];    // 関数呼び出し一覧
+// グローバル変数定義
+$crud_data = [];
+$log_data  = [];
+$defines   = [];
+$varMap    = [];
+$funcCalls = [];
 
-// ビュー・プロシージャリスト読み込み (一度のみ)
 $view_list = file_exists('view_list.txt')       ? file('view_list.txt',       FILE_IGNORE_NEW_LINES) : [];
 $proc_list = file_exists('procedure_list.txt') ? file('procedure_list.txt', FILE_IGNORE_NEW_LINES) : [];
 
 /**
- * === エントリポイント ===
- * 1. 対象ディレクトリを受け取り
- * 2. ジェネレータでファイルパスを逐次取得
- * 3. ファイルごとに processFile() を呼び出し
- * 4. 最後に Excel 出力
+ * エントリポイント
+ * @param array $argv コマンドライン引数
  */
-function main(array $argv)
+function main(array $argv): void
 {
-    global $log_data;
-
-    // 引数チェック
     if (empty($argv[1])) {
         fwrite(STDERR, "Usage: php analyzer.php /path/to/project\n");
         exit(1);
@@ -55,22 +84,21 @@ function main(array $argv)
     $targetDir = $argv[1];
     logMessage("解析開始: {$targetDir}");
 
-    // ファイル収集と処理
+    // ファイル収集と解析
     foreach (collectFiles($targetDir) as $file) {
         processFile($file, $targetDir);
-        // ファイル処理後はメモリ解放を促進
-        gc_collect_cycles();
+        gc_collect_cycles();  // メモリの断片回収
     }
 
-    // Excel 形式で結果を出力
-    writeExcel($GLOBALS['crud_data'], $log_data);
+    // 結果を Excel 出力
+    writeExcel($GLOBALS['crud_data'], $GLOBALS['log_data']);
     logMessage("解析完了: analysis_result.xlsx 出力完了");
 }
 
 /**
- * collectFiles:
- * - ジェネレータを使用し、指定ディレクトリ内のファイルパスを順次返す
- * - 対象拡張子: php, inc, html, js
+ * 対象ファイルをジェネレータで返す
+ * @param string $dir ルートディレクトリ
+ * @return Generator<string>
  */
 function collectFiles(string $dir): Generator
 {
@@ -87,139 +115,123 @@ function collectFiles(string $dir): Generator
 }
 
 /**
- * processFile:
- * - 単一ファイルの解析手順をまとめた関数
- *   1) コード読み込み
- *   2) コメント除去
- *   3) include/require 展開
- *   4) define() 解析 & 定数置換
- *   5) 変数・関数呼び出し解析
- *   6) 部分的 AST 解析
- *   7) 部分的 SQL 解析
- *   8) CRUD 抽出と統合
- *   9) 処理後メモリ解放 (unset)
+ * ファイル単位の解析フロー
+ * @param string $file ファイルパス
+ * @param string $root ルートディレクトリ
  */
 function processFile(string $file, string $root): void
 {
     global $crud_data;
-
-    // 相対パスを算出
     $relPath = ltrim(str_replace(realpath($root), '', realpath($file)), DIRECTORY_SEPARATOR);
     logMessage("処理開始: {$relPath}");
 
-    // 1) コード読み込み
+    // (1) コード読み込み
     $code = file_get_contents($file);
 
-    // 2) コメント除去
+    // (2) コメント除去
     $code = removeComments($code);
 
-    // 3) include/require 展開
+    // (3) include/require 展開
     $code = expandIncludes($code, dirname($file));
 
-    // 4) define() 解析 & 定数置換
+    // (4) define()/定数置換
     $code = extractAndReplaceDefines($code);
 
-    // 5) 変数・関数呼び出し解析
+    // (5) 変数・関数呼び出し解析
     extractVariablesAndFunctions($code);
 
-    // 6) 部分的 AST 解析: スニペット単位で堅牢に
+    // (6) 部分AST解析 (Collecting 使用)
     partialAstParse($code);
 
-    // 7) 部分的 SQL 解析: 断片単位で堅牢に
+    // (7) 部分SQL解析
     partialSqlParse($code);
 
-    // 8) CRUD 抽出と統合処理
+    // (8) CRUD抽出と統合
     parseFile($code, $relPath);
 
-    // 9) メモリ解放
-    unset($code, $varMap, $funcCalls);
+    // (9) メモリ解放
+    unset($code, $GLOBALS['varMap'], $GLOBALS['funcCalls']);
 }
 
 /**
- * removeComments:
- * - 各種コメント(PHPDoc, //, /* */, HTML)を正規表現で除去
+ * コメント除去
+ * - PHPDoc, // コメント, /* コメント */, HTMLコメント を一括除去
  */
 function removeComments(string $code): string
 {
-    // TODO: コメントパターンを preg_replace() で実装
+    // TODO: preg_replace() で各種コメントを削除
     return $code;
 }
 
 /**
- * expandIncludes:
- * - include/require 文を検出し、ファイルを再帰展開して統合コードを生成
+ * include/require 展開
+ * - AST または正規表現で include/require 文を検出
+ * - realpath() で絶対パス解決し file_get_contents() で読み込み
+ * - 再帰的に同じメソッドを呼び出し、コードを統合
  */
 function expandIncludes(string $code, string $baseDir): string
 {
-    // TODO:
-    // 1. AST or preg_match_all() で include/require を検出
-    // 2. パスを realpath() で解決
-    // 3. 存在チェック後 file_get_contents() で取得
-    // 4. 再帰的に同関数を呼び出し
-    // 5. 元コードに統合
+    // TODO: 実装
     return $code;
 }
 
 /**
- * extractAndReplaceDefines:
- * - define() を検出し定数マップに保存、コード中の定数を置換
+ * define()/定数展開
+ * - define() を抽出して $defines に登録
+ * - コード中の定数使用箇所を値に置換
+ * - define() 文を削除
  */
 function extractAndReplaceDefines(string $code): string
 {
     global $defines;
-    // TODO:
-    // 1. preg_match_all() or AST で define()抽出
-    // 2. $defines['NAME'] = VALUE
-    // 3. str_replace()/preg_replace() で NAME を VALUE に置換
-    // 4. define() 文をコードから削除
+    // TODO: 実装
     return $code;
 }
 
 /**
- * extractVariablesAndFunctions:
- * - AST & 正規表現で変数代入と関数呼び出しを収集
- * - 後続の解析で動的構築パターンを推定
+ * 変数・関数呼び出し解析
+ * - AST (Assign, FuncCall) および preg_match で静的文字列代入を収集
+ * - 後続の SQL/CRUD 判定で動的構築パターンに利用
  */
 function extractVariablesAndFunctions(string $code): void
 {
     global $varMap, $funcCalls;
-    // TODO:
-    // 1. ParserFactory()->parse() で AST 取得
-    // 2. NodeTraverser + NodeVisitor で Assign, FuncCall を抽出
-    // 3. preg_match_all() で静的文字列代入をバックアップ
+    // TODO: 実装
 }
 
 /**
- * partialAstParse:
+ * 部分AST解析 (文法ミス耐性)
  * - token_get_all() でトークン化
  * - splitPhpSnippets() でステートメント単位に分割
- * - 各スニペットを try/catch で AST 解析
+ * - Collecting を使いエラーハンドルしつつ parse()
  */
 function partialAstParse(string $code): void
 {
-    $parser = (new ParserFactory())->createForNewestSupportedVersion();
+    $parser       = (new ParserFactory())->createForNewestSupportedVersion();
+    $errorHandler = new Collecting();
     foreach (splitPhpSnippets($code) as $snippet) {
-        try {
-            $stmts = $parser->parse($snippet);
-            // TODO: AST走査で依存解析や SQL候補抽出
-        } catch (PhpParserError $e) {
-            logMessage("AST解析エラー: {$e->getMessage()}");
+        // エラーキャプチャ用ハンドラを再生成しながら parse
+        $errorHandler->clearErrors();
+        $stmts = $parser->parse($snippet, $errorHandler);
+        foreach ($errorHandler->getErrors() as $error) {
+            logMessage("ASTエラー: {$error->getMessage()}");
         }
+        // TODO: $stmts を ASTVisitor で走査し依存／SQL候補を抽出
         unset($stmts);
     }
 }
 
 /**
- * partialSqlParse:
- * - extractSqlFragments() で SQL 断片を取得
- * - 各断片を try/catch で PHPSQLParser->parse()
+ * 部分SQL解析
+ * - extractSqlFragments() で SQL 文字列を断片として抽出
+ * - PHPSQLParser->parse() で個別に解析
  */
 function partialSqlParse(string $code): void
 {
     foreach (extractSqlFragments($code) as $sql) {
         try {
             $parsed = (new PHPSQLParser())->parse($sql);
-            // TODO: parsed から CRUD判定用データを抽出
+            // TODO: parsed から CRUD判定用データを収集
         } catch (Exception $e) {
             logMessage("SQL解析エラー: {$e->getMessage()}");
         }
@@ -227,33 +239,36 @@ function partialSqlParse(string $code): void
 }
 
 /**
- * splitPhpSnippets:
- * - token_get_all()の結果から
- * - 文末の ";" や "<?php ?>" タグまでを単位として分割
+ * PHPスニペット分割
+ * - token_get_all() の結果を
+ * - セミコロン終了 or PHPタグ終了を目安に分割し配列返却
  */
 function splitPhpSnippets(string $code): array
 {
-    // TODO: 実装してステートメント配列を返す
+    // TODO: 実装
     return [];
 }
 
 /**
- * extractSqlFragments:
- * - 文字列連結済み SQL リテラルや HEREDOC などを抽出
+ * SQL断片抽出
+ * - シングル/ダブルクオート文字列リテラル
+ * - HEREDOC/NOWDOC
+ * - 複数行の .=" 連結後の文字列
  */
 function extractSqlFragments(string $code): array
 {
-    // TODO: 正規表現 or AST で SQL文字列を抽出
+    // TODO: 実装
     return [];
 }
 
 /**
- * parseFile:
- * - fallbackParse() と前段の AST/SQL結果を統合
- * - CRUD判定
- * - テーブル名に @view/@proc/@temp を付与
- * - note列の設定 (分岐あり or 判定不能)
- * - $crud_data への追加
+ * CRUD抽出と統合処理
+ * - fallbackParse() により正規表現ベース解析
+ * - partialAstParse, partialSqlParse 結果をマージ
+ * - CRUDフラグを設定 (C,R,U,D)
+ * - ビュー/プロシージャ/一時テーブルに @view/@proc/@temp 付与
+ * - 条件分岐や判定不能箇所は note に記載
+ * - $crud_data に出力
  */
 function parseFile(string $code, string $relPath): void
 {
@@ -262,17 +277,16 @@ function parseFile(string $code, string $relPath): void
 }
 
 /**
- * writeExcel:
- * - Spreadsheet で "File-CRUD" シートと "Log" シートを生成
- * - ヘッダー行をセット (table,C,R,U,D,note) と (time,message)
- * - $crudData, $logData をループで出力
+ * Excel出力
+ * - シート1: File-CRUD  (header: file,table,C,R,U,D,note)
+ * - シート2: Log        (header: time,message)
  */
 function writeExcel(array $crudData, array $logData): void
 {
     $ss = new Spreadsheet();
     $sheet1 = $ss->getActiveSheet();
     $sheet1->setTitle('File-CRUD');
-    // TODO: ヘッダー行と各行出力
+    // TODO: ヘッダー行・データ行出力
 
     $sheet2 = $ss->createSheet();
     $sheet2->setTitle('Log');
@@ -282,8 +296,7 @@ function writeExcel(array $crudData, array $logData): void
 }
 
 /**
- * logMessage:
- * - タイムスタンプ付きで $log_data にメッセージを追加
+ * ログ記録
  */
 function logMessage(string $msg): void
 {
