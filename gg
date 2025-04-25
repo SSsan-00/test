@@ -1,0 +1,59 @@
+function removeComments(string $code): string
+{
+    // PHPDoc & /*! */ と /* */
+    $code = preg_replace('~/\*\*[\s\S]*?\*/~', '', $code);
+    $code = preg_replace('~/\*[\s\S]*?\*/~', '', $code);
+    // // コメント
+    $code = preg_replace('~//.*$~m', '', $code);
+    // # コメント
+    $code = preg_replace('~#.*$~m', '', $code);
+    // HTML コメント
+    $code = preg_replace('~<!--([\s\S]*?)-->~', '', $code);
+    return $code;
+}
+
+function expandIncludes(string $code, string $baseDir): string
+{
+    // include/require 文を検出して再帰展開
+    return preg_replace_callback(
+        '/\b(require|include)(_once)?\s*\(?\s*["\']([^"\']+)["\']\s*\)?\s*;/i',
+        function ($m) use ($baseDir) {
+            $path = $m[3];
+            $full = realpath($baseDir . DIRECTORY_SEPARATOR . $path);
+            if ($full && file_exists($full)) {
+                $inc = file_get_contents($full);
+                return expandIncludes($inc, dirname($full));
+            }
+            return '';  // ファイルが無ければ削除
+        },
+        $code
+    );
+}
+
+function extractAndReplaceDefines(string $code): string
+{
+    global $defines;
+    // define('NAME', VALUE);
+    $code = preg_replace_callback(
+        '/\bdefine\s*\(\s*["\']([A-Z0-9_]+)["\']\s*,\s*(.+?)\s*\)\s*;/i',
+        function ($m) use (&$defines) {
+            $name  = $m[1];
+            $value = trim($m[2]);
+            if (preg_match('/^["\'](.+)["\']$/', $value, $vm)) {
+                $value = $vm[1];
+            }
+            $defines[$name] = $value;
+            return '';
+        },
+        $code
+    );
+    // 定数置換
+    foreach ($defines as $name => $value) {
+        $code = preg_replace(
+            '/\b' . preg_quote($name, '/') . '\b/',
+            var_export($value, true),
+            $code
+        );
+    }
+    return $code;
+}
