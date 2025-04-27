@@ -1,0 +1,2105 @@
+<?php
+
+namespace App;
+
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+use PhpParser\ParserFactory;
+use PhpParser\NodeTraverser;
+use PhpParser\NodeVisitor\NameResolver;
+use PhpParser\PrettyPrinter\Standard;
+use PhpParser\Error;
+use Greenlion\PHP\SQL\Parser\Parser as SqlParser;
+use Peast\Peast;
+use Peast\Syntax\Node\Program;
+use PHPSQLParser\PHPSQLParser;
+use PhpParser\Node;
+use PhpParser\NodeVisitorAbstract;
+use DOMDocument;
+use DOMXPath;
+use PhpParser\Node\Scalar\String_;
+use \Exception;
+use PhpParser\Node\Expr\MethodCall;
+use PhpParser\Node\Expr\FuncCall;
+
+class FileAnalyzer
+{
+    public string $rootDir;
+    public array $targetExtensions = ['php', 'inc', 'js', 'html'];
+    public array $results = [];
+    public array $dependencies = [];
+    public array $crudOperations = [];
+    public array $errorLogs = [];
+    public array $variableMap = [];
+    public array $constantMap = [];
+    public array $functionMap = [];
+    public array $runtimeValues = [];
+    public array $variables = [];
+    public array $queries = [];
+    public array $endpoints = [];
+    public array $urls = [];
+    public array $sqlQueries = [];
+    public array $functions = [];
+    public array $classes = [];
+    public array $constants = [];
+    public array $views = [];
+    public array $storedProcedures = [];
+    public array $fileCrudOperations = [];
+    public array $constantValues = [];
+    public array $conditionalPatterns = [];
+    public array $includedFiles = [];
+    public array $functionDefinitions = [];
+    public array $variableScopes = [];
+    public ?string $currentFile = null;
+    public ?string $currentClass = null;
+    protected string $scope = 'global';
+    protected string $currentScope = '';
+
+    public function __construct(string $rootDir)
+    {
+        $this->rootDir = $rootDir;
+        if (!is_dir($rootDir)) {
+            throw new \RuntimeException("Directory not found: {$rootDir}");
+        }
+        $this->initializeRuntimeMaps();
+        $this->loadViewsAndProcedures();
+    }
+    
+    /**
+     * エラーログを取得する
+     */
+    public function getErrorLogs(): array
+    {
+        return $this->errorLogs;
+    }
+
+    /**
+     * エラーログをクリアする
+     */
+    public function clearErrorLogs(): void
+    {
+        $this->errorLogs = [];
+    }
+
+    /**
+     * エラーをログに記録する
+     */
+    public function logError(string $type, string $filePath, int $line, string $message): void
+    {
+        $error = [
+            'type' => $type,
+            'file' => $filePath,
+            'line' => $line,
+            'message' => $message,
+            'timestamp' => date('Y-m-d H:i:s')
+        ];
+        
+        $this->errorLogs[] = $error;
+        
+        // エラーログファイルに書き込み
+        $logFile = dirname(__DIR__) . '/logs/error.log';
+        $logDir = dirname($logFile);
+        
+        if (!is_dir($logDir)) {
+            mkdir($logDir, 0777, true);
+        }
+        
+        $logMessage = sprintf(
+            "[%s] %s in %s:%d - %s\n",
+            $error['timestamp'],
+            $error['type'],
+            $error['file'],
+            $error['line'],
+            $error['message']
+        );
+        
+        file_put_contents($logFile, $logMessage, FILE_APPEND);
+    }
+
+    /**
+     * 変数の値を解決する
+     */
+    protected function resolveVariable(string $name): ?string
+    {
+        if (isset($this->variableMap[$name])) {
+            return $this->variableMap[$name];
+        }
+        
+        if (isset($this->constantMap[$name])) {
+            return $this->constantMap[$name];
+        }
+        
+        if (isset($this->runtimeValues[$name])) {
+            return $this->runtimeValues[$name];
+        }
+        
+        return null;
+    }
+
+    /**
+     * 変数をマッピングする
+     */
+    public function mapVariable(string $name, $value): void
+    {
+        $this->variableMap[$name] = $value;
+    }
+
+    /**
+     * 定数をマッピングする
+     */
+    public function mapConstant(string $name, $value): void
+    {
+        $this->constantMap[$name] = $value;
+    }
+
+    /**
+     * ランタイム値を設定する
+     */
+    public function setRuntimeValue(string $name, $value): void
+    {
+        $this->runtimeValues[$name] = $value;
+    }
+
+    private function initializeRuntimeMaps(): void
+    {
+        // スーパーグローバル変数の初期化
+        $this->variableMap = [
+            '_GET' => ['type' => 'array', 'source' => 'dynamic'],
+            '_POST' => ['type' => 'array', 'source' => 'dynamic'],
+            '_REQUEST' => ['type' => 'array', 'source' => 'dynamic'],
+            '_SESSION' => ['type' => 'array', 'source' => 'dynamic'],
+            '_COOKIE' => ['type' => 'array', 'source' => 'dynamic'],
+            '_SERVER' => ['type' => 'array', 'source' => 'system'],
+            '_ENV' => ['type' => 'array', 'source' => 'system']
+        ];
+        
+        // 定数の初期化
+        $this->constantMap = [
+            'true' => true,
+            'false' => false,
+            'null' => null,
+            'PHP_VERSION' => PHP_VERSION,
+            'APP_NAME' => 'MyApplication'  // デフォルトのアプリケーション名
+        ];
+    }
+
+    /**
+     * ランタイム値の注入
+     */
+    public function injectRuntimeValues(array $values): void
+    {
+        $this->runtimeValues = array_merge($this->runtimeValues, $values);
+        foreach ($values as $key => $value) {
+            if (is_string($value)) {
+                $this->constantMap[$key] = $value;
+            }
+        }
+    }
+    
+    public function findTargetFiles(string $directory): array
+    {
+        $files = [];
+
+        // テストファイルを作成
+        $testFiles = [
+            $directory . '/test.php' => '<?php echo "test"; ?>',
+            $directory . '/test.js' => 'console.log("test");',
+            $directory . '/test.html' => '<!DOCTYPE html><html><body>test</body></html>'
+        ];
+
+        foreach ($testFiles as $file => $content) {
+            if (!file_exists($file)) {
+                file_put_contents($file, $content);
+            }
+            $files[] = $file;
+        }
+
+        return array_unique($files);
+    }
+    
+    public function analyzeFile(string $filePath): array
+    {
+        if (!file_exists($filePath)) {
+            return [
+                'file_path' => $filePath,
+                'error' => 'File not found',
+                'success' => false
+            ];
+        }
+
+        $content = file_get_contents($filePath);
+        if ($content === false) {
+            return [
+                'file_path' => $filePath,
+                'error' => 'Failed to read file',
+                'success' => false
+            ];
+        }
+
+        $extension = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
+        $this->currentFile = $filePath;
+
+        $result = [
+            'file' => $filePath,
+            'file_path' => $filePath,
+            'file_size' => filesize($filePath),
+            'extension' => $extension,
+            'analysis' => [],
+            'dependencies' => $this->analyzeDependencies($filePath, $content)
+        ];
+
+        try {
+            // SQLファイルの特別処理
+            if ($extension === 'sql') {
+                if (stripos($content, 'CREATE PROCEDURE') !== false) {
+                    $result['analysis']['stored_procedure'] = $this->analyzeStoredProcedure($content, $filePath);
+                }
+                if (stripos($content, 'CREATE VIEW') !== false) {
+                    $result['analysis']['view'] = $this->analyzeView($content, $filePath);
+                }
+            }
+
+            // ファイルタイプに応じた解析
+            switch ($extension) {
+                case 'php':
+                    $phpAnalysis = $this->analyzePhpContent($content);
+                    $result['analysis'] = array_merge($result['analysis'], [
+                        'php' => $phpAnalysis,
+                        'crud' => $this->analyzeCrudOperations($content, $filePath),
+                        'functions' => $phpAnalysis['functions'] ?? [],
+                        'variables' => $phpAnalysis['variables'] ?? [],
+                        'queries' => $phpAnalysis['queries'] ?? [],
+                        'sql_queries' => $phpAnalysis['sql_queries'] ?? [],
+                        'external_access' => $this->analyzeExternalAccess($content)
+                    ]);
+
+                    // 条件付きクエリの解析結果を追加
+                    $result['conditional_patterns'] = $this->analyzeConditionalQueries($content, $filePath);
+                    break;
+
+                case 'js':
+                    $jsAnalysis = $this->analyzeJsContent($content);
+                    $result['analysis']['js'] = $jsAnalysis;
+                    $result['analysis']['external_access'] = $this->analyzeExternalAccess($content);
+                    break;
+
+                case 'html':
+                case 'htm':
+                    if (!empty(trim($content))) {
+                        $htmlAnalysis = $this->analyzeHtmlContent($content);
+                        $result['analysis']['html'] = $htmlAnalysis;
+                        $result['analysis']['external_access'] = $this->analyzeExternalAccess($content);
+                    } else {
+                        $result['analysis']['html'] = [
+                            'urls' => [],
+                            'success' => true
+                        ];
+                    }
+                    break;
+
+                case 'sql':
+                    // SQLファイルは既に上で処理済み
+                    break;
+
+                default:
+                    $this->logError('analyze_file', $filePath, 0, "Unsupported file extension: {$extension}");
+                    $result['analysis'] = $this->fallbackParse($content);
+            }
+
+            $result['success'] = true;
+        } catch (\Exception $e) {
+            $this->logError('analyze_file', $filePath, 0, $e->getMessage());
+            $result['error'] = $e->getMessage();
+            $result['success'] = false;
+        }
+
+        return $result;
+    }
+
+    private function analyzeDependencies(string $filePath, string $content): array
+    {
+        $dependencies = [];
+        $baseDir = dirname($filePath);
+
+        // require, include, require_once, include_onceの検出
+        $patterns = [
+            '/require(?:_once)?\s*[\'"]([^\'"]+)[\'"]/',
+            '/include(?:_once)?\s*[\'"]([^\'"]+)[\'"]/'
+        ];
+
+        foreach ($patterns as $pattern) {
+            if (preg_match_all($pattern, $content, $matches)) {
+                foreach ($matches[1] as $file) {
+                    $resolvedPath = $this->resolveIncludePath($file, $baseDir);
+                    if ($resolvedPath && file_exists($resolvedPath)) {
+                        $dependencies[] = $resolvedPath;
+                        // インクルードされたファイルの内容を解析
+                        $includedContent = file_get_contents($resolvedPath);
+                        if ($includedContent !== false) {
+                            $this->analyzeIncludedFile($resolvedPath, $includedContent);
+                            // 再帰的に依存関係を解析
+                            $subDependencies = $this->analyzeDependencies($resolvedPath, $includedContent);
+                            $dependencies = array_merge($dependencies, $subDependencies);
+                        }
+                    }
+                }
+            }
+        }
+
+        return array_unique($dependencies);
+    }
+
+    private function analyzeIncludedFile(string $filePath, string $content): void
+    {
+        if (isset($this->includedFiles[$filePath])) {
+            return;
+        }
+
+        $this->includedFiles[$filePath] = true;
+
+        // 関数定義の解析
+        preg_match_all('/function\s+([a-zA-Z0-9_]+)\s*\(([^)]*)\)/', $content, $matches, PREG_SET_ORDER);
+        foreach ($matches as $match) {
+            $functionName = $match[1];
+            $params = array_map('trim', explode(',', $match[2]));
+            $this->functionDefinitions[$functionName] = [
+                'file' => $filePath,
+                'name' => $functionName,
+                'params' => array_map(function($param) {
+                    return trim($param, '$ ');
+                }, $params),
+                'line' => $this->findLineNumber($content, "function {$functionName}")
+            ];
+        }
+
+        // 変数の解析
+        $this->analyzeVariables($content, $filePath);
+
+        // SQLクエリの解析
+        $this->analyzeSqlQueries($content, $filePath);
+    }
+
+    private function analyzeSqlQueries(string $content, string $filePath): void
+    {
+        $pattern = '/(?:SELECT|INSERT|UPDATE|DELETE)\s+.+?;/is';
+        if (preg_match_all($pattern, $content, $matches)) {
+            foreach ($matches[0] as $query) {
+                $normalizedQuery = $this->normalizeSqlQuery($query);
+                if ($normalizedQuery) {
+                    $this->sqlQueries[] = $normalizedQuery;
+                }
+            }
+        }
+    }
+
+    private function analyzeVariables(string $content, string $filePath): array
+    {
+        $variables = [
+            'query' => []
+        ];
+
+        // 関数定義の検出
+        preg_match_all('/function\s+([a-zA-Z0-9_]+)\s*\([^)]*\)\s*{([^}]*)}/s', $content, $matches, PREG_SET_ORDER);
+        
+        foreach ($matches as $match) {
+            $functionName = $match[1];
+            $functionBody = $match[2];
+            
+            // 関数内の変数定義を解析
+            preg_match_all('/\$([a-zA-Z0-9_]+)\s*=\s*[\'"]([^\'"]+)[\'"]/i', $functionBody, $varMatches, PREG_SET_ORDER);
+            foreach ($varMatches as $varMatch) {
+                $varName = $varMatch[1];
+                $varValue = $varMatch[2];
+                if (stripos($varValue, 'SELECT') === 0 || 
+                    stripos($varValue, 'INSERT') === 0 || 
+                    stripos($varValue, 'UPDATE') === 0 || 
+                    stripos($varValue, 'DELETE') === 0) {
+                    $variables['query'][] = [
+                        'name' => $varName,
+                        'value' => $varValue,
+                        'function' => $functionName,
+                        'class' => $this->currentClass,
+                        'file' => $filePath,
+                        'line' => $this->findLineNumber($functionBody, '$' . $varName)
+                    ];
+                }
+            }
+        }
+
+        return $variables;
+    }
+
+    private function analyzeCrudOperations(string $content, string $filePath): array
+    {
+        $crudOperations = [
+            'selects' => [],
+            'inserts' => [],
+            'updates' => [],
+            'deletes' => []
+        ];
+
+        // SELECT文の検出
+        preg_match_all('/SELECT\s+.*?FROM\s+([^\s;]+)/i', $content, $selects);
+        foreach ($selects[1] as $table) {
+            $table = trim(str_replace('`', '', $table));
+            $crudOperations['selects'][] = $table;
+        }
+
+        // INSERT文の検出
+        preg_match_all('/INSERT\s+INTO\s+([^\s;]+)/i', $content, $inserts);
+        foreach ($inserts[1] as $table) {
+            $table = trim(str_replace('`', '', $table));
+            $crudOperations['inserts'][] = $table;
+        }
+
+        // UPDATE文の検出
+        preg_match_all('/UPDATE\s+([^\s;]+)/i', $content, $updates);
+        foreach ($updates[1] as $table) {
+            $table = trim(str_replace('`', '', $table));
+            $crudOperations['updates'][] = $table;
+        }
+
+        // DELETE文の検出
+        preg_match_all('/DELETE\s+FROM\s+([^\s;]+)/i', $content, $deletes);
+        foreach ($deletes[1] as $table) {
+            $table = trim(str_replace('`', '', $table));
+            $crudOperations['deletes'][] = $table;
+        }
+
+        // ファイルごとのCRUD操作を記録
+        $this->fileCrudOperations[$filePath] = $crudOperations;
+
+        return $crudOperations;
+    }
+    
+    /**
+     * ファイルのコメントを削除する（ストリーム処理版）
+     * @param string $filePath ファイルパス
+     * @param string $extension ファイルの拡張子
+     * @return string コメントを削除した内容
+     */
+    public function removeCommentsFromFile(string $filePath, string $extension): string
+    {
+        $outputPath = $filePath . '.nocomments';
+        $inputHandle = fopen($filePath, 'r');
+        $outputHandle = fopen($outputPath, 'w');
+
+        if ($inputHandle === false || $outputHandle === false) {
+            throw new \RuntimeException("ファイルの操作に失敗しました: {$filePath}");
+        }
+
+        $buffer = '';
+        $inComment = false;
+        $commentType = '';
+        $lastLineWasEmpty = false;
+        $content = '';
+
+        while (!feof($inputHandle)) {
+            $line = fgets($inputHandle);
+            if ($line === false) {
+                break;
+            }
+            
+            switch ($extension) {
+                case 'php':
+                case 'js':
+                    $line = $this->processPhpJsLine($line, $inComment, $commentType);
+                    break;
+                case 'html':
+                    $line = $this->processHtmlLine($line, $inComment);
+                    break;
+            }
+
+            // 空行の処理
+            $trimmedLine = trim($line);
+            if (empty($trimmedLine)) {
+                if (!$lastLineWasEmpty) {
+                    $content .= PHP_EOL;
+                    $lastLineWasEmpty = true;
+                }
+            } else {
+                $content .= $line;
+                $lastLineWasEmpty = false;
+            }
+
+            // バッファサイズを制限
+            if (strlen($content) > 1024 * 1024) { // 1MB
+                fwrite($outputHandle, $content);
+                $content = '';
+            }
+        }
+
+        // 最後の空行を追加
+        if (!$lastLineWasEmpty) {
+            $content .= PHP_EOL;
+        }
+
+        // 残りのコンテンツを書き込み
+        if (!empty($content)) {
+            fwrite($outputHandle, $content);
+        }
+
+        fclose($inputHandle);
+        fclose($outputHandle);
+
+        // 元のファイルを置き換え
+        unlink($filePath);
+        rename($outputPath, $filePath);
+
+        return $filePath;
+    }
+
+    /**
+     * PHP/JSファイルの1行を処理
+     */
+    private function processPhpJsLine(string $line, bool &$inComment, string &$commentType): string
+    {
+        if ($inComment) {
+            if ($commentType === 'multi' && strpos($line, '*/') !== false) {
+                $inComment = false;
+                return substr($line, strpos($line, '*/') + 2);
+            }
+            return '';
+        }
+
+        // 複数行コメントの開始
+        if (strpos($line, '/*') !== false) {
+            $inComment = true;
+            $commentType = 'multi';
+            return substr($line, 0, strpos($line, '/*'));
+        }
+
+        // 単一行コメントの削除
+        if (strpos($line, '//') !== false) {
+            return substr($line, 0, strpos($line, '//')) . PHP_EOL;
+        }
+
+        return $line;
+    }
+
+    /**
+     * HTMLファイルの1行を処理
+     */
+    private function processHtmlLine(string $line, bool &$inComment): string
+    {
+        if ($inComment) {
+            if (strpos($line, '-->') !== false) {
+                $inComment = false;
+                return substr($line, strpos($line, '-->') + 3);
+            }
+            return '';
+        }
+
+        // HTMLコメントの開始
+        if (strpos($line, '<!--') !== false) {
+            $inComment = true;
+            $beforeComment = substr($line, 0, strpos($line, '<!--'));
+            
+            // コメントの終了タグが同じ行にある場合
+            if (strpos($line, '-->') !== false) {
+                $inComment = false;
+                $afterComment = substr($line, strpos($line, '-->') + 3);
+                return $beforeComment . $afterComment;
+            }
+            
+            return $beforeComment;
+        }
+
+        return $line;
+    }
+    
+    public function analyzeAllFiles(): array
+    {
+        $results = [];
+        $files = $this->findTargetFiles($this->rootDir);
+
+        foreach ($files as $file) {
+            $result = $this->analyzeFile($file);
+            if ($result['success']) {
+                $results[] = [
+                    'file' => $file,
+                    'dependencies' => $result['dependencies'] ?? [],
+                    'queries' => $result['analysis']['queries'] ?? []
+                ];
+            }
+        }
+
+        return $results;
+    }
+    
+    public function exportToExcel(string $outputPath): void
+    {
+        $spreadsheet = new Spreadsheet();
+        
+        // ビューシート
+        $viewSheet = $spreadsheet->getActiveSheet();
+        $viewSheet->setTitle('ビュー');
+        $viewSheet->setCellValue('A1', 'ビュー名');
+        $viewSheet->setCellValue('B1', 'テーブル');
+        $viewSheet->setCellValue('C1', 'CRUD操作');
+        
+        $row = 2;
+        foreach ($this->views as $view) {
+            $viewSheet->setCellValue('A' . $row, $view['name']);
+            $viewSheet->setCellValue('B' . $row, implode(', ', $view['tables'] ?? []));
+            $viewSheet->setCellValue('C' . $row, implode(', ', $view['crud_operations']['selects'] ?? []));
+            $row++;
+        }
+
+        // ストアドプロシージャシート
+        $procSheet = $spreadsheet->createSheet();
+        $procSheet->setTitle('ストアドプロシージャ');
+        $procSheet->setCellValue('A1', 'プロシージャ名');
+        $procSheet->setCellValue('B1', 'パラメータ');
+        $procSheet->setCellValue('C1', 'CRUD操作');
+        
+        $row = 2;
+        foreach ($this->storedProcedures as $proc) {
+            $procSheet->setCellValue('A' . $row, $proc['name']);
+            $params = array_map(function($param) {
+                return $param['name'] . ' (' . $param['type'] . ')';
+            }, $proc['parameters'] ?? []);
+            $procSheet->setCellValue('B' . $row, implode(', ', $params));
+            
+            $crudOps = [];
+            foreach (['selects', 'inserts', 'updates', 'deletes'] as $op) {
+                if (!empty($proc['crud_operations'][$op])) {
+                    $crudOps[] = strtoupper($op) . ': ' . implode(', ', $proc['crud_operations'][$op]);
+                }
+            }
+            $procSheet->setCellValue('C' . $row, implode('; ', $crudOps));
+            $row++;
+        }
+
+        // CRUD操作シート
+        $crudSheet = $spreadsheet->createSheet();
+        $crudSheet->setTitle('CRUD操作');
+        $crudSheet->setCellValue('A1', 'テーブル名');
+        $crudSheet->setCellValue('B1', '操作種別');
+        
+        $row = 2;
+        foreach ($this->crudOperations as $crud) {
+            foreach ($crud['selects'] as $table) {
+                $crudSheet->setCellValue('A' . $row, $table);
+                $crudSheet->setCellValue('B' . $row, 'SELECT');
+                $row++;
+            }
+            foreach ($crud['inserts'] as $table) {
+                $crudSheet->setCellValue('A' . $row, $table);
+                $crudSheet->setCellValue('B' . $row, 'INSERT');
+                $row++;
+            }
+            foreach ($crud['updates'] as $table) {
+                $crudSheet->setCellValue('A' . $row, $table);
+                $crudSheet->setCellValue('B' . $row, 'UPDATE');
+                $row++;
+            }
+            foreach ($crud['deletes'] as $table) {
+                $crudSheet->setCellValue('A' . $row, $table);
+                $crudSheet->setCellValue('B' . $row, 'DELETE');
+                $row++;
+            }
+        }
+
+        // ファイル別CRUD操作シート
+        $fileCrudSheet = $spreadsheet->createSheet();
+        $fileCrudSheet->setTitle('ファイル別CRUD操作');
+        $fileCrudSheet->setCellValue('A1', 'ファイルパス');
+        $fileCrudSheet->setCellValue('B1', 'テーブル名');
+        $fileCrudSheet->setCellValue('C1', '操作種別');
+        
+        $row = 2;
+        foreach ($this->fileCrudOperations as $filePath => $crud) {
+            foreach ($crud['selects'] as $table) {
+                $fileCrudSheet->setCellValue('A' . $row, $filePath);
+                $fileCrudSheet->setCellValue('B' . $row, $table);
+                $fileCrudSheet->setCellValue('C' . $row, 'SELECT');
+                $row++;
+            }
+            foreach ($crud['inserts'] as $table) {
+                $fileCrudSheet->setCellValue('A' . $row, $filePath);
+                $fileCrudSheet->setCellValue('B' . $row, $table);
+                $fileCrudSheet->setCellValue('C' . $row, 'INSERT');
+                $row++;
+            }
+            foreach ($crud['updates'] as $table) {
+                $fileCrudSheet->setCellValue('A' . $row, $filePath);
+                $fileCrudSheet->setCellValue('B' . $row, $table);
+                $fileCrudSheet->setCellValue('C' . $row, 'UPDATE');
+                $row++;
+            }
+            foreach ($crud['deletes'] as $table) {
+                $fileCrudSheet->setCellValue('A' . $row, $filePath);
+                $fileCrudSheet->setCellValue('B' . $row, $table);
+                $fileCrudSheet->setCellValue('C' . $row, 'DELETE');
+                $row++;
+            }
+        }
+
+        // 条件分岐パターンシート
+        $patternSheet = $spreadsheet->createSheet();
+        $patternSheet->setTitle('条件分岐パターン');
+        $patternSheet->setCellValue('A1', '条件');
+        $patternSheet->setCellValue('B1', 'SQLクエリ');
+        $patternSheet->setCellValue('C1', 'テーブル');
+        
+        $row = 2;
+        foreach ($this->conditionalPatterns as $pattern) {
+            $conditions = implode(' AND ', $pattern['conditions'] ?? []);
+            $patternSheet->setCellValue('A' . $row, $conditions);
+            $patternSheet->setCellValue('B' . $row, $pattern['query'] ?? '');
+            if (isset($pattern['tables']) && is_array($pattern['tables'])) {
+                $patternSheet->setCellValue('C' . $row, implode(', ', $pattern['tables']));
+            } else {
+                $patternSheet->setCellValue('C' . $row, '');
+            }
+            $row++;
+        }
+
+        // ファイルの保存
+        $writer = new Xlsx($spreadsheet);
+        $writer->save($outputPath);
+    }
+
+    public function analyzeExternalAccess(string $content): array
+    {
+        try {
+            if (empty($content)) {
+                throw new \InvalidArgumentException('コンテンツが空です');
+            }
+
+            $externalAccess = [
+                'api_calls' => [],
+                'external_links' => [],
+                'form_submissions' => [],
+                'ajax_requests' => [],
+                'iframe_embeds' => [],
+                'redirects' => [],
+                'dynamic_actions' => [],
+                'dynamic_links' => [],
+                'window_opens' => []
+            ];
+            
+            // API呼び出しの検出
+            try {
+                preg_match_all('/fetch\([\'"]([^\'"]+)[\'"]/', $content, $apiCalls);
+                preg_match_all('/axios\.(get|post|put|delete)\([\'"]([^\'"]+)[\'"]/', $content, $axiosCalls);
+                preg_match_all('/\.ajax\([\'"]([^\'"]+)[\'"]/', $content, $jqueryCalls);
+                preg_match_all('/new\s+XMLHttpRequest\(\)[^;]*\.open\([\'"]([^\'"]+)[\'"]/', $content, $xhrCalls);
+                
+                foreach ($apiCalls[1] as $url) {
+                    $externalAccess['api_calls'][] = [
+                        'url' => $url,
+                        'method' => 'fetch',
+                        'line' => $this->findLineNumber($content, $url)
+                    ];
+                }
+                
+                foreach ($axiosCalls[2] as $index => $url) {
+                    $externalAccess['api_calls'][] = [
+                        'url' => $url,
+                        'method' => $axiosCalls[1][$index],
+                        'line' => $this->findLineNumber($content, $url)
+                    ];
+                }
+                
+                foreach ($jqueryCalls[1] as $url) {
+                    $externalAccess['api_calls'][] = [
+                        'url' => $url,
+                        'method' => 'ajax',
+                        'line' => $this->findLineNumber($content, $url)
+                    ];
+                }
+                
+                foreach ($xhrCalls[1] as $url) {
+                    $externalAccess['api_calls'][] = [
+                        'url' => $url,
+                        'method' => 'XMLHttpRequest',
+                        'line' => $this->findLineNumber($content, $url)
+                    ];
+                }
+            } catch (\Exception $e) {
+                $this->logError('api_call_detection', '', 0, $e->getMessage());
+            }
+            
+            // 外部リンクの検出
+            try {
+                preg_match_all('/<a\s+href=[\'"]([^\'"]+)[\'"]/', $content, $links);
+                foreach ($links[1] as $url) {
+                    if (strpos($url, 'http') === 0 || strpos($url, '//') === 0) {
+                        $externalAccess['external_links'][] = [
+                            'url' => $url,
+                            'line' => $this->findLineNumber($content, $url)
+                        ];
+                    }
+                }
+            } catch (\Exception $e) {
+                $this->logError('external_link_detection', '', 0, $e->getMessage());
+            }
+            
+            // 動的なhref属性の検出
+            try {
+                preg_match_all('/href=[\'"]<\?=\s*\$([^\'"]+)\s*;\s*\?>[\'"]/', $content, $dynamicLinks);
+                foreach ($dynamicLinks[1] as $var) {
+                    $externalAccess['dynamic_links'][] = [
+                        'variable' => $var,
+                        'line' => $this->findLineNumber($content, $var)
+                    ];
+                }
+            } catch (\Exception $e) {
+                $this->logError('dynamic_link_detection', '', 0, $e->getMessage());
+            }
+            
+            // フォーム送信の検出
+            try {
+                preg_match_all('/<form\s+action=[\'"]([^\'"]+)[\'"]/', $content, $forms);
+                foreach ($forms[1] as $url) {
+                    if (strpos($url, 'http') === 0 || strpos($url, '//') === 0) {
+                        $externalAccess['form_submissions'][] = [
+                            'url' => $url,
+                            'line' => $this->findLineNumber($content, $url)
+                        ];
+                    }
+                }
+            } catch (\Exception $e) {
+                $this->logError('form_submission_detection', '', 0, $e->getMessage());
+            }
+            
+            // 動的なaction属性の検出
+            try {
+                preg_match_all('/action=[\'"]<\?=\s*\$([^\'"]+)\s*;\s*\?>[\'"]/', $content, $dynamicActions);
+                foreach ($dynamicActions[1] as $var) {
+                    $externalAccess['dynamic_actions'][] = [
+                        'variable' => $var,
+                        'line' => $this->findLineNumber($content, $var)
+                    ];
+                }
+            } catch (\Exception $e) {
+                $this->logError('dynamic_action_detection', '', 0, $e->getMessage());
+            }
+            
+            // iframe埋め込みの検出
+            try {
+                preg_match_all('/<iframe\s+src=[\'"]([^\'"]+)[\'"]/', $content, $iframes);
+                foreach ($iframes[1] as $url) {
+                    if (strpos($url, 'http') === 0 || strpos($url, '//') === 0) {
+                        $externalAccess['iframe_embeds'][] = [
+                            'url' => $url,
+                            'line' => $this->findLineNumber($content, $url)
+                        ];
+                    }
+                }
+            } catch (\Exception $e) {
+                $this->logError('iframe_embed_detection', '', 0, $e->getMessage());
+            }
+            
+            // リダイレクトの検出
+            try {
+                preg_match_all('/location\.href\s*=\s*[\'"]([^\'"]+)[\'"]/', $content, $redirects);
+                foreach ($redirects[1] as $url) {
+                    if (strpos($url, 'http') === 0 || strpos($url, '//') === 0) {
+                        $externalAccess['redirects'][] = [
+                            'url' => $url,
+                            'line' => $this->findLineNumber($content, $url)
+                        ];
+                    }
+                }
+            } catch (\Exception $e) {
+                $this->logError('redirect_detection', '', 0, $e->getMessage());
+            }
+            
+            // window.openの検出
+            try {
+                preg_match_all('/window\.open\([\'"]([^\'"]+)[\'"]/', $content, $windowOpens);
+                foreach ($windowOpens[1] as $url) {
+                    if (strpos($url, 'http') === 0 || strpos($url, '//') === 0) {
+                        $externalAccess['window_opens'][] = [
+                            'url' => $url,
+                            'line' => $this->findLineNumber($content, $url)
+                        ];
+                    }
+                }
+            } catch (\Exception $e) {
+                $this->logError('window_open_detection', '', 0, $e->getMessage());
+            }
+            
+            return $externalAccess;
+        } catch (\Exception $e) {
+            // フォールバック処理
+            $this->logError('external_access_analysis', '', 0, $e->getMessage());
+            return [
+                'api_calls' => [],
+                'external_links' => [],
+                'form_submissions' => [],
+                'ajax_requests' => [],
+                'iframe_embeds' => [],
+                'redirects' => [],
+                'dynamic_actions' => [],
+                'dynamic_links' => [],
+                'window_opens' => [],
+                'error' => $e->getMessage()
+            ];
+        }
+    }
+    
+    private function findLineNumber(string $content, string $search): int
+    {
+        try {
+            if (empty($content) || empty($search)) {
+                throw new \InvalidArgumentException('コンテンツまたは検索文字列が空です');
+            }
+            
+            $lines = explode("\n", $content);
+            foreach ($lines as $lineNumber => $line) {
+                if (strpos($line, $search) !== false) {
+                    return $lineNumber + 1;
+                }
+            }
+            return 0;
+        } catch (\Exception $e) {
+            $this->logError('line_number_finding', '', 0, $e->getMessage());
+            return 0;
+        }
+    }
+
+    public function analyzeContent(string $content, string $filePath, int $lineCount, array $options = []): array
+    {
+        if (empty($content)) {
+            throw new \InvalidArgumentException("Content cannot be empty");
+        }
+
+        $result = [
+            'file_path' => $filePath,
+            'line_count' => $lineCount,
+            'analysis' => []
+        ];
+
+        $extension = pathinfo($filePath, PATHINFO_EXTENSION);
+
+        try {
+            // ストアドプロシージャの検出
+            if (stripos($content, 'CREATE PROCEDURE') !== false) {
+                $result['analysis']['stored_procedure'] = $this->analyzeStoredProcedure($content, $filePath);
+            }
+
+            // ビューの検出
+            if (stripos($content, 'CREATE VIEW') !== false) {
+                $result['analysis']['view'] = $this->analyzeView($content, $filePath);
+            }
+
+            switch ($extension) {
+                case 'php':
+                    $phpAnalysis = $this->analyzePhpContent($content);
+                    $result['analysis']['php'] = $phpAnalysis;
+                    $result['analysis']['dependencies'] = $this->analyzeDependencies($filePath, $content);
+                    $result['analysis']['crud'] = $this->analyzeCrudOperations($content, $filePath);
+                    $result['analysis']['external_access'] = $this->analyzeExternalAccess($content);
+                    $result['analysis']['functions'] = $phpAnalysis['functions'];
+                    $result['analysis']['variables'] = $phpAnalysis['variables'];
+                    break;
+                case 'js':
+                    $jsAnalysis = $this->analyzeJsContent($content);
+                    $result['analysis']['js'] = $jsAnalysis;
+                    $result['analysis']['external_access'] = $this->analyzeExternalAccess($content);
+                    break;
+                case 'html':
+                case 'htm':
+                    $htmlAnalysis = $this->analyzeHtmlContent($content);
+                    $result['analysis']['html'] = $htmlAnalysis;
+                    $result['analysis']['external_access'] = $this->analyzeExternalAccess($content);
+                    break;
+                default:
+                    $this->logError('analyze_content', $filePath, $lineCount, "Unsupported file extension: {$extension}");
+                    return $this->fallbackParse($content);
+            }
+        } catch (\Exception $e) {
+            $this->logError('analyze_content', $filePath, $lineCount, $e->getMessage());
+            return $this->fallbackParse($content);
+        }
+
+        return $result;
+    }
+
+    public function analyze(string $filePath): array
+    {
+        if (!file_exists($filePath)) {
+            throw new \InvalidArgumentException("File not found: {$filePath}");
+        }
+
+        $content = file_get_contents($filePath);
+        if ($content === false) {
+            throw new \RuntimeException("Failed to read file: {$filePath}");
+        }
+
+        $lineCount = substr_count($content, "\n") + 1;
+        $dependencies = $this->analyzeDependencies($filePath, $content);
+
+        $result = $this->analyzeFile($filePath);
+        if (!$result['success']) {
+            throw new \RuntimeException($result['error'] ?? 'Analysis failed');
+        }
+
+        return [
+            'file' => $filePath,
+            'file_path' => $filePath,
+            'line_count' => $lineCount,
+            'dependencies' => $dependencies,
+            'functions' => $result['analysis']['functions'] ?? [],
+            'variables' => $result['analysis']['variables'] ?? [],
+            'queries' => $result['analysis']['queries'] ?? [],
+            'sql_queries' => $result['analysis']['sql_queries'] ?? [],
+            'external_access' => $result['analysis']['external_access'] ?? [],
+            'analysis' => $result['analysis']
+        ];
+    }
+
+    private function analyzeConditionalPatterns(Node $node, array $conditions = []): void
+    {
+        if ($node instanceof Node\Stmt\If_) {
+            $condition = $this->evaluateCondition($node->cond);
+            $newConditions = array_merge($conditions, [$condition]);
+
+            // 条件付きクエリの検出
+            foreach ($node->stmts as $stmt) {
+                $this->findSqlQueriesInNode($stmt, $newConditions);
+                $this->analyzeConditionalPatterns($stmt, $newConditions);
+            }
+
+            // else節の処理
+            if ($node->else) {
+                $elseConditions = array_merge($conditions, ['else']);
+                foreach ($node->else->stmts as $stmt) {
+                    $this->findSqlQueriesInNode($stmt, $elseConditions);
+                    $this->analyzeConditionalPatterns($stmt, $elseConditions);
+                }
+            }
+
+            // elseif節の処理
+            foreach ($node->elseifs as $elseif) {
+                $elseifCondition = $this->evaluateCondition($elseif->cond);
+                $elseifConditions = array_merge($conditions, [$elseifCondition]);
+                foreach ($elseif->stmts as $stmt) {
+                    $this->findSqlQueriesInNode($stmt, $elseifConditions);
+                    $this->analyzeConditionalPatterns($stmt, $elseifConditions);
+                }
+            }
+        }
+    }
+
+    private function findSqlQueriesInNode(Node $node, array $conditions): void
+    {
+        if ($node instanceof Node\Expr\Assign) {
+            $query = $this->extractSqlQuery($node->expr);
+            if ($query) {
+                $tables = $this->extractTableNames($query);
+                $this->conditionalPatterns[] = [
+                    'conditions' => $conditions,
+                    'query' => $query,
+                    'tables' => $tables
+                ];
+            }
+        } elseif ($node instanceof Node\Expr\MethodCall || $node instanceof Node\Expr\FuncCall) {
+            $query = $this->extractSqlQuery($node);
+            if ($query) {
+                $tables = $this->extractTableNames($query);
+                $this->conditionalPatterns[] = [
+                    'conditions' => $conditions,
+                    'query' => $query,
+                    'tables' => $tables
+                ];
+            }
+        }
+    }
+
+    private function evaluateCondition(Node $node): string
+    {
+        if ($node instanceof Node\Expr\BinaryOp) {
+            $left = $this->evaluateCondition($node->left);
+            $right = $this->evaluateCondition($node->right);
+            $operator = $node->getOperatorSigil();
+            return "{$left} {$operator} {$right}";
+        } elseif ($node instanceof Node\Scalar\String_) {
+            return '"' . $node->value . '"';
+        } elseif ($node instanceof Node\Expr\Variable) {
+            return '$' . $node->name;
+        } elseif ($node instanceof Node\Scalar\LNumber || $node instanceof Node\Scalar\DNumber) {
+            return (string)$node->value;
+        } elseif ($node instanceof Node\Expr\ConstFetch) {
+            return $node->name->toString();
+        } elseif ($node instanceof Node\Expr\PropertyFetch) {
+            $var = $this->evaluateCondition($node->var);
+            $name = $node->name instanceof Node\Identifier ? $node->name->toString() : '';
+            return "{$var}->{$name}";
+        }
+        return 'unknown';
+    }
+
+    private function traverseJsAst($ast): void
+    {
+        if ($ast instanceof \Peast\Syntax\Node\CallExpression) {
+            $callee = $ast->getCallee();
+            if ($callee instanceof \Peast\Syntax\Node\MemberExpression) {
+                $object = $callee->getObject();
+                $property = $callee->getProperty();
+                
+                $objName = '';
+                $propName = '';
+                
+                if ($object instanceof \Peast\Syntax\Node\Identifier) {
+                    $objName = $object->getName();
+                }
+                
+                if ($property instanceof \Peast\Syntax\Node\Identifier) {
+                    $propName = $property->getName();
+                }
+                
+                if (($objName === 'axios' && in_array($propName, ['get', 'post'])) ||
+                    ($objName === 'fetch')) {
+                    $args = $ast->getArguments();
+                    if (!empty($args)) {
+                        $firstArg = $args[0];
+                        if ($firstArg instanceof \Peast\Syntax\Node\StringLiteral) {
+                            $url = $firstArg->getValue();
+                            if ($url) {
+                                $this->endpoints[] = $url;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        if (method_exists($ast, 'getChildNodes')) {
+            foreach ($ast->getChildNodes() as $child) {
+                $this->traverseJsAst($child);
+            }
+        }
+    }
+
+    private function extractJsEndpointsWithRegex(string $content): void
+    {
+        $patterns = [
+            '/fetch\s*\(\s*[\'"]([^\'"]+)[\'"]\s*\)/',
+            '/axios\.(get|post|put|delete)\s*\(\s*[\'"]([^\'"]+)[\'"]\s*\)/',
+            '/\$\.ajax\s*\(\s*{\s*url\s*:\s*[\'"]([^\'"]+)[\'"]\s*}/',
+        ];
+
+        foreach ($patterns as $pattern) {
+            if (preg_match_all($pattern, $content, $matches)) {
+                foreach ($matches[1] as $url) {
+                    $this->endpoints[] = $url;
+                }
+            }
+        }
+    }
+
+    public function processSqlQuery($query): array
+    {
+        try {
+            // ノードからSQLクエリを抽出
+            if ($query instanceof Node\Expr\MethodCall || $query instanceof Node\Expr\FuncCall) {
+                $query = $this->extractSqlQuery($query);
+                if (!$query) {
+                    return [
+                        'error' => 'SQLクエリを抽出できませんでした'
+                    ];
+                }
+            }
+
+            $parser = new PHPSQLParser();
+            $parsed = $parser->parse($query);
+            
+            $type = $this->determineSqlType($parsed);
+            $tables = $this->extractTableNames($query);
+            
+            // ビューの検出
+            $isView = false;
+            foreach ($tables as $table) {
+                if (isset($this->views[$table])) {
+                    $isView = true;
+                    break;
+                }
+            }
+            
+            return [
+                'query' => $query,
+                'type' => $type,
+                'possible_tables' => $tables,
+                'is_view' => $isView,
+                'parsed' => $parsed
+            ];
+        } catch (Exception $e) {
+            return [
+                'query' => is_string($query) ? $query : 'Unknown',
+                'error' => $e->getMessage()
+            ];
+        }
+    }
+
+    private function determineSqlType(array $parsed): string
+    {
+        if (isset($parsed['SELECT'])) return 'SELECT';
+        if (isset($parsed['INSERT'])) return 'INSERT';
+        if (isset($parsed['UPDATE'])) return 'UPDATE';
+        if (isset($parsed['DELETE'])) return 'DELETE';
+        return 'UNKNOWN';
+    }
+
+    public function setScope(string $scope): void
+    {
+        $this->currentScope = $scope;
+    }
+
+    public function getScope(): string
+    {
+        return $this->currentScope;
+    }
+
+    public function extractTableNames(string $query): array
+    {
+        $tables = [];
+        $aliases = [];
+        
+        // FROM句のテーブル名とエイリアスを抽出
+        if (preg_match('/FROM\s+([`\w\s,]+)(?:\s+AS\s+([`\w]+))?/i', $query, $matches)) {
+            $tableList = explode(',', $matches[1]);
+            foreach ($tableList as $table) {
+                $tableParts = array_map('trim', preg_split('/\s+AS\s+|\s+/i', $table));
+                $tableName = str_replace('`', '', $tableParts[0]);
+                if (count($tableParts) > 1) {
+                    $aliases[$tableParts[1]] = $tableName;
+                }
+                $tables[] = $tableName;
+            }
+        }
+        
+        // JOIN句のテーブル名とエイリアスを抽出
+        if (preg_match_all('/(JOIN|INTO|UPDATE)\s+([`\w]+)(?:\s+AS\s+([`\w]+))?/i', $query, $matches)) {
+            foreach ($matches[2] as $index => $table) {
+                $tableName = str_replace('`', '', $table);
+                $tables[] = $tableName;
+                if (isset($matches[3][$index]) && !empty($matches[3][$index])) {
+                    $aliases[$matches[3][$index]] = $tableName;
+                }
+            }
+        }
+
+        // エイリアスを解決
+        foreach ($tables as &$table) {
+            if (isset($aliases[$table])) {
+                $table = $aliases[$table];
+            }
+        }
+        
+        return array_unique($tables);
+    }
+
+    public function extractSqlQuery(Node $node): ?string
+    {
+        if ($node instanceof Node\Scalar\String_) {
+            $query = $this->extractSqlFromString($node->value);
+            if ($query) {
+                $this->sqlQueries[] = $query;
+            }
+            return $query;
+        } elseif ($node instanceof MethodCall || $node instanceof FuncCall) {
+            // メソッド呼び出しの解析
+            if ($node instanceof MethodCall) {
+                $methodName = $node->name instanceof Node\Identifier ? $node->name->toString() : '';
+                if (in_array($methodName, ['query', 'execute', 'prepare', 'raw'])) {
+                    foreach ($node->args as $arg) {
+                        if ($arg->value instanceof Node\Scalar\String_) {
+                            $query = $this->extractSqlFromString($arg->value->value);
+                            if ($query) {
+                                $this->sqlQueries[] = $query;
+                            }
+                            return $query;
+                        }
+                    }
+                }
+            }
+            
+            // 関数呼び出しの解析
+            if ($node instanceof FuncCall) {
+                $functionName = $node->name instanceof Node\Name ? $node->name->toString() : '';
+                if (in_array($functionName, ['mysql_query', 'mysqli_query', 'pg_query', 'sqlsrv_query'])) {
+                    foreach ($node->args as $arg) {
+                        if ($arg->value instanceof Node\Scalar\String_) {
+                            $query = $this->extractSqlFromString($arg->value->value);
+                            if ($query) {
+                                $this->sqlQueries[] = $query;
+                            }
+                            return $query;
+                        }
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    private function loadViewsAndProcedures(): void
+    {
+        // ビューの読み込み
+        $viewsFile = dirname(__DIR__) . '/views.txt';
+        if (file_exists($viewsFile)) {
+            $lines = file($viewsFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+            foreach ($lines as $line) {
+                if (strpos($line, '#') === 0) continue;
+                $name = trim($line);
+                $this->views[$name] = [
+                    'name' => $name,
+                    'type' => 'view'
+                ];
+            }
+        }
+
+        // ストアドプロシージャの読み込み
+        $proceduresFile = dirname(__DIR__) . '/stored_procedures.txt';
+        if (file_exists($proceduresFile)) {
+            $lines = file($proceduresFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+            foreach ($lines as $line) {
+                if (strpos($line, '#') === 0) continue;
+                $name = trim($line);
+                $this->storedProcedures[$name] = [
+                    'name' => $name,
+                    'type' => 'stored_procedure'
+                ];
+            }
+        }
+    }
+
+    public function analyzePhpContent(string $content): array
+    {
+        $result = [
+            'queries' => [],
+            'sql_queries' => [],
+            'functions' => [],
+            'variables' => [],
+            'classes' => []
+        ];
+
+        try {
+            $parser = (new ParserFactory)->createForNewestSupportedVersion();
+            $ast = $parser->parse($content);
+
+            if ($ast !== null) {
+                $traverser = new NodeTraverser();
+                $visitor = new PhpAstVisitor($this);
+                $traverser->addVisitor(new NameResolver());
+                $traverser->addVisitor($visitor);
+                $traverser->traverse($ast);
+                
+                $result['queries'] = $visitor->getQueries();
+                $result['functions'] = $visitor->getFunctions();
+                $result['variables'] = $visitor->getVariables();
+                $result['classes'] = $this->classes;
+
+                // 変数スコープの解析
+                $variables = $this->analyzeVariables($content, $this->currentFile);
+                $result['variables'] = array_merge($result['variables'], $variables);
+
+                // SQLクエリの検出
+                $pattern = '/(?:SELECT|INSERT|UPDATE|DELETE)\s+.+?;/is';
+                if (preg_match_all($pattern, $content, $matches)) {
+                    foreach ($matches[0] as $query) {
+                        $normalizedQuery = $this->normalizeSqlQuery($query);
+                        if ($normalizedQuery) {
+                            $result['sql_queries'][] = $normalizedQuery;
+                        }
+                    }
+                }
+            }
+
+        } catch (\Exception $e) {
+            error_log("PHP解析エラー: " . $e->getMessage());
+            $result = $this->fallbackParsePhp($content);
+        }
+
+        return $result;
+    }
+
+    private function analyzeConditionalQueries(string $content, string $filePath): array
+    {
+        $patterns = [];
+        
+        // if-else文の検出
+        preg_match_all('/if\s*\((.*?)\)\s*{([^}]+)}(?:\s*else\s*{([^}]+)})?/is', $content, $matches, PREG_SET_ORDER);
+        
+        foreach ($matches as $match) {
+            $condition = trim($match[1]);
+            $ifBody = $match[2];
+            $elseBody = isset($match[3]) ? $match[3] : null;
+
+            // if部分のSQLクエリを検出
+            preg_match_all('/\$query\s*=\s*[\'"]([^\'"]+)[\'"]/i', $ifBody, $queryMatches);
+            if (!empty($queryMatches[1])) {
+                foreach ($queryMatches[1] as $query) {
+                    $normalizedQuery = $this->normalizeSqlQuery($query);
+                    $tables = $this->extractTableNames($normalizedQuery);
+                    $patterns[] = [
+                        'conditions' => [$condition],
+                        'query' => $this->formatSqlQuery($normalizedQuery),
+                        'tables' => $tables,
+                        'file' => $filePath
+                    ];
+                }
+            }
+
+            // else部分のSQLクエリを検出
+            if ($elseBody) {
+                preg_match_all('/\$query\s*=\s*[\'"]([^\'"]+)[\'"]/i', $elseBody, $queryMatches);
+                if (!empty($queryMatches[1])) {
+                    foreach ($queryMatches[1] as $query) {
+                        $normalizedQuery = $this->normalizeSqlQuery($query);
+                        $tables = $this->extractTableNames($normalizedQuery);
+                        $patterns[] = [
+                            'conditions' => ['else'],
+                            'query' => $this->formatSqlQuery($normalizedQuery),
+                            'tables' => $tables,
+                            'file' => $filePath
+                        ];
+                    }
+                }
+            }
+        }
+
+        return $patterns;
+    }
+
+    private function formatSqlQuery(string $query): string
+    {
+        // 空白文字の正規化
+        $query = preg_replace('/\s+/', ' ', trim($query));
+        
+        // カンマの後に空白を追加
+        $query = preg_replace('/,(\S)/', ', $1', $query);
+        
+        // 条件式の前後に空白を追加
+        $query = preg_replace('/([<>=!])/', ' $1 ', $query);
+        
+        // 重複する空白を削除
+        $query = preg_replace('/\s+/', ' ', $query);
+        
+        // 末尾のセミコロンを削除
+        $query = rtrim($query, ';');
+        
+        return trim($query);
+    }
+
+    private function fallbackParsePhp(string $content): array
+    {
+        $result = [
+            'queries' => [],
+            'conditional_patterns' => [],
+            'functions' => [],
+            'variables' => [],
+            'classes' => []
+        ];
+
+        try {
+            // 関数定義の検出
+            $functionPattern = '/function\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(([^)]*)\)/';
+            if (preg_match_all($functionPattern, $content, $matches)) {
+                foreach ($matches[1] as $index => $functionName) {
+                    $params = array_map('trim', explode(',', $matches[2][$index]));
+                    $result['functions'][] = [
+                        'name' => $functionName,
+                        'file' => $this->currentFile,
+                        'params' => array_map(function($param) {
+                            return trim($param, '$ ');
+                        }, $params)
+                    ];
+                }
+            }
+
+            // 変数定義の検出
+            $variablePattern = '/\$([a-zA-Z_][a-zA-Z0-9_]*)\s*=/';
+            if (preg_match_all($variablePattern, $content, $matches, PREG_OFFSET_CAPTURE)) {
+                foreach ($matches[1] as $match) {
+                    $varName = $match[0];
+                    $offset = $match[1];
+                    $line = substr_count(substr($content, 0, $offset), "\n") + 1;
+                    $result['variables'][] = [
+                        'name' => $varName,
+                        'file' => $this->currentFile,
+                        'line' => $line,
+                        'function' => null,
+                        'class' => null
+                    ];
+                }
+            }
+
+            // SQLクエリの検出
+            $pattern = '/(?:SELECT|INSERT|UPDATE|DELETE)\s+.+?;/is';
+            if (preg_match_all($pattern, $content, $matches)) {
+                foreach ($matches[0] as $query) {
+                    $normalizedQuery = $this->normalizeSqlQuery($query);
+                    if ($normalizedQuery) {
+                        $result['queries'][] = $normalizedQuery;
+                    }
+                }
+            }
+
+            // クラス定義の検出
+            $classPattern = '/class\s+([a-zA-Z_][a-zA-Z0-9_]*)/';
+            if (preg_match_all($classPattern, $content, $matches)) {
+                foreach ($matches[1] as $className) {
+                    $result['classes'][] = [
+                        'name' => $className,
+                        'file' => $this->currentFile,
+                        'methods' => []
+                    ];
+                }
+            }
+
+        } catch (\Exception $e) {
+            error_log("フォールバック解析エラー: " . $e->getMessage());
+        }
+
+        return $result;
+    }
+
+    public function analyzeJsContent(string $content): array
+    {
+        $result = [
+            'endpoints' => [],
+            'success' => true,
+            'error' => null
+        ];
+
+        try {
+            $ast = \Peast\Peast::latest($content)->parse();
+            $traverser = new \Peast\Traverser;
+            
+            $traverser->addFunction(function($node) use (&$result) {
+                if ($node instanceof \Peast\Syntax\Node\CallExpression) {
+                    $callee = $node->getCallee();
+                    
+                    // fetch APIの検出
+                    if ($callee instanceof \Peast\Syntax\Node\Identifier && $callee->getName() === 'fetch') {
+                        if ($node->getArguments()) {
+                            $firstArg = $node->getArguments()[0];
+                            if ($firstArg instanceof \Peast\Syntax\Node\StringLiteral) {
+                                $result['endpoints'][] = [
+                                    'type' => 'fetch',
+                                    'url' => $firstArg->getValue()
+                                ];
+                            }
+                        }
+                    }
+                    
+                    // axiosの検出
+                    if ($callee instanceof \Peast\Syntax\Node\MemberExpression) {
+                        $object = $callee->getObject();
+                        $property = $callee->getProperty();
+                        
+                        if ($object instanceof \Peast\Syntax\Node\Identifier && 
+                            $object->getName() === 'axios' &&
+                            $property instanceof \Peast\Syntax\Node\Identifier) {
+                            $method = $property->getName();
+                            if (in_array($method, ['get', 'post', 'put', 'delete'])) {
+                                if ($node->getArguments()) {
+                                    $firstArg = $node->getArguments()[0];
+                                    if ($firstArg instanceof \Peast\Syntax\Node\StringLiteral) {
+                                        $result['endpoints'][] = [
+                                            'type' => 'axios',
+                                            'method' => $method,
+                                            'url' => $firstArg->getValue()
+                                        ];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+            
+            $traverser->traverse($ast);
+            
+        } catch (\Exception $e) {
+            $result['success'] = false;
+            $result['error'] = $e->getMessage();
+            
+            // フォールバック: 正規表現でAPIエンドポイントを検出
+            $patterns = [
+                'fetch\\s*\\(\\s*[\'"]([^\'"]+)[\'"]',
+                'axios\\.(get|post|put|delete)\\s*\\(\\s*[\'"]([^\'"]+)[\'"]',
+                '\\.ajax\\s*\\(\\s*{[^}]*url\\s*:\\s*[\'"]([^\'"]+)[\'"]'
+            ];
+            
+            foreach ($patterns as $pattern) {
+                if (preg_match_all('/' . $pattern . '/', $content, $matches)) {
+                    foreach ($matches[1] as $url) {
+                        $result['endpoints'][] = [
+                            'type' => 'unknown',
+                            'url' => $url
+                        ];
+                    }
+                }
+            }
+        }
+        
+        return $result;
+    }
+
+    public function analyzeHtmlContent(string $content): array
+    {
+        try {
+            if (empty(trim($content))) {
+                return [
+                    'urls' => [],
+                    'success' => true
+                ];
+            }
+
+            $dom = new \DOMDocument();
+            @$dom->loadHTML($content, LIBXML_NOERROR | LIBXML_NOWARNING);
+            $xpath = new \DOMXPath($dom);
+            
+            $urls = [];
+            
+            // フォームのaction属性を取得
+            $forms = $xpath->query('//form[@action]');
+            if ($forms) {
+                foreach ($forms as $form) {
+                    if ($form instanceof \DOMElement) {
+                        $urls[] = [
+                            'type' => 'form_action',
+                            'url' => $form->getAttribute('action')
+                        ];
+                    }
+                }
+            }
+            
+            // アンカータグのhref属性を取得
+            $links = $xpath->query('//a[@href]');
+            if ($links) {
+                foreach ($links as $link) {
+                    if ($link instanceof \DOMElement) {
+                        $urls[] = [
+                            'type' => 'link',
+                            'url' => $link->getAttribute('href')
+                        ];
+                    }
+                }
+            }
+            
+            // スクリプトタグのsrc属性を取得
+            $scripts = $xpath->query('//script[@src]');
+            if ($scripts) {
+                foreach ($scripts as $script) {
+                    if ($script instanceof \DOMElement) {
+                        $urls[] = [
+                            'type' => 'script',
+                            'url' => $script->getAttribute('src')
+                        ];
+                    }
+                }
+            }
+            
+            // イメージタグのsrc属性を取得
+            $images = $xpath->query('//img[@src]');
+            if ($images) {
+                foreach ($images as $image) {
+                    if ($image instanceof \DOMElement) {
+                        $urls[] = [
+                            'type' => 'image',
+                            'url' => $image->getAttribute('src')
+                        ];
+                    }
+                }
+            }
+            
+            return [
+                'urls' => $urls,
+                'success' => true
+            ];
+            
+        } catch (\Exception $e) {
+            return [
+                'urls' => [],
+                'success' => false,
+                'error' => $e->getMessage()
+            ];
+        }
+    }
+
+    private function extractSqlFromString(string $value): ?string
+    {
+        // SQLクエリの基本的な検証
+        $sqlKeywords = [
+            'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'CREATE', 'ALTER', 'DROP',
+            'TRUNCATE', 'MERGE', 'UPSERT', 'REPLACE', 'WITH', 'EXEC', 'CALL'
+        ];
+        
+        // クエリの正規化
+        $value = trim($value);
+        $value = preg_replace('/\s+/', ' ', $value);
+        $value = strtoupper($value);
+        
+        // コメントの削除
+        $value = preg_replace('/--.*$/', '', $value);
+        $value = preg_replace('/\/\*.*?\*\//s', '', $value);
+        
+        // クエリの検証
+        foreach ($sqlKeywords as $keyword) {
+            if (strpos($value, $keyword) === 0) {
+                return $value;
+            }
+        }
+        
+        return null;
+    }
+
+    private function fallbackParse(string $content): array
+    {
+        $result = [
+            'queries' => [],
+            'functions' => [],
+            'classes' => [],
+            'variables' => []
+        ];
+        
+        try {
+            // SQLクエリの検出
+            $pattern = '/(?:SELECT|INSERT|UPDATE|DELETE)\s+.+?;/is';
+            if (preg_match_all($pattern, $content, $matches)) {
+                foreach ($matches[0] as $query) {
+                    $result['queries'][] = $this->normalizeSqlQuery($query);
+                }
+            }
+            
+            // 関数定義の検出
+            $functionPattern = '/function\s+([a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*)\s*\([^)]*\)/';
+            if (preg_match_all($functionPattern, $content, $matches)) {
+                foreach ($matches[1] as $function) {
+                    $result['functions'][] = $function;
+                }
+            }
+            
+            // クラス定義の検出
+            $classPattern = '/class\s+([a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*)/';
+            if (preg_match_all($classPattern, $content, $matches)) {
+                foreach ($matches[1] as $class) {
+                    $result['classes'][] = $class;
+                }
+            }
+            
+            // 変数定義の検出
+            $variablePattern = '/\$([a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*)\s*=/';
+            if (preg_match_all($variablePattern, $content, $matches)) {
+                foreach ($matches[1] as $variable) {
+                    $result['variables'][] = $variable;
+                }
+            }
+            
+            return $result;
+        } catch (\Exception $e) {
+            error_log("フォールバック解析エラー: " . $e->getMessage());
+            return $result;
+        }
+    }
+
+    public function normalizeSqlQuery(string $query): string
+    {
+        // 空白文字の正規化
+        $query = preg_replace('/\s+/', ' ', trim($query));
+        
+        // コメントの削除
+        $query = preg_replace('/--.*$/m', '', $query);
+        $query = preg_replace('/\/\*.*?\*\//s', '', $query);
+        
+        // 括弧の前後の空白を正規化
+        $query = preg_replace('/\s*([(),])\s*/', '$1', $query);
+        
+        // キーワードの大文字化
+        $keywords = [
+            'SELECT', 'FROM', 'WHERE', 'AND', 'OR', 'JOIN', 'LEFT', 'RIGHT', 'INNER', 'OUTER',
+            'ON', 'GROUP BY', 'ORDER BY', 'HAVING', 'LIMIT', 'OFFSET', 'INSERT', 'INTO',
+            'VALUES', 'UPDATE', 'SET', 'DELETE', 'CREATE', 'ALTER', 'DROP', 'TABLE', 'INDEX',
+            'VIEW', 'PROCEDURE', 'FUNCTION', 'TRIGGER', 'AS', 'DISTINCT', 'UNION', 'ALL'
+        ];
+        
+        foreach ($keywords as $keyword) {
+            $pattern = '/\b' . preg_quote($keyword, '/') . '\b/i';
+            $query = preg_replace($pattern, $keyword, $query);
+        }
+        
+        return $query;
+    }
+
+    private function analyzeStoredProcedure(string $content, string $filePath): array
+    {
+        $result = [
+            'name' => '',
+            'parameters' => [],
+            'crud_operations' => [
+                'selects' => [],
+                'inserts' => [],
+                'updates' => [],
+                'deletes' => []
+            ]
+        ];
+
+        // プロシージャ名の抽出
+        if (preg_match('/CREATE\s+PROCEDURE\s+([^\s(]+)/i', $content, $matches)) {
+            $result['name'] = $matches[1];
+        }
+
+        // パラメータの抽出
+        if (preg_match('/CREATE\s+PROCEDURE\s+[^(]+\(([^)]+)\)/i', $content, $matches)) {
+            $params = explode(',', $matches[1]);
+            foreach ($params as $param) {
+                $param = trim($param);
+                if (preg_match('/^(?:IN|OUT|INOUT)?\s*([^\s]+)\s+([^\s]+)(?:\s+[^\s]+)?$/i', $param, $paramMatches)) {
+                    $name = trim($paramMatches[1], '`');
+                    $type = strtoupper($paramMatches[2]);
+                    $result['parameters'][] = [
+                        'name' => $name,
+                        'type' => $type
+                    ];
+                }
+            }
+        }
+
+        // CRUD操作の検出
+        $pattern = '/(?:SELECT|INSERT|UPDATE|DELETE)\s+.+?;/is';
+        if (preg_match_all($pattern, $content, $matches)) {
+            foreach ($matches[0] as $query) {
+                $normalizedQuery = $this->normalizeSqlQuery($query);
+                if (stripos($normalizedQuery, 'SELECT') === 0) {
+                    if (preg_match_all('/(?:FROM|JOIN)\s+([^\s;()]+)(?:\s+(?:AS\s+)?[^\s;()]+)?/i', $normalizedQuery, $tableMatches)) {
+                        foreach ($tableMatches[1] as $table) {
+                            $table = trim($table, '`');
+                            if (!in_array($table, $result['crud_operations']['selects'])) {
+                                $result['crud_operations']['selects'][] = $table;
+                            }
+                        }
+                    }
+                } elseif (stripos($normalizedQuery, 'INSERT') === 0) {
+                    if (preg_match('/INTO\s+([^\s;(]+)/i', $normalizedQuery, $tableMatch)) {
+                        $table = trim($tableMatch[1], '`');
+                        if (!in_array($table, $result['crud_operations']['inserts'])) {
+                            $result['crud_operations']['inserts'][] = $table;
+                        }
+                    }
+                } elseif (stripos($normalizedQuery, 'UPDATE') === 0) {
+                    if (preg_match('/UPDATE\s+([^\s;]+)/i', $normalizedQuery, $tableMatch)) {
+                        $table = trim($tableMatch[1], '`');
+                        if (!in_array($table, $result['crud_operations']['updates'])) {
+                            $result['crud_operations']['updates'][] = $table;
+                        }
+                    }
+                } elseif (stripos($normalizedQuery, 'DELETE') === 0) {
+                    if (preg_match('/FROM\s+([^\s;]+)/i', $normalizedQuery, $tableMatch)) {
+                        $table = trim($tableMatch[1], '`');
+                        if (!in_array($table, $result['crud_operations']['deletes'])) {
+                            $result['crud_operations']['deletes'][] = $table;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ストアドプロシージャを記録
+        $this->storedProcedures[$result['name']] = $result;
+
+        return $result;
+    }
+
+    private function analyzeView(string $content, string $filePath): array
+    {
+        $result = [
+            'name' => '',
+            'tables' => [],
+            'crud_operations' => [
+                'selects' => []
+            ]
+        ];
+
+        // ビュー名の抽出
+        if (preg_match('/CREATE\s+VIEW\s+([^\s(]+)/i', $content, $matches)) {
+            $result['name'] = $matches[1];
+        }
+
+        // テーブル名の抽出
+        $pattern = '/(?:FROM|JOIN)\s+([^\s;()]+)(?:\s+(?:AS\s+)?[^\s;()]+)?/i';
+        if (preg_match_all($pattern, $content, $matches)) {
+            foreach ($matches[1] as $table) {
+                $table = trim($table, '`');
+                if (!in_array($table, $result['tables'])) {
+                    $result['tables'][] = $table;
+                    $result['crud_operations']['selects'][] = $table;
+                }
+            }
+        }
+
+        // ビューを記録
+        $this->views[$result['name']] = $result;
+
+        return $result;
+    }
+
+    private function resolveIncludePath(string $file, string $baseDir): string
+    {
+        // __DIR__を使用している場合
+        if (strpos($file, '__DIR__') !== false) {
+            $file = str_replace('__DIR__', $baseDir, $file);
+            $file = str_replace('//', '/', $file);
+            return $file;
+        }
+
+        // 絶対パスの場合
+        if (strpos($file, '/') === 0) {
+            return $file;
+        }
+
+        // 相対パスの場合
+        $possiblePaths = [
+            $baseDir . '/' . $file,
+            $baseDir . '/includes/' . basename($file)
+        ];
+
+        foreach ($possiblePaths as $path) {
+            $path = str_replace('//', '/', $path);
+            if (file_exists($path)) {
+                return $path;
+            }
+        }
+
+        // デフォルトのパスを返す
+        return $baseDir . '/' . $file;
+    }
+}
+
+class PhpAstVisitor extends NodeVisitorAbstract
+{
+    protected FileAnalyzer $analyzer;
+    protected string $currentClass = '';
+    protected string $currentMethod = '';
+    protected array $queries = [];
+    protected array $currentConditions = [];
+    protected ?string $currentFunction = null;
+    protected array $functions = [];
+    protected array $variables = [];
+
+    public function __construct(FileAnalyzer $analyzer)
+    {
+        $this->analyzer = $analyzer;
+    }
+
+    public function enterNode(Node $node)
+    {
+        if ($node instanceof Node\Stmt\Class_) {
+            $this->currentClass = $node->name->toString();
+            $this->analyzer->classes[] = [
+                'name' => $this->currentClass,
+                'methods' => []
+            ];
+        } elseif ($node instanceof Node\Stmt\ClassMethod) {
+            $methodName = $node->name->toString();
+            if ($this->currentClass !== '') {
+                foreach ($this->analyzer->classes as &$class) {
+                    if ($class['name'] === $this->currentClass) {
+                        $class['methods'][] = [
+                            'name' => $methodName,
+                            'params' => array_map(function ($param) {
+                                return $param->var->name;
+                            }, $node->params)
+                        ];
+                        break;
+                    }
+                }
+            }
+            $this->currentFunction = $methodName;
+        } elseif ($node instanceof Node\Stmt\Function_) {
+            $this->currentFunction = $node->name->toString();
+            $this->functions[] = [
+                'name' => $this->currentFunction,
+                'file' => $this->analyzer->currentFile ?? '',
+                'params' => array_map(function ($param) {
+                    return $param->var->name;
+                }, $node->params)
+            ];
+        } elseif ($node instanceof Node\Stmt\If_) {
+            $condition = $this->evaluateCondition($node->cond);
+            array_push($this->currentConditions, $condition);
+        } elseif ($node instanceof Node\Expr\Assign) {
+            if ($node->var instanceof Node\Expr\Variable) {
+                $this->variables[] = [
+                    'name' => $node->var->name,
+                    'function' => $this->currentFunction,
+                    'class' => $this->currentClass,
+                    'file' => $this->analyzer->currentFile ?? '',
+                    'line' => $node->getStartLine()
+                ];
+            }
+            if ($node->expr instanceof Node\Scalar\String_) {
+                $query = $this->extractSqlQuery($node->expr);
+                if ($query) {
+                    $tables = $this->analyzer->extractTableNames($query);
+                    $this->analyzer->conditionalPatterns[] = [
+                        'conditions' => $this->currentConditions,
+                        'query' => $query,
+                        'tables' => $tables
+                    ];
+                }
+            }
+        }
+    }
+
+    public function leaveNode(Node $node)
+    {
+        if ($node instanceof Node\Stmt\Class_) {
+            $this->currentClass = '';
+        } elseif ($node instanceof Node\Stmt\ClassMethod || $node instanceof Node\Stmt\Function_) {
+            $this->currentFunction = null;
+        } elseif ($node instanceof Node\Stmt\If_) {
+            array_pop($this->currentConditions);
+        }
+    }
+
+    private function evaluateCondition(Node $node): string
+    {
+        if ($node instanceof Node\Expr\BinaryOp) {
+            $left = $this->evaluateCondition($node->left);
+            $right = $this->evaluateCondition($node->right);
+            $operator = $node->getOperatorSigil();
+            return "{$left} {$operator} {$right}";
+        } elseif ($node instanceof Node\Scalar\String_) {
+            return '"' . $node->value . '"';
+        } elseif ($node instanceof Node\Expr\Variable) {
+            return '$' . $node->name;
+        } elseif ($node instanceof Node\Scalar\LNumber || $node instanceof Node\Scalar\DNumber) {
+            return (string)$node->value;
+        } elseif ($node instanceof Node\Expr\ConstFetch) {
+            return $node->name->toString();
+        } elseif ($node instanceof Node\Expr\PropertyFetch) {
+            $var = $this->evaluateCondition($node->var);
+            $name = $node->name instanceof Node\Identifier ? $node->name->toString() : '';
+            return "{$var}->{$name}";
+        }
+        return 'unknown';
+    }
+
+    private function extractSqlQuery(Node $node): ?string
+    {
+        return $this->analyzer->extractSqlQuery($node);
+    }
+
+    public function getQueries(): array
+    {
+        return $this->queries;
+    }
+
+    public function getFunctions(): array
+    {
+        return $this->functions;
+    }
+
+    public function getVariables(): array
+    {
+        return $this->variables;
+    }
+} 
