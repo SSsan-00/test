@@ -1,0 +1,796 @@
+#!/usr/bin/env php
+<?php
+declare(strict_types=1);
+
+require __DIR__ . '/vendor/autoload.php';
+
+use PhpOffice\PhpSpreadsheet\Settings;
+use PhpOffice\PhpSpreadsheet\CachedObjectStorageFactory;
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+use PhpParser\ParserFactory;
+use PhpParser\NodeTraverser;
+use PhpParser\NodeVisitorAbstract;
+use PhpParser\Error;
+use PhpParser\Node;
+use PHPSQLParser\PHPSQLParser;
+use PHPSQLParser\PHPSQLParserException;
+use Peast\Peast;
+use DOMDocument;
+use DOMXPath;
+use SplFileObject;
+
+// ====================================
+// メモリ・キャッシュ設定
+// ====================================
+Settings::setCacheStorageMethod(
+    CachedObjectStorageFactory::cache_to_discISAM
+);
+
+// ====================================
+// エントリポイント
+// ====================================
+$targetDir  = $argv[1] ?? __DIR__;
+$analyzer   = new FileAnalyzer($targetDir);
+$analyzer->analyze();
+$outputFile = __DIR__ . '/analysis_results.xlsx';
+$analyzer->writeExcel($outputFile);
+echo "解析完了: {$outputFile}\n";
+
+// ====================================
+// FileAnalyzer クラス
+// ====================================
+class FileAnalyzer
+{
+    private string $rootDir;
+    private array $targetExtensions = ['php','inc','js','html'];
+    private array $viewList;
+    private array $procList;
+
+    // 解析結果
+    private array $crudData         = []; // [ file => [ table => ['C'=>bool,'R'=>bool,'U'=>bool,'D'=>bool] ] ]
+    private array $functionRanges   = []; // [ file => [ ['name'=>string,'start'=>int,'end'=>int], … ] ]
+    private array $functionCrud     = []; // [ file => [ func => [ table => ['C'=>…,…] ] ] ]
+    private array $includesGraph    = []; // [ file => [ includedFile, … ] ]
+    private array $externalAccesses = []; // [ ['file'=>..., 'type'=>..., 'url'=>...], … ]
+    private array $procUsage        = []; // [ ['file'=>..., 'proc'=>..., 'args'=>[...] ], … ]
+    private array $varTable         = []; // [ file => [ varName => value, … ] ]
+    private array $defines          = []; // [ CONST_NAME => value, … ]
+    private array $logData          = []; // [ ['file'=>..., 'message'=>...], … ]
+
+    private $parser;
+
+    public function __construct(string $rootDir)
+    {
+        $this->rootDir  = rtrim($rootDir, DIRECTORY_SEPARATOR);
+        $viewFile       = $this->rootDir . '/view_list.txt';
+        $procFile       = $this->rootDir . '/procedure_list.txt';
+        $this->viewList = file_exists($viewFile ) ? file($viewFile,  FILE_IGNORE_NEW_LINES) : [];
+        $this->procList = file_exists($procFile ) ? file($procFile,  FILE_IGNORE_NEW_LINES) : [];
+
+        $factory        = new ParserFactory();
+        $this->parser   = $factory->createForNewestSupportedVersion();
+    }
+
+    /**
+     * 全ファイル解析
+     */
+    public function analyze(): void
+    {
+        gc_disable();
+        foreach ($this->getFiles($this->rootDir) as $file) {
+            $this->parseFile($file);
+            gc_collect_cycles();
+        }
+        gc_enable();
+        $this->propagateIncludes();
+    }
+
+    /**
+     * 再帰ジェネレータでファイル列挙
+     */
+    private function getFiles(string $dir): \Generator
+    {
+        $it = new \DirectoryIterator($dir);
+        foreach ($it as $entry) {
+            if ($entry->isDot()) continue;
+            $path = $entry->getPathname();
+            if ($entry->isDir()) {
+                yield from $this->getFiles($path);
+            } elseif (in_array(strtolower($entry->getExtension()), $this->targetExtensions, true)) {
+                yield $path;
+            }
+        }
+    }
+
+    /**
+     * 拡張子ごとに解析振り分け
+     */
+    private function parseFile(string $file): void
+    {
+        $rel = ltrim(str_replace($this->rootDir, '', $file), '/\\');
+        $ext = strtolower(pathinfo($file, PATHINFO_EXTENSION));
+        if (in_array($ext, ['php','inc'], true)) {
+            $this->parsePhpFile($file, $rel);
+        } elseif ($ext === 'js') {
+            $this->parseJsFile($file, $rel);
+        } elseif ($ext === 'html') {
+            $this->parseHtmlFile($file, $rel);
+        }
+    }
+
+    // ---------------------------------------------
+    // PHP ファイル解析
+    // ---------------------------------------------
+    private function parsePhpFile(string $file, string $rel): void
+    {
+        $code = file_get_contents($file);
+        if ($code === false) {
+            $this->addLog($rel, 'Failed to read PHP file');
+            return;
+        }
+
+        // include / require
+        $noC = preg_replace('!/\*.*?\*/!s', '', $code);
+        $noC = preg_replace('/\/\/.*?\n/', "\n", $noC);
+        if (preg_match_all('/\b(require|include)(_once)?\s*\(?[\'"](.+?)[\'"]\)?\s*;/', $noC, $m)) {
+            foreach ($m[3] as $inc) {
+                $abs = realpath(dirname($file) . DIRECTORY_SEPARATOR . $inc);
+                if ($abs !== false && str_starts_with($abs, $this->rootDir)) {
+                    $incRel = ltrim(str_replace($this->rootDir, '', $abs), '/\\');
+                    $this->includesGraph[$rel][] = $incRel;
+                }
+                $this->addLog($rel, "Found include: {$inc}");
+            }
+        }
+
+        // AST: define, 変数定義, 関数レンジ
+        try {
+            $stmts = $this->parser->parse($code) ?? [];
+            $tr    = new NodeTraverser();
+            $tr->addVisitor(new class($this, $rel) extends NodeVisitorAbstract {
+                private FileAnalyzer $A;
+                private string $f;
+                public function __construct($A, $f) { $this->A = $A; $this->f = $f; }
+                public function enterNode(Node $n)
+                {
+                    // define('KEY','VAL')
+                    if ($n instanceof Node\Expr\FuncCall
+                        && $n->name instanceof Node\Name
+                        && strtolower($n->name->toString()) === 'define'
+                        && isset($n->args[0], $n->args[1])
+                        && $n->args[0]->value instanceof Node\Scalar\String_
+                        && $n->args[1]->value instanceof Node\Scalar\String_
+                    ) {
+                        $k = $n->args[0]->value->value;
+                        $v = $n->args[1]->value->value;
+                        $this->A->defines[$k] = $v;
+                    }
+                    // $var = expr;
+                    if ($n instanceof Node\Expr\Assign
+                        && $n->var instanceof Node\Expr\Variable
+                    ) {
+                        $name = $n->var->name;
+                        $val  = $this->A->evaluateExpression($n->expr, $this->f);
+                        if ($val !== null) {
+                            $this->A->varTable[$this->f][$name] = $val;
+                        }
+                    }
+                    // function foo() { … }
+                    if ($n instanceof Node\Stmt\Function_) {
+                        $this->A->functionRanges[$this->f][] = [
+                            'name'  => $n->name->toString(),
+                            'start' => $n->getStartLine(),
+                            'end'   => $n->getEndLine(),
+                        ];
+                    }
+                }
+            });
+            $tr->traverse($stmts);
+        } catch (Error $e) {
+            $this->addLog($rel, 'Parser error: ' . $e->getMessage());
+        }
+
+        // fallback SQL 組み立て解析
+        $buffers = $this->fallbackParseBuffers($file, $rel);
+        foreach ($buffers as $b) {
+            $this->parseSqlString($b['sql'], $rel, $b['line']);
+        }
+
+        // 関数呼び出し伝播
+        $this->propagateFunctionCalls($code, $rel);
+    }
+
+    /**
+     * フォールバック: 行単位ストリーム処理で SQL 組立
+     */
+    private function fallbackParseBuffers(string $file, string $rel): array
+    {
+        $buffers = [];
+        $fobj    = new SplFileObject($file);
+        $current = null;
+        $curLine = 0;
+        $ln      = 0;
+
+        while (!$fobj->eof()) {
+            $line = $fobj->fgets();
+            $ln++;
+            // コメント除去
+            $line = preg_replace('!/\*.*?\*/!s', '', $line);
+            $line = preg_replace('/\/\/.*$/m', '', $line);
+
+            // $sql = '…';
+            if (preg_match('/^\s*\$(\w+)\s*=\s*[\'"](.+?)[\'"]\s*;/', $line, $m)) {
+                if ($current !== null) {
+                    $buffers[] = ['sql'=>$current,'line'=>$curLine];
+                }
+                $current = $m[2];
+                $curLine = $ln;
+                continue;
+            }
+            // $sql .= '…';
+            if ($current!==null
+                && preg_match('/^\s*\$\w+\s*\.\=\s*[\'"](.+?)[\'"]\s*;/', $line, $m)
+            ) {
+                $current .= $m[1];
+                continue;
+            }
+            // $sql = $var;
+            if (preg_match('/^\s*\$(\w+)\s*=\s*\$(\w+)\s*;/', $line, $m)) {
+                if ($current !== null) {
+                    $buffers[] = ['sql'=>$current,'line'=>$curLine];
+                }
+                $current = $this->varTable[$rel][$m[2]] ?? '';
+                $curLine = $ln;
+                continue;
+            }
+            // $sql .= $var;
+            if ($current!==null
+                && preg_match('/^\s*\$\w+\s*\.\=\s*\$(\w+)\s*;/', $line, $m)
+            ) {
+                $current .= ($this->varTable[$rel][$m[1]] ?? '');
+                continue;
+            }
+            // $sql = CONST;
+            if (preg_match('/^\s*\$(\w+)\s*=\s*([A-Z_][A-Z0-9_]*)\s*;/', $line, $m)
+                && isset($this->defines[$m[2]])
+            ) {
+                if ($current!==null) {
+                    $buffers[] = ['sql'=>$current,'line'=>$curLine];
+                }
+                $current = $this->defines[$m[2]];
+                $curLine = $ln;
+                continue;
+            }
+            // $sql .= CONST;
+            if ($current!==null
+                && preg_match('/^\s*\$\w+\s*\.\=\s*([A-Z_][A-Z0-9_]*)\s*;/', $line, $m)
+                && isset($this->defines[$m[1]])
+            ) {
+                $current .= $this->defines[$m[1]];
+                continue;
+            }
+            // $_GET / $_POST マッピング
+            if (preg_match('/^\s*\$(\w+)\s*=\s*\$_(GET|POST|REQUEST)\s*\[\s*[\'"](.+?)[\'"]\s*\]\s*;/', $line, $m)) {
+                $this->addLog($rel, "Mapped \${$m[1]} ← \$_{$m[2]}['{$m[3]}']");
+                if ($current!==null) {
+                    $buffers[] = ['sql'=>$current,'line'=>$curLine];
+                }
+                $current = ":{$m[3]}:";
+                $curLine = $ln;
+                continue;
+            }
+            if ($current!==null
+                && preg_match('/^\s*\$\w+\s*\.\=\s*\$_(GET|POST|REQUEST)\s*\[\s*[\'"](.+?)[\'"]\s*\]\s*;/', $line, $m)
+            ) {
+                $this->addLog($rel, "Appended \$_{$m[1]}['{$m[2]}']");
+                $current .= ":{$m[2]}:";
+                continue;
+            }
+        }
+
+        if ($current!==null) {
+            $buffers[] = ['sql'=>$current,'line'=>$curLine];
+        }
+        return $buffers;
+    }
+
+    /**
+     * 簡易式評価: 文字列・数値リテラル、変数参照、連結、四則演算
+     */
+    private function evaluateExpression(Node\Expr $e, string $file): string|int|null
+    {
+        if ($e instanceof Node\Scalar\String_) {
+            return $e->value;
+        }
+        if ($e instanceof Node\Scalar\LNumber) {
+            return $e->value;
+        }
+        if ($e instanceof Node\Expr\Variable) {
+            return $this->varTable[$file][$e->name] ?? null;
+        }
+        if ($e instanceof Node\Expr\BinaryOp\Concat) {
+            $l = $this->evaluateExpression($e->left,  $file);
+            $r = $this->evaluateExpression($e->right, $file);
+            if ($l!==null && $r!==null) {
+                return $l.$r;
+            }
+        }
+        if ($e instanceof Node\Expr\BinaryOp) {
+            $l = $this->evaluateExpression($e->left,  $file);
+            $r = $this->evaluateExpression($e->right, $file);
+            if (is_int($l) && is_int($r)) {
+                return match(get_class($e)) {
+                    Node\Expr\BinaryOp\Plus  => $l + $r,
+                    Node\Expr\BinaryOp\Minus => $l - $r,
+                    Node\Expr\BinaryOp\Mul   => $l * $r,
+                    Node\Expr\BinaryOp\Div   => intdiv($l,$r),
+                    default                  => null,
+                };
+            }
+        }
+        return null;
+    }
+
+    /**
+     * SQL → CRUD, VIEW/PROC, CALL Proc 抽出
+     */
+    private function parseSqlString(string $sql, string $file, int $line=null): void
+    {
+        $sql = trim($sql);
+        if ($sql === '') return;
+
+        // 定数展開
+        foreach ($this->defines as $k=>$v) {
+            $sql = str_replace($k,$v,$sql);
+        }
+
+        // CALL proc(...)
+        if (preg_match_all('/\bcall\s+([A-Za-z0-9_]+)\s*\((.*?)\)/i',$sql,$c,PREG_SET_ORDER)) {
+            foreach ($c as $m) {
+                $proc = $m[1];
+                $args = array_map('trim', explode(',',$m[2]));
+                if (in_array($proc,$this->procList,true)) {
+                    $this->procUsage[] = ['file'=>$file,'proc'=>$proc,'args'=>$args];
+                    $this->addLog($file,"Found proc call: {$proc}");
+                }
+            }
+        }
+
+        // CTE WITH
+        if (preg_match('/^\s*with\s+(.+?)\)\s*select\s+/is',$sql,$wm)) {
+            if (preg_match_all('/([A-Za-z0-9_]+)\s+as\s*\((.+?)\)(?:,|$)/is',$wm[1],$cm)) {
+                foreach ($cm[2] as $cte) {
+                    $this->parseSqlString($cte,$file,$line);
+                }
+            }
+            $sql = preg_replace('/^\s*with\s+.+?\)\s*(select\s+)/is','$1',$sql);
+        }
+
+        // TEMP table
+        if (preg_match(
+            '/\bselect\b.+?\binto\s+(?:temporary\s+table\s+|temp\s+table\s+)?([A-Za-z0-9_]+)\s+from\s+([A-Za-z0-9_]+)/is',
+            $sql,$m
+        )) {
+            $this->addCrud($file,$m[1].'@temp','C',$line);
+            $this->addCrud($file,$m[2],'R',$line);
+            return;
+        }
+
+        // PHPSQLParser
+        try {
+            $pp = new PHPSQLParser($sql,true);
+            $pd = $pp->parsed;
+        } catch (PHPSQLParserException $e) {
+            $this->addLog($file,'SQL parse error: '.$e->getMessage());
+            return;
+        }
+        $this->processParsed($pd,$file,$line);
+    }
+
+    private function processParsed(array $p, string $file, int $line=null): void
+    {
+        // INSERT
+        if (!empty($p['INSERT'])) {
+            foreach ($p['INSERT'] as $in) {
+                $tbl = $in['table']['no_quotes'] ?? $in['table'];
+                $this->addCrud($file,$tbl,'C',$line);
+            }
+        }
+        // UPDATE
+        if (!empty($p['UPDATE'])) {
+            foreach ($p['UPDATE'] as $up) {
+                $this->addCrud($file,$up['table'],'U',$line);
+            }
+        }
+        // DELETE
+        if (!empty($p['DELETE'])) {
+            foreach ($p['DELETE'] as $dl) {
+                $this->addCrud($file,$dl['table'],'D',$line);
+            }
+        }
+        // FROM / JOIN
+        foreach (['FROM','JOIN'] as $cl) {
+            if (!empty($p[$cl]) && is_array($p[$cl])) {
+                foreach ($p[$cl] as $e) {
+                    if (!empty($e['expr_type']) && $e['expr_type']==='subquery' && !empty($e['sub_tree'])) {
+                        $this->processParsed($e['sub_tree'],$file,$line);
+                    } elseif (!empty($e['table'])) {
+                        $tbl = $e['table'];
+                        $sfx = in_array($tbl,$this->viewList,true) ? '@view'
+                             : (in_array($tbl,$this->procList,true)?'@proc':'');
+                        $this->addCrud($file,$tbl.$sfx,'R',$line);
+                    }
+                }
+            }
+        }
+        // WHERE subquery
+        if (!empty($p['WHERE']) && is_array($p['WHERE'])) {
+            $this->processWhere($p['WHERE'],$file,$line);
+        }
+    }
+
+    private function processWhere(array $w, string $file, int $line=null): void
+    {
+        foreach ($w as $item) {
+            if (is_array($item)) {
+                if (!empty($item['expr_type']) && $item['expr_type']==='subquery' && !empty($item['sub_tree'])) {
+                    $this->processParsed($item['sub_tree'],$file,$line);
+                } else {
+                    $this->processWhere($item,$file,$line);
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------
+    // 関数呼び出し伝播と動的テーブル関数
+    // ---------------------------------------------
+    private function propagateFunctionCalls(string $code, string $file): void
+    {
+        try {
+            $stmts = $this->parser->parse($code) ?? [];
+        } catch (Error) {
+            return;
+        }
+        $tr = new NodeTraverser();
+        $tr->addVisitor(new class($this,$file) extends NodeVisitorAbstract {
+            private FileAnalyzer $A;
+            private string $f;
+            public function __construct($A,$f){$this->A=$A; $this->f=$f;}
+            public function enterNode(Node $n) {
+                if ($n instanceof Node\Expr\FuncCall && $n->name instanceof Node\Name) {
+                    $fn = $n->name->toString();
+                    // 固定テーブル関数
+                    if (isset($this->A->functionCrud[$this->f][$fn])) {
+                        foreach ($this->A->functionCrud[$this->f][$fn] as $tbl=>$ops) {
+                            foreach (['C','R','U','D'] as $op) {
+                                if ($ops[$op]) $this->A->addCrud($this->f,$tbl,$op);
+                            }
+                        }
+                        return;
+                    }
+                    // 動的テーブル関数 (第一引数)
+                    if (!empty($n->args[0]->value)) {
+                        $tbl = $this->A->evaluateExpression($n->args[0]->value,$this->f);
+                        if (is_string($tbl) && $tbl!=='') {
+                            $this->A->addCrud($this->f,$tbl,'R');
+                        }
+                    }
+                }
+            }
+        });
+        $tr->traverse($stmts);
+    }
+
+    /**
+     * CRUD 登録 + 関数スコープマッピング
+     */
+    private function addCrud(string $file, string $table, string $op, int $line=null): void
+    {
+        $this->crudData[$file][$table] ??= ['C'=>false,'R'=>false,'U'=>false,'D'=>false];
+        $this->crudData[$file][$table][$op] = true;
+        if ($line !== null) {
+            $fn = $this->findFunctionByLine($file,$line);
+            if ($fn !== null) {
+                $this->functionCrud[$file][$fn][$table][$op] = true;
+            }
+        }
+    }
+
+    private function findFunctionByLine(string $file, int $line): ?string
+    {
+        foreach ($this->functionRanges[$file] ?? [] as $r) {
+            if ($line >= $r['start'] && $line <= $r['end']) {
+                return $r['name'];
+            }
+        }
+        return null;
+    }
+
+    // ---------------------------------------------
+    // include 依存伝播
+    // ---------------------------------------------
+    private function propagateIncludes(): void
+    {
+        foreach (array_keys($this->includesGraph) as $f) {
+            $this->propInc($f, []);
+        }
+    }
+    private function propInc(string $file, array $vis): void
+    {
+        if (!empty($vis[$file])) return;
+        $vis[$file] = true;
+        foreach ($this->includesGraph[$file] ?? [] as $inc) {
+            $this->propInc($inc,$vis);
+            foreach ($this->crudData[$inc] ?? [] as $tbl=>$ops) {
+                foreach (['C','R','U','D'] as $op) {
+                    if ($ops[$op]) $this->addCrud($file,$tbl,$op);
+                }
+            }
+        }
+    }
+
+    private function addLog(string $file, string $msg): void
+    {
+        $this->logData[] = ['file'=>$file,'message'=>$msg];
+    }
+
+    // ---------------------------------------------
+    // JavaScript 外部アクセス解析
+    // ---------------------------------------------
+    private function parseJsFile(string $file, string $rel): void
+    {
+        $code = file_get_contents($file);
+        if ($code === false) {
+            $this->addLog($rel, 'Failed to read JS file');
+            return;
+        }
+        try {
+            $ast = Peast::latest($code, ['comments'=>false])->parse();
+        } catch (\Exception $e) {
+            $this->addLog($rel, 'JS parse error: ' . $e->getMessage());
+            return;
+        }
+        $ast->bodyLoop(function($n) use($rel) {
+            // fetch / window.fetch
+            if ($n->type === 'ExpressionStatement'
+                && isset($n->expression->callee)
+                && in_array(strtolower($n->expression->callee->type), ['identifier','memberexpression'], true)
+            ) {
+                $callee = $n->expression->callee;
+                $name = strtolower(
+                    $callee->type === 'Identifier' ? $callee->name
+                    : ($callee->object->type === 'Identifier' && strtolower($callee->object->name)==='window'
+                        ? $callee->property->name : '')
+                );
+                if ($name === 'fetch'
+                    && isset($n->expression->arguments[0]->value->value)
+                ) {
+                    $this->externalAccesses[] = [
+                        'file'=>$rel,'type'=>'fetch','url'=>$n->expression->arguments[0]->value->value
+                    ];
+                }
+            }
+            // XMLHttpRequest.open
+            if ($n->type==='ExpressionStatement'
+                && $n->expression->type==='CallExpression'
+                && $n->expression->callee->type==='MemberExpression'
+                && $n->expression->callee->object->type==='NewExpression'
+                && $n->expression->callee->object->callee->name==='XMLHttpRequest'
+                && $n->expression->callee->property->name==='open'
+                && isset($n->expression->arguments[1]->value->value)
+            ) {
+                $this->externalAccesses[]=[
+                    'file'=>$rel,'type'=>'xhr','url'=>$n->expression->arguments[1]->value->value
+                ];
+            }
+            // jQuery $.ajax / $.get / $.post / $.getJSON / $(...).load
+            if ($n->type==='ExpressionStatement'
+                && $n->expression->type==='CallExpression'
+                && $n->expression->callee->type==='MemberExpression'
+                && $n->expression->callee->object->type==='Identifier'
+                && strtolower($n->expression->callee->object->name)==='$'
+                && in_array(strtolower($n->expression->callee->property->name),
+                    ['ajax','get','post','getjson','load'], true)
+            ) {
+                $arg0 = $n->expression->arguments[0]->value->value ?? null;
+                if ($arg0 !== null) {
+                    $this->externalAccesses[] = [
+                        'file'=>$rel,
+                        'type'=>'jquery.'.$n->expression->callee->property->name,
+                        'url'=>$arg0
+                    ];
+                }
+            }
+            // Axios axios.get / axios.post / axios.request
+            if ($n->type==='ExpressionStatement'
+                && $n->expression->type==='CallExpression'
+                && $n->expression->callee->type==='MemberExpression'
+                && $n->expression->callee->object->type==='Identifier'
+                && strtolower($n->expression->callee->object->name)==='axios'
+                && in_array(strtolower($n->expression->callee->property->name),
+                    ['get','post','request'], true)
+            ) {
+                $arg0 = $n->expression->arguments[0]->value->value ?? null;
+                if ($arg0 !== null) {
+                    $this->externalAccesses[] = [
+                        'file'=>$rel,
+                        'type'=>'axios.'.$n->expression->callee->property->name,
+                        'url'=>$arg0
+                    ];
+                }
+            }
+            // dynamic import()
+            if ($n->type === 'ExpressionStatement'
+                && $n->expression->type === 'ImportExpression'
+                && isset($n->expression->source->value)
+            ) {
+                $this->externalAccesses[] = [
+                    'file'=>$rel,'type'=>'import','url'=>$n->expression->source->value
+                ];
+            }
+            // WebSocket / EventSource
+            if ($n->type==='ExpressionStatement'
+                && $n->expression->type==='NewExpression'
+                && in_array($n->expression->callee->name, ['WebSocket','EventSource'], true)
+                && isset($n->expression->arguments[0]->value->value)
+            ) {
+                $this->externalAccesses[] = [
+                    'file'=>$rel,
+                    'type'=>strtolower($n->expression->callee->name),
+                    'url'=>$n->expression->arguments[0]->value->value
+                ];
+            }
+        });
+    }
+
+    // ---------------------------------------------
+    // HTML 外部アクセス解析
+    // ---------------------------------------------
+    private function parseHtmlFile(string $file, string $rel): void
+    {
+        $html = file_get_contents($file);
+        if ($html === false) {
+            $this->addLog($rel, 'Failed to read HTML file');
+            return;
+        }
+        libxml_use_internal_errors(true);
+        $dom = new DOMDocument();
+        if (!$dom->loadHTML($html)) {
+            $this->addLog($rel, 'HTML parse error');
+            return;
+        }
+        $xp = new DOMXPath($dom);
+
+        $queries = [
+            ['//form[@action]',           'action',     'form-action'],
+            ['//script[@src]',            'src',        'script-src'],
+            ['//img[@src]',               'src',        'img-src'],
+            ['//img[@srcset]',            'srcset',     'img-srcset'],
+            ['//link[@href]',             'href',       'link-href'],
+            ['//iframe[@src]',            'src',        'iframe-src'],
+            ['//audio[@src]',             'src',        'audio-src'],
+            ['//video[@src]',             'src',        'video-src'],
+            ['//source[@src]',            'src',        'source-src'],
+            ['//embed[@src]',             'src',        'embed-src'],
+            ['//object[@data]',           'data',       'object-data'],
+            ['//meta[@http-equiv="refresh"]','content', 'meta-refresh'],
+        ];
+        foreach ($queries as list($xpExpr,$attr,$type)) {
+            foreach ($xp->query($xpExpr) as $node) {
+                $val = $node->getAttribute($attr);
+                if ($type==='meta-refresh' && preg_match('/url=(.+)$/i',$val,$m)) {
+                    $val = trim($m[1], '"\' ');
+                }
+                if ($val !== '') {
+                    $this->externalAccesses[] = [
+                        'file'=>$rel,'type'=>$type,'url'=>$val
+                    ];
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------
+    // Excel 出力
+    // ---------------------------------------------
+    public function writeExcel(string $outputPath): void
+    {
+        $ss = new Spreadsheet();
+
+        // --- File-CRUD シート ---
+        $sh = $ss->getActiveSheet();
+        $sh->setTitle('File-CRUD');
+        $sh->fromArray(['File','Table','C','R','U','D'], null, 'A1');
+        $row = 2;
+        foreach ($this->crudData as $file => $tables) {
+            $first = true;
+            foreach ($tables as $table => $ops) {
+                if ($first) {
+                    $sh->setCellValue("A{$row}", $file);
+                    $first = false;
+                }
+                $sh->setCellValue("B{$row}", $table);
+                $sh->setCellValue("C{$row}", $ops['C'] ? '○' : '');
+                $sh->setCellValue("D{$row}", $ops['R'] ? '○' : '');
+                $sh->setCellValue("E{$row}", $ops['U'] ? '○' : '');
+                $sh->setCellValue("F{$row}", $ops['D'] ? '○' : '');
+                $row++;
+            }
+            $row++;
+        }
+
+        // --- ストアドプロシージャ シート ---
+        $sp = $ss->createSheet();
+        $sp->setTitle('ストアドプロシージャ');
+        $sp->fromArray(['File','Procedure','Args'], null, 'A1');
+        $r2 = 2;
+        foreach ($this->procUsage as $u) {
+            $sp->setCellValue("A{$r2}", $u['file']);
+            $sp->setCellValue("B{$r2}", $u['proc']);
+            $sp->setCellValue("C{$r2}", implode(', ', $u['args']));
+            $r2++;
+        }
+
+        // --- Function-CRUD シート ---
+        $fsh = $ss->createSheet();
+        $fsh->setTitle('Function-CRUD');
+        $fsh->fromArray(['File','Function','Table','C','R','U','D'], null, 'A1');
+        $r3 = 2;
+        foreach ($this->functionCrud as $file => $funcs) {
+            foreach ($funcs as $func => $tables) {
+                foreach ($tables as $table => $ops) {
+                    $fsh->setCellValue("A{$r3}", $file);
+                    $fsh->setCellValue("B{$r3}", $func);
+                    $fsh->setCellValue("C{$r3}", $table);
+                    $fsh->setCellValue("D{$r3}", $ops['C'] ? '○' : '');
+                    $fsh->setCellValue("E{$r3}", $ops['R'] ? '○' : '');
+                    $fsh->setCellValue("F{$r3}", $ops['U'] ? '○' : '');
+                    $fsh->setCellValue("G{$r3}", $ops['D'] ? '○' : '');
+                    $r3++;
+                }
+            }
+        }
+
+        // --- インクルードファイル シート ---
+        $ish = $ss->createSheet();
+        $ish->setTitle('インクルードファイル');
+        $ish->fromArray(['File','Include'], null, 'A1');
+        $r4 = 2;
+        foreach ($this->includesGraph as $file => $incs) {
+            foreach ($incs as $inc) {
+                $ish->setCellValue("A{$r4}", $file);
+                $ish->setCellValue("B{$r4}", $inc);
+                $r4++;
+            }
+            $r4++;
+        }
+
+        // --- 外部アクセス シート ---
+        $eah = $ss->createSheet();
+        $eah->setTitle('外部アクセス');
+        $eah->fromArray(['File','Type','URL'], null, 'A1');
+        $r5 = 2;
+        foreach ($this->externalAccesses as $e) {
+            $eah->setCellValue("A{$r5}", $e['file']);
+            $eah->setCellValue("B{$r5}", $e['type']);
+            $eah->setCellValue("C{$r5}", $e['url']);
+            $r5++;
+        }
+
+        // --- ログ シート ---
+        $lsh = $ss->createSheet();
+        $lsh->setTitle('ログ');
+        $lsh->fromArray(['File','Message'], null, 'A1');
+        $r6 = 2;
+        foreach ($this->logData as $log) {
+            $lsh->setCellValue("A{$r6}", $log['file']);
+            $lsh->setCellValue("B{$r6}", $log['message']);
+            $r6++;
+        }
+
+        // ファイル保存
+        (new Xlsx($ss))->save($outputPath);
+    }
+}
