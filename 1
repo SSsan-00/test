@@ -6,76 +6,73 @@ require __DIR__ . '/vendor/autoload.php';
 
 use PhpOffice\PhpSpreadsheet\Spreadsheet;
 use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+use PhpOffice\PhpSpreadsheet\Settings;
+use PhpOffice\PhpSpreadsheet\CachedObjectStorageFactory;
 use PhpParser\ParserFactory;
 
+// --- メモリ管理：セルキャッシュを phpTemp に設定 ---
+Settings::setCacheStorageMethod(
+    CachedObjectStorageFactory::cache_to_phpTemp,
+    ['memoryCacheSize' => '16MB']
+);
+
+// --- 引数チェック ---
 if ($argc < 3) {
     fwrite(STDERR, "Usage: php analyzer.php <target_dir> <output.xlsx>\n");
     exit(1);
 }
-
-$targetDir  = $argv[1];
+$targetDir  = rtrim($argv[1], "/\\");
 $outputFile = $argv[2];
-
 if (!is_dir($targetDir)) {
     fwrite(STDERR, "Error: '{$targetDir}' is not a directory.\n");
     exit(1);
 }
 
-// ParserFactory を将来の AST 解析用にインスタンス化
+// --- AST 準備（将来拡張用） ---
 $parser = (new ParserFactory())->createForNewestSupportedVersion();
 
+// --- シートを 1 つだけ用意 ---
 $spreadsheet = new Spreadsheet();
-$sheetCount  = 0;
+$sheet       = $spreadsheet->getActiveSheet();
+$sheet->setTitle('CRUD Results');
+$headers = ['File', 'Table', 'C', 'R', 'U', 'D'];
+$sheet->fromArray($headers, null, 'A1');
 
-// 再帰的に .php ファイルを走査
+$row = 2;
 $rii = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($targetDir));
 foreach ($rii as $file) {
     if (!$file->isFile() || $file->getExtension() !== 'php') {
         continue;
     }
 
-    $path    = $file->getPathname();
-    $content = file_get_contents($path);
-    $crudMap = analyzeCrud($content);
+    $path       = $file->getPathname();
+    $relPath    = substr($path, strlen($targetDir) + 1);
+    $content    = file_get_contents($path);
+    $crudMap    = analyzeCrud($content);
 
-    // シート作成（最初は既存シートを利用、それ以降は新規作成）
-    $sheet = $sheetCount === 0
-        ? $spreadsheet->getActiveSheet()
-        : $spreadsheet->createSheet();
-    // シート名はファイル名（長すぎる場合は切り詰め）
-    $title = mb_substr($file->getBasename(), 0, 28);
-    $sheet->setTitle($title);
-
-    // ヘッダー
-    $sheet->fromArray(['Table', 'C', 'R', 'U', 'D'], null, 'A1');
-
-    // CRUD データ書き込み
-    $row = 2;
     foreach ($crudMap as $table => $ops) {
-        $sheet->setCellValue("A{$row}", $table);
-        $sheet->setCellValue("B{$row}", $ops['C'] ? '○' : '');
-        $sheet->setCellValue("C{$row}", $ops['R'] ? '○' : '');
-        $sheet->setCellValue("D{$row}", $ops['U'] ? '○' : '');
-        $sheet->setCellValue("E{$row}", $ops['D'] ? '○' : '');
+        $sheet->setCellValue("A{$row}", $relPath);
+        $sheet->setCellValue("B{$row}", $table);
+        $sheet->setCellValue("C{$row}", $ops['C'] ? '○' : '');
+        $sheet->setCellValue("D{$row}", $ops['R'] ? '○' : '');
+        $sheet->setCellValue("E{$row}", $ops['U'] ? '○' : '');
+        $sheet->setCellValue("F{$row}", $ops['D'] ? '○' : '');
         $row++;
     }
 
-    $sheetCount++;
+    // メモリ開放：変数クリア＋GC
+    unset($content, $crudMap);
+    gc_collect_cycles();
 }
 
-// ファイル保存
+// --- ファイル出力 ---
 $writer = new Xlsx($spreadsheet);
 $writer->save($outputFile);
 
-echo "✔ {$outputFile} を生成しました。\n";
-
+echo "✔ {$outputFile} を生成しました。\n\n";
 
 /**
- * 簡易版：ファイル本文から正規表現で CRUD 操作を検出
- *   C => INSERT INTO
- *   R => SELECT … FROM
- *   U => UPDATE
- *   D => DELETE FROM
+ * 簡易版：正規表現による CRUD 検出
  */
 function analyzeCrud(string $content): array
 {
