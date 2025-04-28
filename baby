@@ -9,10 +9,40 @@ use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 use PhpParser\ParserFactory;
 
 // ── コメント除去ユーティリティ ──
+/**
+ * コメント除去ユーティリティ（堅牢版）
+ *
+ * @param string $code 元のコード
+ * @return string コメントを除去したコード
+ */
 function stripComments(string $code): string
 {
-    // PHP/JS コメント（/*…*/、//…、#…）と HTML コメント（<!--…-->）をすべて除去
-    return preg_replace('!/\*.*?\*/|//.*?$|#.*?$|<!--.*?-->!ms', '', $code);
+    // HTML コメント
+    $result = @preg_replace('/<!--.*?-->/s', '', $code);
+    if ($result === null) {
+        // エラーが起きたら元コードを返す
+        $result = $code;
+    }
+
+    // C／PHP ブロックコメント
+    $tmp = @preg_replace('/\/\*.*?\*\//s', '', $result);
+    if ($tmp !== null) {
+        $result = $tmp;
+    }
+
+    // 行コメント (//… )
+    $tmp = @preg_replace('/\/\/.*$/m', '', $result);
+    if ($tmp !== null) {
+        $result = $tmp;
+    }
+
+    // 行コメント (#… )
+    $tmp = @preg_replace('/#.*$/m', '', $result);
+    if ($tmp !== null) {
+        $result = $tmp;
+    }
+
+    return $result;
 }
 
 // ガベージコレクション有効化
