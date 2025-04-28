@@ -8,7 +8,7 @@ use PhpOffice\PhpSpreadsheet\Spreadsheet;
 use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 use PhpParser\ParserFactory;
 
-// ガベージコレクション有効化（PHP 標準）
+// ガベージコレクション有効化
 gc_enable();
 
 // 引数チェック
@@ -19,16 +19,15 @@ if ($argc < 3) {
 
 $targetDir  = rtrim($argv[1], "/\\");
 $outputFile = $argv[2];
-
 if (!is_dir($targetDir)) {
     fwrite(STDERR, "Error: '{$targetDir}' is not a directory.\n");
     exit(1);
 }
 
-// 将来の AST 用意（今回は使いませんがインスタンス化のみ）
+// 将来の AST 用意（今回は使わないがインスタンスのみ）
 $parser = (new ParserFactory())->createForNewestSupportedVersion();
 
-// スプレッドシート準備（シートは 1 枚のみ）
+// スプレッドシート準備（シートは 1 枚）
 $spreadsheet = new Spreadsheet();
 $sheet       = $spreadsheet->getActiveSheet();
 $sheet->setTitle('CRUD Results');
@@ -37,23 +36,38 @@ $sheet->setTitle('CRUD Results');
 $sheet->fromArray(['File', 'Table', 'C', 'R', 'U', 'D'], null, 'A1');
 
 $row = 2;
+$prevFile = null;
+
 $rii = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($targetDir));
 foreach ($rii as $file) {
     if (!$file->isFile() || strtolower($file->getExtension()) !== 'php') {
         continue;
     }
 
+    // 相対パス
     $relPath = substr($file->getPathname(), strlen($targetDir) + 1);
     $content = file_get_contents($file->getPathname());
     $crudMap = analyzeCrud($content);
 
+    // ファイル内の各テーブル操作を出力
     foreach ($crudMap as $table => $ops) {
-        $sheet->setCellValue("A{$row}", $relPath);
+        // ファイル切り替え時は空行を挿入
+        if ($relPath !== $prevFile) {
+            if ($prevFile !== null) {
+                $row++;  // 空白行
+            }
+            // 新ファイル名を出力
+            $sheet->setCellValue("A{$row}", $relPath);
+            $prevFile = $relPath;
+        }
+        // 同一ファイル２行目以降は A 列を空白に
+        // テーブルと CRUD 列を埋める
         $sheet->setCellValue("B{$row}", $table);
         $sheet->setCellValue("C{$row}", $ops['C'] ? '○' : '');
         $sheet->setCellValue("D{$row}", $ops['R'] ? '○' : '');
         $sheet->setCellValue("E{$row}", $ops['U'] ? '○' : '');
         $sheet->setCellValue("F{$row}", $ops['D'] ? '○' : '');
+
         $row++;
     }
 
@@ -70,10 +84,6 @@ echo "✔ {$outputFile} を生成しました。\n\n";
 
 /**
  * 簡易版：正規表現による CRUD 抽出
- *   C => INSERT INTO
- *   R => SELECT … FROM
- *   U => UPDATE
- *   D => DELETE FROM
  */
 function analyzeCrud(string $content): array
 {
