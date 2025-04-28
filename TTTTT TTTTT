@@ -1,0 +1,308 @@
+#!/usr/bin/env php
+<?php
+declare(strict_types=1);
+
+// 事前に以下を実行してください
+// composer require phpoffice/phpspreadsheet nikic/php-parser greenlion/php-sql-parser mck89/peast
+// chmod +x analyze.php
+
+require __DIR__ . '/vendor/autoload.php';
+date_default_timezone_set('Asia/Tokyo');
+
+namespace App;
+
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+use PhpParser\ParserFactory;
+use PhpParser\Error;
+use PhpParser\Node;
+use PhpParser\NodeTraverser;
+use PhpParser\NodeVisitorAbstract;
+use Greenlion\PHP\SQL\Parser\Parser as GreenSqlParser;
+
+class Config
+{
+    public array  $extensions;
+    public string $viewListFile;
+    public string $procedureListFile;
+    public string $logFile;
+
+    public function __construct(array $options = [])
+    {
+        $this->extensions        = $options['extensions']        ?? ['php','inc','js','html'];
+        $this->viewListFile      = $options['viewListFile']      ?? 'view_list.txt';
+        $this->procedureListFile = $options['procedureListFile'] ?? 'procedure_list.txt';
+        $this->logFile           = $options['logFile']           ?? 'analyzer.log';
+    }
+}
+
+interface CollectorInterface
+{
+    /**
+     * @return array{type:string, file:string, table?:string, C?:string, R?:string, U?:string, D?:string, include?:string}[]
+     */
+    public function collect(string $filePath, string $code): array;
+}
+
+class FileFinder
+{
+    private Config $config;
+    public function __construct(Config $config) { $this->config = $config; }
+
+    /** @return string[] */
+    public function findFiles(string $rootDir): array
+    {
+        $rii = new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($rootDir));
+        $files = [];
+        foreach ($rii as $file) {
+            if (!$file->isFile()) continue;
+            $ext = strtolower(pathinfo((string)$file, PATHINFO_EXTENSION));
+            if (in_array($ext, $this->config->extensions, true)) {
+                $files[] = (string)$file;
+            }
+        }
+        return $files;
+    }
+}
+
+class PhpAstCollector implements CollectorInterface
+{
+    private $phpParser;
+    private GreenSqlParser $sqlParser;
+    private Config $config;
+
+    public function __construct($phpParser, GreenSqlParser $sqlParser, Config $config)
+    {
+        $this->phpParser = $phpParser;
+        $this->sqlParser = $sqlParser;
+        $this->config    = $config;
+    }
+
+    public function collect(string $filePath, string $code): array
+    {
+        $crud = [];
+        try {
+            $ast = $this->phpParser->parse($code);
+            $traverser = new NodeTraverser();
+            $visitor = new class($this->sqlParser, $filePath, $crud) extends NodeVisitorAbstract {
+                private GreenSqlParser $sqlParser;
+                private string $file;
+                private array &$crud;
+                public function __construct(GreenSqlParser $sqlParser, string $file, array &$crud)
+                {
+                    $this->sqlParser = $sqlParser;
+                    $this->file      = $file;
+                    $this->crud      = &$crud;
+                }
+                public function enterNode(Node $node)
+                {
+                    if ($node instanceof Node\Expr\Assign || $node instanceof Node\Expr\AssignOp\Concat) {
+                        $valNode = $node->expr;
+                        $value = $valNode instanceof Node\Scalar\String_ ? $valNode->value : null;
+                        if (is_string($value) && preg_match('/\b(select|insert|update|delete)\b/i', $value, $m)) {
+                            $parsed = $this->sqlParser->parse($value);
+                            if (!empty($parsed['FROM'])) {
+                                foreach ($parsed['FROM'] as $tbl) {
+                                    $typ = strtoupper($m[1]);
+                                    $this->crud[] = [
+                                        'type'  => 'crud',
+                                        'file'  => $this->file,
+                                        'table' => $tbl['table'],
+                                        'C'     => $typ === 'INSERT' ? '○' : '',
+                                        'R'     => $typ === 'SELECT' ? '○' : '',
+                                        'U'     => $typ === 'UPDATE' ? '○' : '',
+                                        'D'     => $typ === 'DELETE' ? '○' : ''
+                                    ];
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+            $traverser->addVisitor($visitor);
+            $traverser->traverse($ast);
+        } catch (Error $e) {
+            // ASTパース失敗は無視（必要ならログ）
+            error_log("[AST Error] {$filePath}: {$e->getMessage()}\n", 3, $this->config->logFile);
+        }
+        return $crud;
+    }
+}
+
+class FallbackCollector implements CollectorInterface
+{
+    private Config $config;
+    public function __construct(Config $config) { $this->config = $config; }
+
+    public function collect(string $filePath, string $code): array
+    {
+        $crud = [];
+        // コメント除去
+        $str = preg_replace('!/\*.*?\*/!s', '', $code);
+        $str = preg_replace('/\/\/.*$/m', '', $str);
+        // 文字列結合解決
+        $str = preg_replace_callback(
+            '/\$(\w+)\s*(?:=|\.=)\s*"(.*?)";/',
+            fn($m) => $m[2].';',
+            $str
+        );
+        if (preg_match_all('/\b(select|insert|update|delete)\b.+?\bfrom\b\s+([a-zA-Z0-9_]+)/i', $str, $ms, PREG_SET_ORDER)) {
+            foreach ($ms as $m) {
+                $typ = strtoupper($m[1]);
+                $crud[] = [
+                    'type'  => 'crud',
+                    'file'  => $filePath,
+                    'table' => $m[2],
+                    'C'     => $typ === 'INSERT' ? '○' : '',
+                    'R'     => $typ === 'SELECT' ? '○' : '',
+                    'U'     => $typ === 'UPDATE' ? '○' : '',
+                    'D'     => $typ === 'DELETE' ? '○' : ''
+                ];
+            }
+        }
+        return $crud;
+    }
+}
+
+class IncludeCollector implements CollectorInterface
+{
+    private Config $config;
+    public function __construct(Config $config) { $this->config = $config; }
+
+    public function collect(string $filePath, string $code): array
+    {
+        $inc = [];
+        if (preg_match_all('/\b(require|include)(_once)?\s*\(?\s*[\'"](.+?)[\'"]\s*\)?\s*;/i', $code, $ms, PREG_SET_ORDER)) {
+            foreach ($ms as $m) {
+                $inc[] = [
+                    'type'    => 'include',
+                    'file'    => $filePath,
+                    'include' => $m[3]
+                ];
+            }
+        }
+        return $inc;
+    }
+}
+
+class Analyzer
+{
+    /** @var CollectorInterface[] */
+    private array $collectors;
+    private Config $config;
+
+    public function __construct(array $collectors, Config $config)
+    {
+        $this->collectors = $collectors;
+        $this->config     = $config;
+    }
+
+    /**
+     * @return array{type:string, file:string, table?:string, C?:string, R?:string, U?:string, D?:string, include?:string}[]
+     */
+    public function analyze(array $files): array
+    {
+        $all = [];
+        foreach ($files as $file) {
+            $code = file_get_contents($file) ?: '';
+            foreach ($this->collectors as $col) {
+                try {
+                    foreach ($col->collect($file, $code) as $row) {
+                        $all[] = $row;
+                    }
+                } catch (\Throwable $e) {
+                    error_log("[$file] ".$e->getMessage()."\n", 3, $this->config->logFile);
+                }
+            }
+        }
+        return $all;
+    }
+}
+
+class SpreadsheetWriter
+{
+    private Config $config;
+    public function __construct(Config $config) { $this->config = $config; }
+
+    /**
+     * @param array{type:string, file:string, table?:string, C?:string, R?:string, U?:string, D?:string, include?:string}[] $data
+     */
+    public function write(array $data, string $outFile): void
+    {
+        $spreadsheet = new Spreadsheet();
+
+        // ■ CRUD シート
+        $crudSheet = $spreadsheet->getActiveSheet();
+        $crudSheet->setTitle('CRUD');
+        $crudSheet->fromArray(['File','Table','C','R','U','D'], null, 'A1');
+        $r = 2;
+        foreach ($data as $row) {
+            if ($row['type'] !== 'crud') continue;
+            $crudSheet->fromArray([
+                $row['file'],
+                $row['table'] ?? '',
+                $row['C'] ?? '',
+                $row['R'] ?? '',
+                $row['U'] ?? '',
+                $row['D'] ?? ''
+            ], null, "A{$r}");
+            $r++;
+        }
+
+        // ■ Includes シート
+        $incSheet = $spreadsheet->createSheet();
+        $incSheet->setTitle('Includes');
+        $incSheet->fromArray(['File','Included File'], null, 'A1');
+        $r2 = 2;
+        foreach ($data as $row) {
+            if ($row['type'] !== 'include') continue;
+            $incSheet->fromArray([
+                $row['file'],
+                $row['include'] ?? ''
+            ], null, "A{$r2}");
+            $r2++;
+        }
+
+        (new Xlsx($spreadsheet))->save($outFile);
+    }
+}
+
+// === エントリポイント ===
+namespace {
+    use App\Config;
+    use App\FileFinder;
+    use App\PhpParserFactory;
+    use App\GreenSqlParser;
+    use App\PhpParserFactory as ParserFactoryAlias; // for createForNewestSupportedVersion
+    use App\Parser\PhpParserFactory as PFactory;
+    use App\Parser\SqlParserFactory;
+    use App\PhpAstCollector;
+    use App\FallbackCollector;
+    use App\IncludeCollector;
+    use App\Analyzer;
+    use App\SpreadsheetWriter;
+
+    $root    = $argv[1] ?? getcwd();
+    $outFile = $argv[2] ?? 'analysis.xlsx';
+
+    $config = new Config();
+    $finder = new FileFinder($config);
+    $files  = $finder->findFiles($root);
+
+    // PHP AST パーサ
+    $phpParser = (new ParserFactory())->createForNewestSupportedVersion();
+    // SQL パーサ
+    $sqlParser = new GreenSqlParser();
+
+    $collectors = [
+        new PhpAstCollector($phpParser, $sqlParser, $config),
+        new FallbackCollector($config),
+        new IncludeCollector($config)
+    ];
+
+    $analyzer = new Analyzer($collectors, $config);
+    $results  = $analyzer->analyze($files);
+
+    (new SpreadsheetWriter($config))->write($results, $outFile);
+    echo "Analysis completed. Output: {$outFile}\n";
+}
