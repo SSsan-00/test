@@ -8,41 +8,68 @@ use PhpOffice\PhpSpreadsheet\Spreadsheet;
 use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 use PhpParser\ParserFactory;
 
-// ── コメント除去ユーティリティ ──
 /**
- * コメント除去ユーティリティ（堅牢版）
+ * 汎用コメント除去ユーティリティ（HTML/JS/PHP コメント）
  *
- * @param string $code 元のコード
- * @return string コメントを除去したコード
+ * @param string $code
+ * @return string
  */
 function stripComments(string $code): string
 {
     // HTML コメント
-    $result = @preg_replace('/<!--.*?-->/s', '', $code);
-    if ($result === null) {
-        // エラーが起きたら元コードを返す
-        $result = $code;
+    $res = @preg_replace('/<!--[\s\S]*?-->/', '', $code);
+    if ($res === null) {
+        $res = $code;
     }
 
-    // C／PHP ブロックコメント
-    $tmp = @preg_replace('/\/\*.*?\*\//s', '', $result);
+    // C/PHP ブロックコメント
+    $tmp = @preg_replace('/\/\*[\s\S]*?\*\//', '', $res);
     if ($tmp !== null) {
-        $result = $tmp;
+        $res = $tmp;
     }
 
-    // 行コメント (//… )
-    $tmp = @preg_replace('/\/\/.*$/m', '', $result);
+    // 行コメント (//...)
+    $tmp = @preg_replace('/\/\/.*?(?=\r?\n|$)/', '', $res);
     if ($tmp !== null) {
-        $result = $tmp;
+        $res = $tmp;
     }
 
-    // 行コメント (#… )
-    $tmp = @preg_replace('/#.*$/m', '', $result);
+    // 行コメント (#...)
+    $tmp = @preg_replace('/#.*?(?=\r?\n|$)/', '', $res);
     if ($tmp !== null) {
-        $result = $tmp;
+        $res = $tmp;
     }
 
-    return $result;
+    return $res;
+}
+
+/**
+ * SQL 内コメント除去ユーティリティ
+ *
+ * @param string $sql
+ * @return string
+ */
+function stripSqlComments(string $sql): string
+{
+    // ブロックコメント
+    $res = @preg_replace('/\/\*[\s\S]*?\*\//', '', $sql);
+    if ($res === null) {
+        $res = $sql;
+    }
+
+    // 行コメント (-- ...)
+    $tmp = @preg_replace('/--.*?(?=\r?\n|$)/', '', $res);
+    if ($tmp !== null) {
+        $res = $tmp;
+    }
+
+    // 行コメント (# ...)
+    $tmp = @preg_replace('/#.*?(?=\r?\n|$)/', '', $res);
+    if ($tmp !== null) {
+        $res = $tmp;
+    }
+
+    return $res;
 }
 
 // ガベージコレクション有効化
@@ -60,14 +87,14 @@ if (!is_dir($targetDir)) {
     exit(1);
 }
 
-// 将来の AST 用意（今回は未使用だがインスタンス化のみ）
+// AST 用意（将来拡張向け）
 $parser = (new ParserFactory())->createForNewestSupportedVersion();
 
 // スプレッドシート準備
 $spreadsheet = new Spreadsheet();
 $sheet       = $spreadsheet->getActiveSheet();
 $sheet->setTitle('CRUD Results');
-$sheet->fromArray(['File', 'Table', 'C', 'R', 'U', 'D'], null, 'A1');
+$sheet->fromArray(['File','Table','C','R','U','D'], null, 'A1');
 
 $row      = 2;
 $prevFile = null;
@@ -75,7 +102,7 @@ $prevFile = null;
 // 対象拡張子リスト
 $exts = ['php','inc','html','js'];
 
-// ── ファイルループ ──
+// ファイル走査
 $rii = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($targetDir));
 foreach ($rii as $file) {
     if (!$file->isFile()) {
@@ -83,19 +110,19 @@ foreach ($rii as $file) {
     }
     $ext = strtolower($file->getExtension());
     if (!in_array($ext, $exts, true)) {
-        continue; // php, inc, html, js のみ対象
+        continue;
     }
 
     $relPath = substr($file->getPathname(), strlen($targetDir) + 1);
     $raw     = file_get_contents($file->getPathname());
-    // 全コメント除去
     $clean   = stripComments($raw);
     $crudMap = analyzeCrud($clean);
 
     foreach ($crudMap as $table => $ops) {
+        // ファイル切り替わり時に空行
         if ($relPath !== $prevFile) {
             if ($prevFile !== null) {
-                $row++;  // ファイル間に空行
+                $row++;
             }
             $sheet->setCellValue("A{$row}", $relPath);
             $prevFile = $relPath;
@@ -115,14 +142,19 @@ foreach ($rii as $file) {
 // 出力
 $writer = new Xlsx($spreadsheet);
 $writer->save($outputFile);
-echo "✔ {$outputFile} を生成しました。\n\n";
-
+echo "✔ {$outputFile} を生成しました。\n\n';
 
 /**
- * 拡張版 analyzeCrud(): 
+ * 拡張版 analyzeCrud()
+ *
+ *  - 文字列連結対応
  *  - SQL コメント除去
- *  - テーブルエイリアス検出＆解決
- *  - CRUD／JOIN／FROM／DROP／TRUNCATE 検出
+ *  - エイリアス解決
+ *  - DROP/TRUNCATE/INSERT/SELECT INTO TEMP/UPDATE/DELETE/JOIN/FROM 検出
+ *  - フォールバック検出
+ *
+ * @param string $content コメント除去済みコード
+ * @return array<string,array{C:bool,R:bool,U:bool,D:bool}>
  */
 function analyzeCrud(string $content): array
 {
@@ -131,22 +163,12 @@ function analyzeCrud(string $content): array
     $sqlStatements = [];
 
     // 1) 文字列連結を含む SQL 文の収集
-    if (preg_match_all(
-        '/\$([A-Za-z_][A-Za-z0-9_]*)\s*=\s*[\'"](.+?)[\'"];/s',
-        $content,
-        $mInit,
-        PREG_SET_ORDER
-    )) {
+    if (preg_match_all('/\$([A-Za-z_][A-Za-z0-9_]*)\s*=\s*[\'"](.+?)[\'"];/s', $content, $mInit, PREG_SET_ORDER)) {
         foreach ($mInit as $m) {
             $sqlStatements[] = ['var' => $m[1], 'sql' => $m[2]];
         }
     }
-    if (preg_match_all(
-        '/\$([A-Za-z_][A-Za-z0-9_]*)\s*\.\=\s*[\'"](.+?)[\'"];/s',
-        $content,
-        $mAppend,
-        PREG_SET_ORDER
-    )) {
+    if (preg_match_all('/\$([A-Za-z_][A-Za-z0-9_]*)\s*\.\=\s*[\'"](.+?)[\'"];/s', $content, $mAppend, PREG_SET_ORDER)) {
         foreach ($mAppend as $m) {
             for ($i = count($sqlStatements) - 1; $i >= 0; $i--) {
                 if ($sqlStatements[$i]['var'] === $m[1]) {
@@ -159,10 +181,9 @@ function analyzeCrud(string $content): array
 
     // 2) 各 SQL 文ごとの解析
     foreach ($sqlStatements as $stmt) {
-        // (a) SQL 内コメントを除去
-        $sql = preg_replace('!/\*.*?\*/|--.*?$|#.*?$!ms', '', $stmt['sql']);
+        $sql = stripSqlComments($stmt['sql']);
 
-        // (b) エイリアス定義検出
+        // エイリアス定義: FROM ... AS alias / JOIN ... AS alias
         if (preg_match_all(
             '/\b(?:FROM|JOIN)\s+`?([A-Za-z0-9_]+)`?\s+(?:AS\s+)?`?([A-Za-z0-9_]+)`?/i',
             $sql,
@@ -174,7 +195,7 @@ function analyzeCrud(string $content): array
             }
         }
 
-        // (c) DROP / TRUNCATE → D
+        // DROP / TRUNCATE → D
         foreach (['DROP','TRUNCATE'] as $kw) {
             if (preg_match_all("/\\b{$kw}\\s+TABLE\\s+`?([A-Za-z0-9_]+)`?/i", $sql, $m)) {
                 foreach ($m[1] as $tbl) {
@@ -182,7 +203,8 @@ function analyzeCrud(string $content): array
                 }
             }
         }
-        // (d) INSERT INTO / SELECT … INTO TEMP → C
+
+        // INSERT INTO / SELECT ... INTO TEMP → C
         if (preg_match_all(
             '/INSERT\s+INTO\s+`?([A-Za-z0-9_]+)`?|\bSELECT\b.*?\bINTO\s+TEMP(?:ORARY)?\s+`?([A-Za-z0-9_]+)`?/i',
             $sql,
@@ -191,28 +213,34 @@ function analyzeCrud(string $content): array
         )) {
             foreach ($m as $mm) {
                 $tbl = $mm[1] ?: ($mm[2] ?? null);
-                if ($tbl) $map[$tbl]['C'] = true;
+                if ($tbl) {
+                    $map[$tbl]['C'] = true;
+                }
             }
         }
-        // (e) UPDATE → U
+
+        // UPDATE → U
         if (preg_match_all('/\bUPDATE\s+`?([A-Za-z0-9_]+)`?/i', $sql, $m)) {
             foreach ($m[1] as $tbl) {
                 $map[$tbl]['U'] = true;
             }
         }
-        // (f) DELETE FROM → D
+
+        // DELETE FROM → D
         if (preg_match_all('/\bDELETE\s+FROM\s+`?([A-Za-z0-9_]+)`?/i', $sql, $m)) {
             foreach ($m[1] as $tbl) {
                 $map[$tbl]['D'] = true;
             }
         }
-        // (g) JOIN → R
+
+        // JOIN → R
         if (preg_match_all('/\bJOIN\s+`?([A-Za-z0-9_]+)`?/i', $sql, $m)) {
             foreach ($m[1] as $tbl) {
                 $map[$tbl]['R'] = true;
             }
         }
-        // (h) 汎用 FROM → R
+
+        // FROM → R
         if (preg_match_all('/\bFROM\s+`?([A-Za-z0-9_]+)`?/i', $sql, $m)) {
             foreach ($m[1] as $tbl) {
                 $map[$tbl]['R'] = true;
@@ -220,33 +248,28 @@ function analyzeCrud(string $content): array
         }
     }
 
-    // 3) フォールバック：ファイル全体から再検出
-    $fb = preg_replace('!/\*.*?\*/|//.*?$|#.*?$|<!--.*?-->!ms', '', $content);
+    // 3) フォールバック検出
+    $fb = stripComments($content);
+    $fb = stripSqlComments($fb);
     $fallbacks = [
-        'D'=>'/\b(?:DROP|TRUNCATE)\s+TABLE\s+`?([A-Za-z0-9_]+)`?/i',
         'C'=>'/INSERT\s+INTO\s+`?([A-Za-z0-9_]+)`?/i',
         'U'=>'/UPDATE\s+`?([A-Za-z0-9_]+)`?/i',
-        'D2'=>'/DELETE\s+FROM\s+`?([A-Za-z0-9_]+)`?/i',
-        'R'=>'/\bFROM\s+`?([A-Za-z0-9_]+)`?/i',
-        'J'=>'/\bJOIN\s+`?([A-Za-z0-9_]+)`?/i',
+        'D'=>'/(?:DROP|TRUNCATE|DELETE\s+FROM)\s+`?([A-Za-z0-9_]+)`?/i',
+        'R'=>'/\b(?:FROM|JOIN)\s+`?([A-Za-z0-9_]+)`?/i',
     ];
     foreach ($fallbacks as $op => $pat) {
         if (preg_match_all($pat, $fb, $mFb)) {
             foreach ($mFb[1] as $rawTbl) {
                 $tbl = $aliasMap[$rawTbl] ?? $rawTbl;
-                switch ($op) {
-                    case 'C':   $map[$tbl]['C'] = true; break;
-                    case 'U':   $map[$tbl]['U'] = true; break;
-                    case 'D':
-                    case 'D2':  $map[$tbl]['D'] = true; break;
-                    case 'R':
-                    case 'J':   $map[$tbl]['R'] = true; break;
-                }
+                if ($op === 'C')   $map[$tbl]['C'] = true;
+                if ($op === 'U')   $map[$tbl]['U'] = true;
+                if ($op === 'D')   $map[$tbl]['D'] = true;
+                if ($op === 'R')   $map[$tbl]['R'] = true;
             }
         }
     }
 
-    // 4) 真偽値で初期化
+    // 4) 真偽値初期化
     foreach ($map as $tbl => $ops) {
         $map[$tbl] = [
             'C' => !empty($ops['C']),
@@ -255,5 +278,6 @@ function analyzeCrud(string $content): array
             'D' => !empty($ops['D']),
         ];
     }
+
     return $map;
 }
