@@ -1,308 +1,229 @@
-<?php
 #!/usr/bin/env php
-/**
- * analyzer.php — PHPソースコード解析ツール 雛形 (堅牢＆文法ミス耐性設計)
- *
- * この雛形は以下のステップで実装を進めることを想定しています。
- * 各セクションには実装の詳細手順を記載しています。
- *
- * 【実装フロー】
- * 1. **エントリポイント (main)**
- *    - コマンドライン引数で解析対象ディレクトリを取得しチェック
- *    - collectFiles() でファイルパスをジェネレータで逐次取得
- *    - processFile() でファイル単位の解析を実行し、gc_collect_cycles() でメモリ解放
- *    - writeExcel() で最終結果を Excel (.xlsx) に保存
- *
- * 2. **ファイル列挙 (collectFiles)**
- *    - RecursiveDirectoryIterator でディレクトリを再帰スキャン
- *    - 対象拡張子 (php, inc, html, js) のみ yield
- *    - 大規模環境でもメモリ使用量を最小化
- *
- * 3. **ファイル解析 (processFile)**
- *    - (1) コード読み込み: file_get_contents()
- *    - (2) コメント除去: 正規表現で PHPDoc, //, /* */, HTMLコメントを一括削除
- *    - (3) include/require 展開: AST または preg_match_all で検出し再帰的展開
- *    - (4) define() 定数解析・展開: define() を抽出して定数マップに保存しコードを置換
- *    - (5) 変数・関数呼び出し解析: AST と正規表現併用で Assign/FuncCall を収集
- *    - (6) 部分AST解析: Collecting を使いステートメント単位でトークン分割→AST解析
- *    - (7) 部分SQL解析: SQL断片を抽出し PHPSQLParser で個別解析
- *    - (8) CRUD抽出と統合: fallbackParse() との結果をマージし CRUD フラグ付与
- *    - (9) メモリ解放: $code, $varMap, $funcCalls を unset し次ファイルへ
- *
- * 4. **コード補助関数**
- *    - removeComments(): コメント削除の正規表現実装ガイド
- *    - expandIncludes(): include/require 文の抽出と再帰的ファイル統合
- *    - extractAndReplaceDefines(): define() の検出と置換手順
- *    - extractVariablesAndFunctions(): AST/正規表現での変数・関数呼び出し収集
- *    - splitPhpSnippets(): token_get_all でトークン化後ステートメント単位に分割
- *    - extractSqlFragments(): SQLリテラルや連結済み文字列の抽出方法
- *    - partialAstParse(): Collecting を利用した堅牢AST解析フロー
- *    - partialSqlParse(): 断片ごとの SQL パース手順
- *    - parseFile(): CRUD 判定、@view/@proc/@temp タグ付与、note 設定
- *    - writeExcel(): PhpSpreadsheet を使った 2-sheet 出力手順
- *    - logMessage(): タイムスタンプ付きログ蓄積
- *
- * 【依存ライブラリ】
- *   - phpoffice/phpspreadsheet ^4.2
- *   - nikic/php-parser ^5.4
- *   - greenlion/php-sql-parser ^4.7
- */
+<?php
+declare(strict_types=1);
 
 require __DIR__ . '/vendor/autoload.php';
 
 use PhpOffice\PhpSpreadsheet\Spreadsheet;
 use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
-use PHPSQLParser\PHPSQLParser;
 use PhpParser\ParserFactory;
-use PhpParser\ErrorHandler\Collecting;
 
-// 設定
-date_default_timezone_set('Asia/Tokyo');
-error_reporting(E_ALL);
-gc_enable();
-
-// グローバル変数定義
-$crud_data = [];
-$log_data  = [];
-$defines   = [];
-$varMap    = [];
-$funcCalls = [];
-
-$view_list = file_exists('view_list.txt')       ? file('view_list.txt',       FILE_IGNORE_NEW_LINES) : [];
-$proc_list = file_exists('procedure_list.txt') ? file('procedure_list.txt', FILE_IGNORE_NEW_LINES) : [];
-
-/**
- * エントリポイント
- * @param array $argv コマンドライン引数
- */
-function main(array $argv): void
+// ── コメント除去ユーティリティ ──
+function stripComments(string $code): string
 {
-    if (empty($argv[1])) {
-        fwrite(STDERR, "Usage: php analyzer.php /path/to/project\n");
-        exit(1);
-    }
-    $targetDir = $argv[1];
-    logMessage("解析開始: {$targetDir}");
-
-    // ファイル収集と解析
-    foreach (collectFiles($targetDir) as $file) {
-        processFile($file, $targetDir);
-        gc_collect_cycles();  // メモリの断片回収
-    }
-
-    // 結果を Excel 出力
-    writeExcel($GLOBALS['crud_data'], $GLOBALS['log_data']);
-    logMessage("解析完了: analysis_result.xlsx 出力完了");
+    // PHP/JS コメント（/*…*/、//…、#…）と HTML コメント（<!--…-->）をすべて除去
+    return preg_replace('!/\*.*?\*/|//.*?$|#.*?$|<!--.*?-->!ms', '', $code);
 }
 
+// ガベージコレクション有効化
+gc_enable();
+
+// 引数チェック
+if ($argc < 3) {
+    fwrite(STDERR, "Usage: php analyzer.php <target_dir> <output.xlsx>\n");
+    exit(1);
+}
+$targetDir  = rtrim($argv[1], "/\\");
+$outputFile = $argv[2];
+if (!is_dir($targetDir)) {
+    fwrite(STDERR, "Error: '{$targetDir}' is not a directory.\n");
+    exit(1);
+}
+
+// 将来の AST 用意（今回は未使用だがインスタンス化のみ）
+$parser = (new ParserFactory())->createForNewestSupportedVersion();
+
+// スプレッドシート準備
+$spreadsheet = new Spreadsheet();
+$sheet       = $spreadsheet->getActiveSheet();
+$sheet->setTitle('CRUD Results');
+$sheet->fromArray(['File', 'Table', 'C', 'R', 'U', 'D'], null, 'A1');
+
+$row      = 2;
+$prevFile = null;
+
+// 対象拡張子リスト
+$exts = ['php','inc','html','js'];
+
+// ── ファイルループ ──
+$rii = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($targetDir));
+foreach ($rii as $file) {
+    if (!$file->isFile()) {
+        continue;
+    }
+    $ext = strtolower($file->getExtension());
+    if (!in_array($ext, $exts, true)) {
+        continue; // php, inc, html, js のみ対象
+    }
+
+    $relPath = substr($file->getPathname(), strlen($targetDir) + 1);
+    $raw     = file_get_contents($file->getPathname());
+    // 全コメント除去
+    $clean   = stripComments($raw);
+    $crudMap = analyzeCrud($clean);
+
+    foreach ($crudMap as $table => $ops) {
+        if ($relPath !== $prevFile) {
+            if ($prevFile !== null) {
+                $row++;  // ファイル間に空行
+            }
+            $sheet->setCellValue("A{$row}", $relPath);
+            $prevFile = $relPath;
+        }
+        $sheet->setCellValue("B{$row}", $table);
+        $sheet->setCellValue("C{$row}", $ops['C'] ? '○' : '');
+        $sheet->setCellValue("D{$row}", $ops['R'] ? '○' : '');
+        $sheet->setCellValue("E{$row}", $ops['U'] ? '○' : '');
+        $sheet->setCellValue("F{$row}", $ops['D'] ? '○' : '');
+        $row++;
+    }
+
+    unset($raw, $clean, $crudMap);
+    gc_collect_cycles();
+}
+
+// 出力
+$writer = new Xlsx($spreadsheet);
+$writer->save($outputFile);
+echo "✔ {$outputFile} を生成しました。\n\n";
+
+
 /**
- * 対象ファイルをジェネレータで返す
- * @param string $dir ルートディレクトリ
- * @return Generator<string>
+ * 拡張版 analyzeCrud(): 
+ *  - SQL コメント除去
+ *  - テーブルエイリアス検出＆解決
+ *  - CRUD／JOIN／FROM／DROP／TRUNCATE 検出
  */
-function collectFiles(string $dir): Generator
+function analyzeCrud(string $content): array
 {
-    $extensions = ['php', 'inc', 'html', 'js'];
-    $iterator = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($dir));
-    foreach ($iterator as $file) {
-        if ($file->isFile()) {
-            $ext = strtolower(pathinfo($file->getFilename(), PATHINFO_EXTENSION));
-            if (in_array($ext, $extensions, true)) {
-                yield $file->getPathname();
+    $map           = [];
+    $aliasMap      = [];
+    $sqlStatements = [];
+
+    // 1) 文字列連結を含む SQL 文の収集
+    if (preg_match_all(
+        '/\$([A-Za-z_][A-Za-z0-9_]*)\s*=\s*[\'"](.+?)[\'"];/s',
+        $content,
+        $mInit,
+        PREG_SET_ORDER
+    )) {
+        foreach ($mInit as $m) {
+            $sqlStatements[] = ['var' => $m[1], 'sql' => $m[2]];
+        }
+    }
+    if (preg_match_all(
+        '/\$([A-Za-z_][A-Za-z0-9_]*)\s*\.\=\s*[\'"](.+?)[\'"];/s',
+        $content,
+        $mAppend,
+        PREG_SET_ORDER
+    )) {
+        foreach ($mAppend as $m) {
+            for ($i = count($sqlStatements) - 1; $i >= 0; $i--) {
+                if ($sqlStatements[$i]['var'] === $m[1]) {
+                    $sqlStatements[$i]['sql'] .= $m[2];
+                    break;
+                }
             }
         }
     }
-}
 
-/**
- * ファイル単位の解析フロー
- * @param string $file ファイルパス
- * @param string $root ルートディレクトリ
- */
-function processFile(string $file, string $root): void
-{
-    global $crud_data;
-    $relPath = ltrim(str_replace(realpath($root), '', realpath($file)), DIRECTORY_SEPARATOR);
-    logMessage("処理開始: {$relPath}");
+    // 2) 各 SQL 文ごとの解析
+    foreach ($sqlStatements as $stmt) {
+        // (a) SQL 内コメントを除去
+        $sql = preg_replace('!/\*.*?\*/|--.*?$|#.*?$!ms', '', $stmt['sql']);
 
-    // (1) コード読み込み
-    $code = file_get_contents($file);
-
-    // (2) コメント除去
-    $code = removeComments($code);
-
-    // (3) include/require 展開
-    $code = expandIncludes($code, dirname($file));
-
-    // (4) define()/定数置換
-    $code = extractAndReplaceDefines($code);
-
-    // (5) 変数・関数呼び出し解析
-    extractVariablesAndFunctions($code);
-
-    // (6) 部分AST解析 (Collecting 使用)
-    partialAstParse($code);
-
-    // (7) 部分SQL解析
-    partialSqlParse($code);
-
-    // (8) CRUD抽出と統合
-    parseFile($code, $relPath);
-
-    // (9) メモリ解放
-    unset($code, $GLOBALS['varMap'], $GLOBALS['funcCalls']);
-}
-
-/**
- * コメント除去
- * - PHPDoc, // コメント, /* コメント */, HTMLコメント を一括除去
- */
-function removeComments(string $code): string
-{
-    // TODO: preg_replace() で各種コメントを削除
-    return $code;
-}
-
-/**
- * include/require 展開
- * - AST または正規表現で include/require 文を検出
- * - realpath() で絶対パス解決し file_get_contents() で読み込み
- * - 再帰的に同じメソッドを呼び出し、コードを統合
- */
-function expandIncludes(string $code, string $baseDir): string
-{
-    // TODO: 実装
-    return $code;
-}
-
-/**
- * define()/定数展開
- * - define() を抽出して $defines に登録
- * - コード中の定数使用箇所を値に置換
- * - define() 文を削除
- */
-function extractAndReplaceDefines(string $code): string
-{
-    global $defines;
-    // TODO: 実装
-    return $code;
-}
-
-/**
- * 変数・関数呼び出し解析
- * - AST (Assign, FuncCall) および preg_match で静的文字列代入を収集
- * - 後続の SQL/CRUD 判定で動的構築パターンに利用
- */
-function extractVariablesAndFunctions(string $code): void
-{
-    global $varMap, $funcCalls;
-    // TODO: 実装
-}
-
-/**
- * 部分AST解析 (文法ミス耐性)
- * - token_get_all() でトークン化
- * - splitPhpSnippets() でステートメント単位に分割
- * - Collecting を使いエラーハンドルしつつ parse()
- */
-function partialAstParse(string $code): void
-{
-    $parser       = (new ParserFactory())->createForNewestSupportedVersion();
-    $errorHandler = new Collecting();
-    foreach (splitPhpSnippets($code) as $snippet) {
-        // エラーキャプチャ用ハンドラを再生成しながら parse
-        $errorHandler->clearErrors();
-        $stmts = $parser->parse($snippet, $errorHandler);
-        foreach ($errorHandler->getErrors() as $error) {
-            logMessage("ASTエラー: {$error->getMessage()}");
+        // (b) エイリアス定義検出
+        if (preg_match_all(
+            '/\b(?:FROM|JOIN)\s+`?([A-Za-z0-9_]+)`?\s+(?:AS\s+)?`?([A-Za-z0-9_]+)`?/i',
+            $sql,
+            $mAlias,
+            PREG_SET_ORDER
+        )) {
+            foreach ($mAlias as $ma) {
+                $aliasMap[$ma[2]] = $ma[1];
+            }
         }
-        // TODO: $stmts を ASTVisitor で走査し依存／SQL候補を抽出
-        unset($stmts);
-    }
-}
 
-/**
- * 部分SQL解析
- * - extractSqlFragments() で SQL 文字列を断片として抽出
- * - PHPSQLParser->parse() で個別に解析
- */
-function partialSqlParse(string $code): void
-{
-    foreach (extractSqlFragments($code) as $sql) {
-        try {
-            $parsed = (new PHPSQLParser())->parse($sql);
-            // TODO: parsed から CRUD判定用データを収集
-        } catch (Exception $e) {
-            logMessage("SQL解析エラー: {$e->getMessage()}");
+        // (c) DROP / TRUNCATE → D
+        foreach (['DROP','TRUNCATE'] as $kw) {
+            if (preg_match_all("/\\b{$kw}\\s+TABLE\\s+`?([A-Za-z0-9_]+)`?/i", $sql, $m)) {
+                foreach ($m[1] as $tbl) {
+                    $map[$tbl]['D'] = true;
+                }
+            }
+        }
+        // (d) INSERT INTO / SELECT … INTO TEMP → C
+        if (preg_match_all(
+            '/INSERT\s+INTO\s+`?([A-Za-z0-9_]+)`?|\bSELECT\b.*?\bINTO\s+TEMP(?:ORARY)?\s+`?([A-Za-z0-9_]+)`?/i',
+            $sql,
+            $m,
+            PREG_SET_ORDER
+        )) {
+            foreach ($m as $mm) {
+                $tbl = $mm[1] ?: ($mm[2] ?? null);
+                if ($tbl) $map[$tbl]['C'] = true;
+            }
+        }
+        // (e) UPDATE → U
+        if (preg_match_all('/\bUPDATE\s+`?([A-Za-z0-9_]+)`?/i', $sql, $m)) {
+            foreach ($m[1] as $tbl) {
+                $map[$tbl]['U'] = true;
+            }
+        }
+        // (f) DELETE FROM → D
+        if (preg_match_all('/\bDELETE\s+FROM\s+`?([A-Za-z0-9_]+)`?/i', $sql, $m)) {
+            foreach ($m[1] as $tbl) {
+                $map[$tbl]['D'] = true;
+            }
+        }
+        // (g) JOIN → R
+        if (preg_match_all('/\bJOIN\s+`?([A-Za-z0-9_]+)`?/i', $sql, $m)) {
+            foreach ($m[1] as $tbl) {
+                $map[$tbl]['R'] = true;
+            }
+        }
+        // (h) 汎用 FROM → R
+        if (preg_match_all('/\bFROM\s+`?([A-Za-z0-9_]+)`?/i', $sql, $m)) {
+            foreach ($m[1] as $tbl) {
+                $map[$tbl]['R'] = true;
+            }
         }
     }
+
+    // 3) フォールバック：ファイル全体から再検出
+    $fb = preg_replace('!/\*.*?\*/|//.*?$|#.*?$|<!--.*?-->!ms', '', $content);
+    $fallbacks = [
+        'D'=>'/\b(?:DROP|TRUNCATE)\s+TABLE\s+`?([A-Za-z0-9_]+)`?/i',
+        'C'=>'/INSERT\s+INTO\s+`?([A-Za-z0-9_]+)`?/i',
+        'U'=>'/UPDATE\s+`?([A-Za-z0-9_]+)`?/i',
+        'D2'=>'/DELETE\s+FROM\s+`?([A-Za-z0-9_]+)`?/i',
+        'R'=>'/\bFROM\s+`?([A-Za-z0-9_]+)`?/i',
+        'J'=>'/\bJOIN\s+`?([A-Za-z0-9_]+)`?/i',
+    ];
+    foreach ($fallbacks as $op => $pat) {
+        if (preg_match_all($pat, $fb, $mFb)) {
+            foreach ($mFb[1] as $rawTbl) {
+                $tbl = $aliasMap[$rawTbl] ?? $rawTbl;
+                switch ($op) {
+                    case 'C':   $map[$tbl]['C'] = true; break;
+                    case 'U':   $map[$tbl]['U'] = true; break;
+                    case 'D':
+                    case 'D2':  $map[$tbl]['D'] = true; break;
+                    case 'R':
+                    case 'J':   $map[$tbl]['R'] = true; break;
+                }
+            }
+        }
+    }
+
+    // 4) 真偽値で初期化
+    foreach ($map as $tbl => $ops) {
+        $map[$tbl] = [
+            'C' => !empty($ops['C']),
+            'R' => !empty($ops['R']),
+            'U' => !empty($ops['U']),
+            'D' => !empty($ops['D']),
+        ];
+    }
+    return $map;
 }
-
-/**
- * PHPスニペット分割
- * - token_get_all() の結果を
- * - セミコロン終了 or PHPタグ終了を目安に分割し配列返却
- */
-function splitPhpSnippets(string $code): array
-{
-    // TODO: 実装
-    return [];
-}
-
-/**
- * SQL断片抽出
- * - シングル/ダブルクオート文字列リテラル
- * - HEREDOC/NOWDOC
- * - 複数行の .=" 連結後の文字列
- */
-function extractSqlFragments(string $code): array
-{
-    // TODO: 実装
-    return [];
-}
-
-/**
- * CRUD抽出と統合処理
- * - fallbackParse() により正規表現ベース解析
- * - partialAstParse, partialSqlParse 結果をマージ
- * - CRUDフラグを設定 (C,R,U,D)
- * - ビュー/プロシージャ/一時テーブルに @view/@proc/@temp 付与
- * - 条件分岐や判定不能箇所は note に記載
- * - $crud_data に出力
- */
-function parseFile(string $code, string $relPath): void
-{
-    global $crud_data;
-    // TODO: 実装
-}
-
-/**
- * Excel出力
- * - シート1: File-CRUD  (header: file,table,C,R,U,D,note)
- * - シート2: Log        (header: time,message)
- */
-function writeExcel(array $crudData, array $logData): void
-{
-    $ss = new Spreadsheet();
-    $sheet1 = $ss->getActiveSheet();
-    $sheet1->setTitle('File-CRUD');
-    // TODO: ヘッダー行・データ行出力
-
-    $sheet2 = $ss->createSheet();
-    $sheet2->setTitle('Log');
-    // TODO: Logシートに time,message を出力
-
-    (new Xlsx($ss))->save('analysis_result.xlsx');
-}
-
-/**
- * ログ記録
- */
-function logMessage(string $msg): void
-{
-    global $log_data;
-    $log_data[] = ['time' => date('Y-m-d H:i:s'), 'message' => $msg];
-}
-
-// 実行開始
-main($argv);
