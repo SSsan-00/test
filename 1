@@ -4,154 +4,45 @@ declare(strict_types=1);
 
 require __DIR__ . '/vendor/autoload.php';
 
-use PhpOffice\PhpSpreadsheet\Settings;
 use PhpOffice\PhpSpreadsheet\Spreadsheet;
 use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 use PhpParser\ParserFactory;
-use Psr\SimpleCache\CacheInterface;
 
-// ────────── ネイティブ実装の PSR-16 キャッシュ ──────────
-class LocalSimpleCache implements CacheInterface
-{
-    private string $dir;
-
-    public function __construct(string $dir = '')
-    {
-        $this->dir = $dir ?: sys_get_temp_dir() . '/phpspreadsheet_cache';
-        if (!is_dir($this->dir)) {
-            mkdir($this->dir, 0777, true);
-        }
-    }
-
-    private function getPath(string $key): string
-    {
-        $safe = preg_replace('/[^A-Za-z0-9_\-]/', '_', $key);
-        return "{$this->dir}/{$safe}.cache";
-    }
-
-    public function get($key, $default = null)
-    {
-        $path = $this->getPath($key);
-        if (!file_exists($path)) {
-            return $default;
-        }
-        $data = unserialize(file_get_contents($path));
-        if (isset($data['expires']) && $data['expires'] !== null && time() > $data['expires']) {
-            @unlink($path);
-            return $default;
-        }
-        return $data['value'];
-    }
-
-    public function set($key, $value, $ttl = null): bool
-    {
-        $path = $this->getPath($key);
-        if ($ttl instanceof \DateInterval) {
-            $expires = (new \DateTime())->add($ttl)->getTimestamp();
-        } elseif (is_int($ttl)) {
-            $expires = time() + $ttl;
-        } else {
-            $expires = null;
-        }
-        $data = ['value' => $value, 'expires' => $expires];
-        return file_put_contents($path, serialize($data)) !== false;
-    }
-
-    public function delete($key): bool
-    {
-        $path = $this->getPath($key);
-        return !file_exists($path) || unlink($path);
-    }
-
-    public function clear(): bool
-    {
-        foreach (glob("{$this->dir}/*.cache") as $f) {
-            @unlink($f);
-        }
-        return true;
-    }
-
-    public function getMultiple($keys, $default = null): iterable
-    {
-        $results = [];
-        foreach ($keys as $k) {
-            $results[$k] = $this->get($k, $default);
-        }
-        return $results;
-    }
-
-    public function setMultiple($values, $ttl = null): bool
-    {
-        $ok = true;
-        foreach ($values as $k => $v) {
-            if (!$this->set($k, $v, $ttl)) {
-                $ok = false;
-            }
-        }
-        return $ok;
-    }
-
-    public function deleteMultiple($keys): bool
-    {
-        $ok = true;
-        foreach ($keys as $k) {
-            if (!$this->delete($k)) {
-                $ok = false;
-            }
-        }
-        return $ok;
-    }
-
-    public function has($key): bool
-    {
-        $path = $this->getPath($key);
-        if (!file_exists($path)) {
-            return false;
-        }
-        $data = unserialize(file_get_contents($path));
-        if (isset($data['expires']) && $data['expires'] !== null && time() > $data['expires']) {
-            @unlink($path);
-            return false;
-        }
-        return true;
-    }
-}
-
-// ────────── セルキャッシュ設定 ──────────
-// PSR-16 実装を渡すだけで、Excel のセルをディスクにキャッシュします
-$cacheImpl = new LocalSimpleCache();
-Settings::setCache($cacheImpl);  [oai_citation:0‡PhpSpreadsheet](https://phpspreadsheet.readthedocs.io/en/latest/topics/memory_saving/?utm_source=chatgpt.com) [oai_citation:1‡Packagist](https://packagist.org/packages/phpoffice/phpspreadsheet)
-
-// ガベージコレクション有効化
+// ガベージコレクション有効化（PHP 標準）
 gc_enable();
 
-// ────────── メイン処理 ──────────
+// 引数チェック
 if ($argc < 3) {
     fwrite(STDERR, "Usage: php analyzer.php <target_dir> <output.xlsx>\n");
     exit(1);
 }
+
 $targetDir  = rtrim($argv[1], "/\\");
 $outputFile = $argv[2];
+
 if (!is_dir($targetDir)) {
     fwrite(STDERR, "Error: '{$targetDir}' is not a directory.\n");
     exit(1);
 }
 
-// 将来の AST 解析用
+// 将来の AST 用意（今回は使いませんがインスタンス化のみ）
 $parser = (new ParserFactory())->createForNewestSupportedVersion();
 
-// シートを 1 枚だけ用意
+// スプレッドシート準備（シートは 1 枚のみ）
 $spreadsheet = new Spreadsheet();
 $sheet       = $spreadsheet->getActiveSheet();
 $sheet->setTitle('CRUD Results');
-$sheet->fromArray(['File','Table','C','R','U','D'], null, 'A1');
+
+// ヘッダー
+$sheet->fromArray(['File', 'Table', 'C', 'R', 'U', 'D'], null, 'A1');
 
 $row = 2;
 $rii = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($targetDir));
 foreach ($rii as $file) {
-    if (!$file->isFile() || $file->getExtension() !== 'php') {
+    if (!$file->isFile() || strtolower($file->getExtension()) !== 'php') {
         continue;
     }
+
     $relPath = substr($file->getPathname(), strlen($targetDir) + 1);
     $content = file_get_contents($file->getPathname());
     $crudMap = analyzeCrud($content);
@@ -177,7 +68,13 @@ $writer->save($outputFile);
 
 echo "✔ {$outputFile} を生成しました。\n\n";
 
-// ────────── 簡易 CRUD 抽出関数 ──────────
+/**
+ * 簡易版：正規表現による CRUD 抽出
+ *   C => INSERT INTO
+ *   R => SELECT … FROM
+ *   U => UPDATE
+ *   D => DELETE FROM
+ */
 function analyzeCrud(string $content): array
 {
     $map = [];
@@ -187,13 +84,17 @@ function analyzeCrud(string $content): array
         'U' => '/UPDATE\s+`?([a-zA-Z0-9_]+)`?/i',
         'D' => '/DELETE\s+FROM\s+`?([a-zA-Z0-9_]+)`?/i',
     ];
+
     foreach ($patterns as $op => $pat) {
         if (preg_match_all($pat, $content, $m)) {
             foreach ($m[1] as $tbl) {
-                $map[$tbl] ??= ['C'=>false,'R'=>false,'U'=>false,'D'=>false];
+                if (!isset($map[$tbl])) {
+                    $map[$tbl] = ['C'=>false,'R'=>false,'U'=>false,'D'=>false];
+                }
                 $map[$tbl][$op] = true;
             }
         }
     }
+
     return $map;
 }
