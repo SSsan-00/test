@@ -5,37 +5,146 @@ declare(strict_types=1);
 require __DIR__ . '/vendor/autoload.php';
 
 use PhpOffice\PhpSpreadsheet\Settings;
-use Symfony\Component\Cache\Adapter\FilesystemAdapter;
-use Symfony\Component\Cache\Psr16Cache;
 use PhpOffice\PhpSpreadsheet\Spreadsheet;
 use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 use PhpParser\ParserFactory;
+use Psr\SimpleCache\CacheInterface;
 
-// ■ 1. PSR-16 キャッシュを設定（ディスクベース）
-$tempDir    = sys_get_temp_dir();
-$psr6Adapter = new FilesystemAdapter('', 0, $tempDir);
-$psr16Cache  = new Psr16Cache($psr6Adapter);
-Settings::setCache($psr16Cache);  // キャッシュ実装を渡す  [oai_citation:0‡GitHub](https://github.com/PHPOffice/PhpSpreadsheet/blob/master/src/PhpSpreadsheet/Settings.php) [oai_citation:1‡PhpSpreadsheet](https://phpspreadsheet.readthedocs.io/en/latest/topics/memory_saving/?utm_source=chatgpt.com)
+// ────────── ネイティブ実装の PSR-16 キャッシュ ──────────
+class LocalSimpleCache implements CacheInterface
+{
+    private string $dir;
 
-// ■ 2. GC を有効化（要らなくなったオブジェクトを解放）
+    public function __construct(string $dir = '')
+    {
+        $this->dir = $dir ?: sys_get_temp_dir() . '/phpspreadsheet_cache';
+        if (!is_dir($this->dir)) {
+            mkdir($this->dir, 0777, true);
+        }
+    }
+
+    private function getPath(string $key): string
+    {
+        $safe = preg_replace('/[^A-Za-z0-9_\-]/', '_', $key);
+        return "{$this->dir}/{$safe}.cache";
+    }
+
+    public function get($key, $default = null)
+    {
+        $path = $this->getPath($key);
+        if (!file_exists($path)) {
+            return $default;
+        }
+        $data = unserialize(file_get_contents($path));
+        if (isset($data['expires']) && $data['expires'] !== null && time() > $data['expires']) {
+            @unlink($path);
+            return $default;
+        }
+        return $data['value'];
+    }
+
+    public function set($key, $value, $ttl = null): bool
+    {
+        $path = $this->getPath($key);
+        if ($ttl instanceof \DateInterval) {
+            $expires = (new \DateTime())->add($ttl)->getTimestamp();
+        } elseif (is_int($ttl)) {
+            $expires = time() + $ttl;
+        } else {
+            $expires = null;
+        }
+        $data = ['value' => $value, 'expires' => $expires];
+        return file_put_contents($path, serialize($data)) !== false;
+    }
+
+    public function delete($key): bool
+    {
+        $path = $this->getPath($key);
+        return !file_exists($path) || unlink($path);
+    }
+
+    public function clear(): bool
+    {
+        foreach (glob("{$this->dir}/*.cache") as $f) {
+            @unlink($f);
+        }
+        return true;
+    }
+
+    public function getMultiple($keys, $default = null): iterable
+    {
+        $results = [];
+        foreach ($keys as $k) {
+            $results[$k] = $this->get($k, $default);
+        }
+        return $results;
+    }
+
+    public function setMultiple($values, $ttl = null): bool
+    {
+        $ok = true;
+        foreach ($values as $k => $v) {
+            if (!$this->set($k, $v, $ttl)) {
+                $ok = false;
+            }
+        }
+        return $ok;
+    }
+
+    public function deleteMultiple($keys): bool
+    {
+        $ok = true;
+        foreach ($keys as $k) {
+            if (!$this->delete($k)) {
+                $ok = false;
+            }
+        }
+        return $ok;
+    }
+
+    public function has($key): bool
+    {
+        $path = $this->getPath($key);
+        if (!file_exists($path)) {
+            return false;
+        }
+        $data = unserialize(file_get_contents($path));
+        if (isset($data['expires']) && $data['expires'] !== null && time() > $data['expires']) {
+            @unlink($path);
+            return false;
+        }
+        return true;
+    }
+}
+
+// ────────── セルキャッシュ設定 ──────────
+// PSR-16 実装を渡すだけで、Excel のセルをディスクにキャッシュします
+$cacheImpl = new LocalSimpleCache();
+Settings::setCache($cacheImpl);  [oai_citation:0‡PhpSpreadsheet](https://phpspreadsheet.readthedocs.io/en/latest/topics/memory_saving/?utm_source=chatgpt.com) [oai_citation:1‡Packagist](https://packagist.org/packages/phpoffice/phpspreadsheet)
+
+// ガベージコレクション有効化
 gc_enable();
 
-// ■ 3. CRUD 抽出＋Excel 出力（省略を除いた例）
+// ────────── メイン処理 ──────────
 if ($argc < 3) {
     fwrite(STDERR, "Usage: php analyzer.php <target_dir> <output.xlsx>\n");
     exit(1);
 }
 $targetDir  = rtrim($argv[1], "/\\");
 $outputFile = $argv[2];
+if (!is_dir($targetDir)) {
+    fwrite(STDERR, "Error: '{$targetDir}' is not a directory.\n");
+    exit(1);
+}
 
-// AST 用意（将来拡張向け）
+// 将来の AST 解析用
 $parser = (new ParserFactory())->createForNewestSupportedVersion();
 
-// シートひとつ
+// シートを 1 枚だけ用意
 $spreadsheet = new Spreadsheet();
 $sheet       = $spreadsheet->getActiveSheet();
 $sheet->setTitle('CRUD Results');
-$sheet->fromArray(['File', 'Table', 'C', 'R', 'U', 'D'], null, 'A1');
+$sheet->fromArray(['File','Table','C','R','U','D'], null, 'A1');
 
 $row = 2;
 $rii = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($targetDir));
@@ -57,7 +166,7 @@ foreach ($rii as $file) {
         $row++;
     }
 
-    // 不要メモリの開放
+    // メモリ解放
     unset($content, $crudMap);
     gc_collect_cycles();
 }
@@ -65,10 +174,10 @@ foreach ($rii as $file) {
 // ファイル書き出し
 $writer = new Xlsx($spreadsheet);
 $writer->save($outputFile);
-echo "✔ {$outputFile} を生成しました。\n";
 
-// ──────────────
-// 正規表現による簡易 CRUD 抽出
+echo "✔ {$outputFile} を生成しました。\n\n";
+
+// ────────── 簡易 CRUD 抽出関数 ──────────
 function analyzeCrud(string $content): array
 {
     $map = [];
@@ -80,11 +189,9 @@ function analyzeCrud(string $content): array
     ];
     foreach ($patterns as $op => $pat) {
         if (preg_match_all($pat, $content, $m)) {
-            foreach ($m[1] as $table) {
-                if (!isset($map[$table])) {
-                    $map[$table] = ['C'=>false,'R'=>false,'U'=>false,'D'=>false];
-                }
-                $map[$table][$op] = true;
+            foreach ($m[1] as $tbl) {
+                $map[$tbl] ??= ['C'=>false,'R'=>false,'U'=>false,'D'=>false];
+                $map[$tbl][$op] = true;
             }
         }
     }
