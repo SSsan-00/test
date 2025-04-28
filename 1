@@ -1,27 +1,102 @@
+#!/usr/bin/env php
 <?php
-require_once __DIR__ . '/lib/AppConfig.php';
-require_once __DIR__ . '/lib/QueryEngine.php';
+declare(strict_types=1);
 
-use Lib\AppConfig;
-use Lib\QueryEngine;
+require __DIR__ . '/vendor/autoload.php';
 
-$dbh = pg_connect("host=localhost dbname=complex user=postgres password=secret");
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+use PhpParser\ParserFactory;
 
-// 条件で定数を切り替え（例: テストモードか本番か）
-$env = getenv('APP_ENV') ?: 'production';
-AppConfig::setEnvironment($env); // この処理で定数が変化
+if ($argc < 3) {
+    fwrite(STDERR, "Usage: php analyzer.php <target_dir> <output.xlsx>\n");
+    exit(1);
+}
 
-// SQL構築実行
-$engine = new QueryEngine();
+$targetDir  = $argv[1];
+$outputFile = $argv[2];
 
-$status = 'active';
-$limit = 30;
+if (!is_dir($targetDir)) {
+    fwrite(STDERR, "Error: '{$targetDir}' is not a directory.\n");
+    exit(1);
+}
 
-$sql = $engine->generateUserQuery($status, $limit);
-pg_query($dbh, $sql);
+// ParserFactory を将来の AST 解析用にインスタンス化
+$parser = (new ParserFactory())->createForNewestSupportedVersion();
 
-// ビュー利用
-$engine->queryFromView($dbh);
+$spreadsheet = new Spreadsheet();
+$sheetCount  = 0;
 
-// ストアドプロシージャ呼び出し
-$engine->callStoredProcedure($dbh);
+// 再帰的に .php ファイルを走査
+$rii = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($targetDir));
+foreach ($rii as $file) {
+    if (!$file->isFile() || $file->getExtension() !== 'php') {
+        continue;
+    }
+
+    $path    = $file->getPathname();
+    $content = file_get_contents($path);
+    $crudMap = analyzeCrud($content);
+
+    // シート作成（最初は既存シートを利用、それ以降は新規作成）
+    $sheet = $sheetCount === 0
+        ? $spreadsheet->getActiveSheet()
+        : $spreadsheet->createSheet();
+    // シート名はファイル名（長すぎる場合は切り詰め）
+    $title = mb_substr($file->getBasename(), 0, 28);
+    $sheet->setTitle($title);
+
+    // ヘッダー
+    $sheet->fromArray(['Table', 'C', 'R', 'U', 'D'], null, 'A1');
+
+    // CRUD データ書き込み
+    $row = 2;
+    foreach ($crudMap as $table => $ops) {
+        $sheet->setCellValue("A{$row}", $table);
+        $sheet->setCellValue("B{$row}", $ops['C'] ? '○' : '');
+        $sheet->setCellValue("C{$row}", $ops['R'] ? '○' : '');
+        $sheet->setCellValue("D{$row}", $ops['U'] ? '○' : '');
+        $sheet->setCellValue("E{$row}", $ops['D'] ? '○' : '');
+        $row++;
+    }
+
+    $sheetCount++;
+}
+
+// ファイル保存
+$writer = new Xlsx($spreadsheet);
+$writer->save($outputFile);
+
+echo "✔ {$outputFile} を生成しました。\n";
+
+
+/**
+ * 簡易版：ファイル本文から正規表現で CRUD 操作を検出
+ *   C => INSERT INTO
+ *   R => SELECT … FROM
+ *   U => UPDATE
+ *   D => DELETE FROM
+ */
+function analyzeCrud(string $content): array
+{
+    $map = [];
+    $patterns = [
+        'C' => '/INSERT\s+INTO\s+`?([a-zA-Z0-9_]+)`?/i',
+        'R' => '/SELECT\b.*?\bFROM\s+`?([a-zA-Z0-9_]+)`?/is',
+        'U' => '/UPDATE\s+`?([a-zA-Z0-9_]+)`?/i',
+        'D' => '/DELETE\s+FROM\s+`?([a-zA-Z0-9_]+)`?/i',
+    ];
+
+    foreach ($patterns as $op => $pat) {
+        if (preg_match_all($pat, $content, $m)) {
+            foreach ($m[1] as $table) {
+                if (!isset($map[$table])) {
+                    $map[$table] = ['C'=>false,'R'=>false,'U'=>false,'D'=>false];
+                }
+                $map[$table][$op] = true;
+            }
+        }
+    }
+
+    return $map;
+}
