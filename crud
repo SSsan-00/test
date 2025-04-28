@@ -1,83 +1,126 @@
 /**
- * 拡張版：文字列結合対応＋同名変数の個別追跡による CRUD 抽出
+ * 拡張版：DROP/TRUNCATE、汎用FROM、サブクエリにも対応した CRUD 抽出
  */
 function analyzeCrud(string $content): array
 {
     $map = [];
     $sqlStatements = [];
 
-    // ① 変数への初期代入を「新しい SQL 文」として登録
+    // 1. 変数への初期代入を収集
     if (preg_match_all(
-        '/\$([a-zA-Z_][A-Za-z0-9_]*)\s*=\s*[\'"]([^\'"]+)[\'"];/',
+        '/\$([A-Za-z_][A-Za-z0-9_]*)\s*=\s*[\'"]([^\'"]+)[\'"];/',
         $content,
         $mInit,
         PREG_SET_ORDER
     )) {
         foreach ($mInit as $m) {
-            [$full, $var, $part] = $m;
-            $sqlStatements[] = ['var' => $var, 'sql' => $part];
+            $sqlStatements[] = ['var' => $m[1], 'sql' => $m[2]];
         }
     }
 
-    // ② 文字列結合 .= があれば、直前の同名変数エントリに追記
+    // 2. .= 連結をマージ
     if (preg_match_all(
-        '/\$([a-zA-Z_][A-Za-z0-9_]*)\s*\.\=\s*[\'"]([^\'"]+)[\'"];/',
+        '/\$([A-Za-z_][A-Za-z0-9_]*)\s*\.\=\s*[\'"]([^\'"]+)[\'"];/',
         $content,
         $mApp,
         PREG_SET_ORDER
     )) {
         foreach ($mApp as $m) {
-            [$full, $var, $part] = $m;
-            // 後ろから検索し、一番最後に追加された同名変数に追記
             for ($i = count($sqlStatements) - 1; $i >= 0; $i--) {
-                if ($sqlStatements[$i]['var'] === $var) {
-                    $sqlStatements[$i]['sql'] .= $part;
+                if ($sqlStatements[$i]['var'] === $m[1]) {
+                    $sqlStatements[$i]['sql'] .= $m[2];
                     break;
                 }
             }
         }
     }
 
-    // ③ 各 SQL 文に対して CRUD パターンを適用
-    $patterns = [
-        // INSERT INTO または SELECT … INTO TEMP => C
-        'C' => '/INSERT\s+INTO\s+`?([A-Za-z0-9_]+)`?|\bSELECT\b.*?\bINTO\s+TEMP(?:ORARY)?\s+`?([A-Za-z0-9_]+)`?/i',
-        // SELECT … FROM => R
-        'R' => '/\bSELECT\b.*?\bFROM\s+`?([A-Za-z0-9_]+)`?/i',
-        // UPDATE => U
-        'U' => '/\bUPDATE\s+`?([A-Za-z0-9_]+)`?/i',
-        // DELETE FROM => D
-        'D' => '/\bDELETE\s+FROM\s+`?([A-Za-z0-9_]+)`?/i',
-    ];
-
+    // 3. 各 SQL 文ごとにパターン検出
     foreach ($sqlStatements as $stmt) {
         $sql = $stmt['sql'];
-        foreach ($patterns as $op => $pat) {
-            if (preg_match_all($pat, $sql, $m, PREG_SET_ORDER)) {
-                foreach ($m as $match) {
-                    // キャプチャ 1 or 2 にテーブル名が入る
-                    $table = $match[1] ?: ($match[2] ?? null);
-                    if ($table !== null) {
-                        $map[$table] ??= ['C'=>false,'R'=>false,'U'=>false,'D'=>false];
-                        $map[$table][$op] = true;
-                    }
+
+        // 3-1. DROP TABLE → D
+        if (preg_match_all('/\bDROP\s+TABLE\s+`?([A-Za-z0-9_]+)`?/i', $sql, $m)) {
+            foreach ($m[1] as $tbl) {
+                $map[$tbl] ??= ['C'=>false,'R'=>false,'U'=>false,'D'=>false];
+                $map[$tbl]['D'] = true;
+            }
+        }
+
+        // 3-2. TRUNCATE TABLE → D
+        if (preg_match_all('/\bTRUNCATE\s+TABLE\s+`?([A-Za-z0-9_]+)`?/i', $sql, $m)) {
+            foreach ($m[1] as $tbl) {
+                $map[$tbl] ??= ['C'=>false,'R'=>false,'U'=>false,'D'=>false];
+                $map[$tbl]['D'] = true;
+            }
+        }
+
+        // 3-3. JOIN → R
+        if (preg_match_all('/\bJOIN\s+`?([A-Za-z0-9_]+)`?/i', $sql, $m)) {
+            foreach ($m[1] as $tbl) {
+                $map[$tbl] ??= ['C'=>false,'R'=>false,'U'=>false,'D'=>false];
+                $map[$tbl]['R'] = true;
+            }
+        }
+
+        // 3-4. 汎用 FROM → R（SELECT 以外の文脈でも）
+        if (preg_match_all('/\bFROM\s+`?([A-Za-z0-9_]+)`?/i', $sql, $m)) {
+            foreach ($m[1] as $tbl) {
+                $map[$tbl] ??= ['C'=>false,'R'=>false,'U'=>false,'D'=>false];
+                $map[$tbl]['R'] = true;
+            }
+        }
+
+        // 3-5. INSERT INTO / SELECT ... INTO TEMP → C
+        if (preg_match_all(
+            '/INSERT\s+INTO\s+`?([A-Za-z0-9_]+)`?|\bSELECT\b.*?\bINTO\s+TEMP(?:ORARY)?\s+`?([A-Za-z0-9_]+)`?/i',
+            $sql,
+            $m,
+            PREG_SET_ORDER
+        )) {
+            foreach ($m as $match) {
+                // キャプチャ 1 or 2 にテーブル名が入る
+                $tbl = $match[1] ?: ($match[2] ?? null);
+                if ($tbl) {
+                    $map[$tbl] ??= ['C'=>false,'R'=>false,'U'=>false,'D'=>false];
+                    $map[$tbl]['C'] = true;
                 }
+            }
+        }
+
+        // 3-6. UPDATE → U
+        if (preg_match_all('/\bUPDATE\s+`?([A-Za-z0-9_]+)`?/i', $sql, $m)) {
+            foreach ($m[1] as $tbl) {
+                $map[$tbl] ??= ['C'=>false,'R'=>false,'U'=>false,'D'=>false];
+                $map[$tbl]['U'] = true;
+            }
+        }
+
+        // 3-7. DELETE FROM → D
+        if (preg_match_all('/\bDELETE\s+FROM\s+`?([A-Za-z0-9_]+)`?/i', $sql, $m)) {
+            foreach ($m[1] as $tbl) {
+                $map[$tbl] ??= ['C'=>false,'R'=>false,'U'=>false,'D'=>false];
+                $map[$tbl]['D'] = true;
             }
         }
     }
 
-    // ④ 通常の静的 SQL にもフォールバックでマッチ
+    // 4. フォールバック：ファイル全文からも DROP/TRUNCATE/FROM を拾う
     $fallback = [
-        'C'=>'/INSERT\s+INTO\s+`?([A-Za-z0-9_]+)`?/i',
-        'R'=>'/SELECT\b.*?\bFROM\s+`?([A-Za-z0-9_]+)`?/is',
-        'U'=>'/UPDATE\s+`?([A-Za-z0-9_]+)`?/i',
-        'D'=>'/DELETE\s+FROM\s+`?([A-Za-z0-9_]+)`?/i',
+        'D_drop'     => '/\bDROP\s+TABLE\s+`?([A-Za-z0-9_]+)`?/i',
+        'D_truncate' => '/\bTRUNCATE\s+TABLE\s+`?([A-Za-z0-9_]+)`?/i',
+        'R_from'     => '/\bFROM\s+`?([A-Za-z0-9_]+)`?/i',
     ];
-    foreach ($fallback as $op => $pat) {
+    foreach ($fallback as $key => $pat) {
         if (preg_match_all($pat, $content, $m)) {
-            foreach ($m[1] as $table) {
-                $map[$table] ??= ['C'=>false,'R'=>false,'U'=>false,'D'=>false];
-                $map[$table][$op] = true;
+            foreach ($m[1] as $tbl) {
+                $map[$tbl] ??= ['C'=>false,'R'=>false,'U'=>false,'D'=>false];
+                // D_drop／D_truncate は D に、R_from は R にマッピング
+                if (str_starts_with($key, 'D_')) {
+                    $map[$tbl]['D'] = true;
+                } else {
+                    $map[$tbl]['R'] = true;
+                }
             }
         }
     }
