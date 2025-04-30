@@ -1,0 +1,159 @@
+#!/usr/bin/env php
+<?php
+/**
+ * trim_whitespace_utf8.php
+ * ---------------------------------------------------------------
+ *   📌 機能
+ *     1) ファイル読み込み時に **文字コードを UTF-8 に変換**
+ *        - UTF-8/BOM, SJIS-win, CP932, EUC-JP, ISO-2022-JP, ASCII を自動判定
+ *        - 変換不能・判定失敗時は内容をそのまま使用
+ *     2) 行末空白（スペース・タブ）の除去
+ *     3) 連続する空行を 1 行に圧縮
+ *     4) 改行コードを LF (`\n`) に統一
+ *     5) 末尾に改行 1 行を保証
+ *
+ *   🛠 使い方
+ *     php trim_whitespace_utf8.php <入力ディレクトリ> [出力ディレクトリ]
+ *
+ *       出力先省略時 → <入力ディレクトリ>_trim_utf8/
+ *       元ファイルは一切変更せず、整形済みコードを新フォルダへコピー
+ *
+ *   ⚙ 要件
+ *     - PHP 8.0 以上推奨（7.4 でも動作可）
+ *     - mbstring 拡張必須
+ * ---------------------------------------------------------------
+ */
+
+declare(strict_types=1);
+
+/* ===== 設定 ===== */
+const TARGET_EXT = ['php', 'inc'];   // 処理対象拡張子（小文字比較）
+
+/* ===== 引数確認 ===== */
+if ($argc < 2) {
+    fwrite(STDERR, "Usage: php trim_whitespace_utf8.php <input_dir> [output_dir]\n");
+    exit(1);
+}
+$inputDir = realpath($argv[1]) ?: null;
+if (!$inputDir || !is_dir($inputDir)) {
+    fwrite(STDERR, "ERROR: invalid input directory: {$argv[1]}\n");
+    exit(1);
+}
+$outputDir = $argv[2] ?? $inputDir . '_trim_utf8';
+if (!is_dir($outputDir) && !mkdir($outputDir, 0777, true)) {
+    fwrite(STDERR, "ERROR: cannot create output directory: {$outputDir}\n");
+    exit(1);
+}
+
+/* ===== メインループ ===== */
+foreach (traverse_files($inputDir) as $srcPath) {
+
+    $rel      = substr($srcPath, strlen($inputDir) + 1);      // 入力 dir からの相対パス
+    $destPath = $outputDir . DIRECTORY_SEPARATOR . $rel;
+    $destDir  = dirname($destPath);
+    if (!is_dir($destDir) && !mkdir($destDir, 0777, true)) {
+        fwrite(STDERR, "WARN: mkdir failed: {$destDir}\n");
+        continue;
+    }
+
+    $raw = file_get_contents($srcPath);
+    if ($raw === false) {
+        fwrite(STDERR, "WARN: cannot read {$srcPath}\n");
+        continue;
+    }
+
+    /* ---- ステップ 1 : UTF-8 変換 ---- */
+    $code = convert_to_utf8($raw);
+
+    /* ---- ステップ 2 : 空白整形 ---- */
+    $code = normalize_whitespace($code);
+
+    /* ---- 書き込み ---- */
+    file_put_contents($destPath, $code);
+}
+
+/* ================================================================
+ *  関数定義
+ * ================================================================
+ */
+
+/**
+ * 指定ディレクトリを再帰走査し、対象拡張子のファイルパスを yield
+ */
+function traverse_files(string $baseDir): iterable
+{
+    $it = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator(
+            $baseDir,
+            FilesystemIterator::SKIP_DOTS | FilesystemIterator::FOLLOW_SYMLINKS
+        ),
+        RecursiveIteratorIterator::LEAVES_ONLY
+    );
+
+    /** @var SplFileInfo $info */
+    foreach ($it as $info) {
+        if (!$info->isFile()) { continue; }
+        if (in_array(strtolower($info->getExtension()), TARGET_EXT, true)) {
+            yield $info->getPathname();
+        }
+    }
+}
+
+/**
+ * 文字列を UTF-8 に変換（既に UTF-8 の場合は何もしない）
+ *
+ * @param string $bytes 読み込んだ生バイト列
+ * @return string UTF-8 文字列（BOM 無し）
+ */
+function convert_to_utf8(string $bytes): string
+{
+    // UTF-8 BOM を除去
+    if (substr($bytes, 0, 3) === "\xEF\xBB\xBF") {
+        $bytes = substr($bytes, 3);
+    }
+
+    // 推定文字コードを取得
+    $enc = mb_detect_encoding(
+        $bytes,
+        ['UTF-8', 'SJIS-win', 'CP932', 'EUC-JP', 'ISO-2022-JP', 'ASCII'],
+        true
+    );
+
+    // 検出失敗時は UTF-8 とみなす
+    if ($enc === false) { $enc = 'UTF-8'; }
+
+    // 変換不要
+    if ($enc === 'UTF-8') { return $bytes; }
+
+    // 変換実行（失敗時はオリジナルを返す）
+    $converted = @mb_convert_encoding($bytes, 'UTF-8', $enc);
+    return $converted !== false ? $converted : $bytes;
+}
+
+/**
+ * 行末空白除去・空行圧縮・改行 LF 化・終端 \n 付与
+ */
+function normalize_whitespace(string $code): string
+{
+    // CRLF / CR → LF
+    $code = str_replace(["\r\n", "\r"], "\n", $code);
+
+    $out         = [];
+    $blankStreak = 0;
+
+    foreach (explode("\n", $code) as $line) {
+        $trimmed = rtrim($line);     // 行末空白削除
+
+        if ($trimmed === '') {       // 空行
+            $blankStreak++;
+            if ($blankStreak > 1) {  // 2 連続目以降はスキップ
+                continue;
+            }
+        } else {
+            $blankStreak = 0;
+        }
+        $out[] = $trimmed;
+    }
+
+    return implode("\n", $out) . "\n";  // 最終行にも LF を確保
+}
