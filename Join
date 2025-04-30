@@ -1,0 +1,10 @@
+@@  function analyseSql(string $sql,Ctx $ctx): void
+-    if(preg_match_all('/\bjoin\s+(\w+)/i',$q,$j))
+-        foreach($j[1] as $tbl) add($ctx,in_array($tbl,$ctx->temps,true)?"$tbl@temp":$tbl,'r');
++    /* JOIN 句  ─  left/right/inner/full/cross なども含めて捕捉 */
++    if(preg_match_all('/\b(?:left|right|inner|outer|full|cross|straight_join)?\s*join\s+(\w+)/i',
++                      $q,$j))
++        foreach($j[1] as $tbl)
++            add($ctx,
++                in_array($tbl,$ctx->temps,true) ? "$tbl@temp" : $tbl,
++                'r');
