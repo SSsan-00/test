@@ -1,0 +1,340 @@
+<?php
+/**
+ * url_extractor.php  ─ 外部アクセス先 一括抽出ツール (PHP‑CLI)
+ * ------------------------------------------------------------------
+ * 依存:
+ *   composer require "nikic/php-parser:^5.4" \
+ *                      "phpoffice/phpspreadsheet:^4.2" \
+ *                      "mck89/peast:^1.17"
+ * 使い方:
+ *   $ php url_extractor.php <TARGET_DIR> [OUTPUT.xlsx]
+ *      TARGET_DIR   … 解析対象ディレクトリ (再帰)
+ *      OUTPUT.xlsx  … 出力先 (省略時 external_access.xlsx)
+ * ------------------------------------------------------------------
+ * 出力列:
+ *   file   … 相対パス
+ *   type   … アクセス種別 (FORM_ACTION / IMG_SRC / HEADER_LOCATION / ...)
+ *   url    … 解決済み URL
+ * ------------------------------------------------------------------
+ * 2025‑05‑01  fully‑featured initial release
+ */
+
+declare(strict_types=1);
+
+require __DIR__ . '/vendor/autoload.php';
+
+// ────────── CLI Entrypoint ──────────
+(function (): void {
+    $baseDir = $argv[1] ?? getcwd();
+    $outXlsx = $argv[2] ?? 'external_access.xlsx';
+
+    $analyzer = new App\Analyzer($baseDir);
+    $records  = $analyzer->run(); // [['file','type','url'], …]
+
+    (new App\Exporter())->toExcel($records, $outXlsx);
+    fwrite(STDOUT, "\e[32m✔ 解析完了: $outXlsx (" . count($records) . " 件)\e[0m\n");
+})();
+
+// ────────── Library Code (PSR‑4: App\*) ──────────
+namespace App {
+    final class Collector
+    {
+        private array $seen = [];
+        private array $rows = [];
+        public function add(string $file, string $type, string $url): void
+        {
+            $key = "$file|$type|$url";
+            if (isset($this->seen[$key])) return;
+            $this->seen[$key] = true;
+            $this->rows[] = ['file' => $file, 'type' => $type, 'url' => $url];
+        }
+        /** @return list<array{file:string,type:string,url:string}> */
+        public function all(): array { return $this->rows; }
+    }
+}
+
+namespace App\Resolver {
+    use PhpParser\Node;
+    use PhpParser\NodeFinder;
+
+    /** 変数・定数・連結式を出来る限り評価 */
+    final class ValueResolver
+    {
+        /** @param string|Node $expr */
+        public static function resolve($expr, ?Node $ctx = null): string
+        {
+            if (is_string($expr)) {
+                return trim($expr, "\"' ");
+            }
+
+            // 文字列リテラル
+            if ($expr instanceof Node\Scalar\String_) {
+                return $expr->value;
+            }
+
+            // 連結
+            if ($expr instanceof Node\Expr\BinaryOp\Concat) {
+                return self::resolve($expr->left, $ctx) . self::resolve($expr->right, $ctx);
+            }
+
+            // 定数呼び出し
+            if ($expr instanceof Node\Expr\ConstFetch) {
+                $name = $expr->name->toString();
+                return \defined($name) ? (string) \constant($name) : $name;
+            }
+
+            // 変数参照
+            if ($expr instanceof Node\Expr\Variable && is_string($expr->name) && $ctx) {
+                $finder = new NodeFinder();
+                $stmts  = $ctx->getAttribute('rootStmts') ?? [];
+                /** @var Node[] $assigns */
+                $assigns = $finder->find($stmts, function (Node $n) use ($expr) {
+                    return $n instanceof Node\Expr\Assign
+                        && $n->var instanceof Node\Expr\Variable
+                        && $n->var->name === $expr->name
+                        && $n->expr instanceof Node;
+                });
+                if ($assigns) {
+                    // 最後の代入を採用
+                    $last = end($assigns);
+                    return self::resolve($last->expr, $last);
+                }
+                return '${' . $expr->name . '}';
+            }
+            return '<UNRESOLVED>';
+        }
+    }
+}
+
+namespace App\Parser {
+    use App\Collector;
+    use App\Resolver\ValueResolver;
+    use PhpParser\{Node, NodeTraverser, NodeVisitorAbstract, ParserFactory, NodeFinder};
+
+    final class PhpParser
+    {
+        public function parse(string $file, Collector $collector): void
+        {
+            $code = \file_get_contents($file);
+            $parser = (new ParserFactory())->createForNewestSupportedVersion();
+            $stmts  = $parser->parse($code);
+            if ($stmts === null) throw new \RuntimeException('parse error');
+            // rootStmts 属性付与 (解決で使用)
+            foreach ($stmts as $s) $s->setAttribute('rootStmts', $stmts);
+
+            $traverser = new NodeTraverser();
+            $traverser->addVisitor(new class($file, $collector) extends NodeVisitorAbstract {
+                public function __construct(private string $file, private Collector $collector) {}
+
+                public function enterNode(Node $node)
+                {
+                    // header("Location: ...")
+                    if ($node instanceof Node\Expr\FuncCall
+                        && $node->name instanceof Node\Name
+                        && \strtolower($node->name->toString()) === 'header'
+                        && isset($node->args[0])) {
+
+                        $val = $node->args[0]->value;
+                        $raw = $val instanceof Node ? ValueResolver::resolve($val, $node) : (string)$val;
+                        if (\preg_match('/location\s*:\s*(.+)/i', $raw, $m)) {
+                            $this->collector->add($this->file, 'HEADER_LOCATION', trim($m[1]));
+                        }
+                    }
+
+                    // echo 内に埋め込まれた HTML (<form action="..."> 等)
+                    if ($node instanceof Node\Stmt\InlineHTML || $node instanceof Node\Scalar\Encapsed) {
+                        FallbackRegEx::parseString($this->file, $this->collector, (string)$node->value);
+                    }
+                }
+            });
+            $traverser->traverse($stmts);
+        }
+    }
+
+    final class HtmlParser
+    {
+        public function parse(string $file, Collector $collector): void
+        {
+            $html = \file_get_contents($file);
+            $dom  = new \DOMDocument();
+            @$dom->loadHTML($html);
+            $xp   = new \DOMXPath($dom);
+
+            // <form action="...">
+            foreach ($xp->query('//form[@action]') as $el) {
+                /** @var \DOMElement $el */
+                $collector->add($file, 'FORM_ACTION', ValueResolver::resolve($el->getAttribute('action')));
+            }
+            // <a href>, <img src>
+            foreach ($xp->query('//a[@href]') as $el) {
+                $collector->add($file, 'A_HREF', ValueResolver::resolve($el->getAttribute('href')));
+            }
+            foreach ($xp->query('//img[@src]') as $el) {
+                $collector->add($file, 'IMG_SRC', ValueResolver::resolve($el->getAttribute('src')));
+            }
+        }
+    }
+
+    final class JsParser
+    {
+        public function parse(string $file, Collector $collector): void
+        {
+            $code = \file_get_contents($file);
+            $ast  = \Peast\Peast::latest($code)->parse();
+            $walker = new \Peast\Traversal\NodeTraverser();
+            $walker->addVisitor(new class($file, $collector) implements \Peast\Traversal\Visitor {
+                public function __construct(private string $file, private Collector $collector) {}
+
+                public function enterNode(\Peast\Syntax\Node $node)
+                {
+                    // window.open("url")
+                    if ($node->getType() === 'CallExpression') {
+                        $callee = $node->getCallee();
+                        if ($callee->getType() === 'MemberExpression') {
+                            $obj = $callee->getObject();
+                            $prop = $callee->getProperty();
+                            if ($obj->getType() === 'Identifier' && $prop->getType() === 'Identifier') {
+                                // window.open
+                                if (\strtolower($obj->getName()) === 'window' && $prop->getName() === 'open') {
+                                    $args = $node->getArguments();
+                                    if (!empty($args)) {
+                                        $url = self::resolveJs($args[0]);
+                                        $this->collector->add($this->file, 'WINDOW_OPEN', $url);
+                                    }
+                                }
+                                // xmlHttp.open (第2引数)
+                                if (\preg_match('/^xmlhttp\d*/i', $obj->getName()) && $prop->getName() === 'open') {
+                                    $args = $node->getArguments();
+                                    if (isset($args[1])) {
+                                        $url = self::resolveJs($args[1]);
+                                        $this->collector->add($this->file, 'XMLHTTP_OPEN', $url);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // location.href = "url"
+                    if ($node->getType() === 'AssignmentExpression') {
+                        $left = $node->getLeft();
+                        if ($left->getType() === 'MemberExpression') {
+                            $propChain = self::memberChain($left);
+                            if (\in_array('location.href', $propChain, true) ||
+                                \in_array('window.location.href', $propChain, true)) {
+                                $url = self::resolveJs($node->getRight());
+                                $this->collector->add($this->file, 'LOCATION_HREF', $url);
+                            }
+                        }
+                    }
+                }
+                public function leaveNode(\Peast\Syntax\Node $node) {}
+
+                private static function memberChain($member): array
+                {
+                    $parts = [];
+                    while ($member && $member->getType() === 'MemberExpression') {
+                        $prop = $member->getProperty();
+                        $obj  = $member->getObject();
+                        if ($prop->getType() === 'Identifier') $parts[] = $prop->getName();
+                        if ($obj->getType() === 'Identifier') {
+                            $parts[] = $obj->getName();
+                            break;
+                        }
+                        $member = $obj;
+                    }
+                    return [\implode('.', \array_reverse($parts))];
+                }
+                private static function resolveJs($expr): string
+                {
+                    if ($expr->getType() === 'Literal') return trim((string)$expr->getValue(), "\"'");
+                    if ($expr->getType() === 'BinaryExpression' && $expr->getOperator() === '+') {
+                        return self::resolveJs($expr->getLeft()) . self::resolveJs($expr->getRight());
+                    }
+                    if ($expr->getType() === 'Identifier') {
+                        return '${' . $expr->getName() . '}';
+                    }
+                    return '<UNRESOLVED>';
+                }
+            });
+            $walker->traverse($ast);
+        }
+    }
+
+    final class FallbackRegEx
+    {
+        public static function parse(string $file, Collector $collector): void
+        {
+            self::parseString($file, $collector, \file_get_contents($file));
+        }
+
+        public static function parseString(string $file, Collector $collector, string $str): void
+        {
+            // HTML 属性
+            if (\preg_match_all('/\b(action|src|href)\s*=\s*[\'\"]([^\'\"]+)[\'\"]/i', $str, $m)) {
+                foreach ($m[0] as $i => $_) {
+                    $collector->add($file, strtoupper($m[1][$i]) . '_ATTR', $m[2][$i]);
+                }
+            }
+            // header("Location: ...")
+            if (\preg_match_all('/header\s*\(\s*\"location\s*:\s*([^\"\)]+)\"/i', $str, $m)) {
+                foreach ($m[1] as $url) $collector->add($file, 'HEADER_LOCATION', $url);
+            }
+            // window.open / location.href / xmlHttp.open
+            if (\preg_match_all('/(?:window\.open|location\.href\s*=|\.open\s*\().{0,60}[\'\"]([^\'\"]+)[\'\"]/i', $str, $m)) {
+                foreach ($m[1] as $url) $collector->add($file, 'GENERIC_REGEX', $url);
+            }
+        }
+    }
+}
+
+namespace App {
+    use App\Parser\{PhpParser, HtmlParser, JsParser, FallbackRegEx};
+
+    final class Analyzer
+    {
+        public function __construct(private string $baseDir) {}
+
+        /** @return list<array{file:string,type:string,url:string}> */
+        public function run(): array
+        {
+            $collector = new Collector();
+            $it = new \RecursiveIteratorIterator(
+                    new \RecursiveDirectoryIterator($this->baseDir, \FilesystemIterator::SKIP_DOTS));
+            foreach ($it as $splFile) {
+                /** @var \SplFileInfo $splFile */
+                if ($splFile->isDir()) continue;
+                $path = $splFile->getPathname();
+                $ext  = \strtolower($splFile->getExtension());
+                try {
+                    match ($ext) {
+                        'php', 'inc' => (new PhpParser)->parse($path, $collector),
+                        'html', 'htm' => (new HtmlParser)->parse($path, $collector),
+                        'js'         => (new JsParser)->parse($path, $collector),
+                        default      => null,
+                    };
+                } catch (\Throwable $e) {
+                    // 落ちても必ずフォールバック
+                    FallbackRegEx::parse($path, $collector);
+                }
+            }
+            return $collector->all();
+        }
+    }
+}
+
+namespace App {
+    use PhpOffice\PhpSpreadsheet\Spreadsheet;
+    use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+
+    final class Exporter
+    {
+        /** @param list<array{file:string,type:string,url:string}> $rows */
+        public function toExcel(array $rows, string $out): void
+        {
+            $sheet = new Spreadsheet();
+            $ws    = $sheet->getActiveSheet();
+            $ws->fromArray(['file','type','url'], null, 'A1');
+            $ws->fromArray($rows, null, 'A2');
+            (new Xlsx($sheet))->save($out);
+        }
+    }
+}
