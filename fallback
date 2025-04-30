@@ -1,73 +1,61 @@
-/**
- * フォールバック簡易解析（正規表現）
- *  ──────────────────────────────────
- *  PHPSQLParser が失敗した場合や CRUD が空だった場合に呼ばれる。
- *  DROP/TRUNCATE, CREATE TEMP TABLE, INSERT/UPDATE/DELETE,
- *  SELECT…FROM/JOIN, WITH CTE, SELECT…INTO TEMP など
- *  PostgreSQL で遭遇しやすいパターンを網羅し、
- *  1 文に複数 CRUD が混在しているケースでも **OR 結合** で重ねて記録する。
- *
- *  @return array<string,array{C:bool,R:bool,U:bool,D:bool}>
- */
-function fallbackCrud(string $sql): array
-{
-    $crud = [];
-    $sqlL = strtolower($sql);
+function fallbackCrud($sql) {
+    $tables = [];  // 結果を格納する [テーブル名 => 種別] の配列
 
-    /* --- 1) DROP / TRUNCATE ---------------------------------- */
-    if (preg_match_all('/\b(drop|truncate)\s+table\s+([a-z0-9_.]+)/i', $sql, $m, PREG_SET_ORDER)) {
-        foreach ($m as $g) {
-            $crud[$g[2]]['D'] = true;
+    // 1. 基本CRUD文の主操作テーブルを検出
+    // DROP/TRUNCATE文
+    if (preg_match_all('/\b(?:DROP|TRUNCATE)\s+TABLE\s+`?([A-Za-z0-9_\.]+)`?/i', $sql, $matches)) {
+        foreach ($matches[1] as $tableName) {
+            $tables[$tableName] = 'D';
+        }
+    }
+    // CREATE TEMP TABLE文
+    if (preg_match_all('/\bCREATE\s+(?:TEMPORARY|TEMP)\s+TABLE\s+`?([A-Za-z0-9_\.]+)`?/i', $sql, $matches)) {
+        foreach ($matches[1] as $tableName) {
+            $tables[$tableName] = 'C';
+        }
+    }
+    // INSERT文
+    if (preg_match_all('/\bINSERT\s+(?:INTO\s+)?`?([A-Za-z0-9_\.]+)`?/i', $sql, $matches)) {
+        foreach ($matches[1] as $tableName) {
+            $tables[$tableName] = 'C';
+        }
+    }
+    // UPDATE文
+    if (preg_match_all('/\bUPDATE\s+`?([A-Za-z0-9_\.]+)`?/i', $sql, $matches)) {
+        foreach ($matches[1] as $tableName) {
+            $tables[$tableName] = 'U';
+        }
+    }
+    // DELETE文
+    if (preg_match_all('/\bDELETE\s+FROM\s+`?([A-Za-z0-9_\.]+)`?/i', $sql, $matches)) {
+        foreach ($matches[1] as $tableName) {
+            $tables[$tableName] = 'D';
         }
     }
 
-    /* --- 2) CREATE TEMP[ORARY] TABLE ------------------------- */
-    if (preg_match_all('/create\s+(?:temporary|temp)?\s*table\s+([a-z0-9_.]+)/i', $sql, $m)) {
-        foreach ($m[1] as $t) {
-            $crud["{$t}@temp"]['C'] = true;
+    // 2. 特殊構文の検出
+    // SELECT ... INTO TEMP TABLE 文
+    if (preg_match_all('/\bSELECT\b[\s\S]*?\bINTO\s+(?:TEMPORARY\s+|TEMP\s+)?`?([A-Za-z0-9_\.]+)`?/i', $sql, $matches)) {
+        foreach ($matches[1] as $tableName) {
+            $tables[$tableName] = 'C';  // 新規作成されるテーブル
+        }
+    }
+    // WITH CTE 文
+    if (preg_match_all('/\bWITH\s+`?([A-Za-z0-9_]+)`?\s+AS\s*\(/i', $sql, $matches)) {
+        foreach ($matches[1] as $cteName) {
+            $tables["{$cteName}@temp"] = 'C';  // CTEは一時テーブルとしてC分類
         }
     }
 
-    /* --- 3) INSERT ------------------------------------------- */
-    if (preg_match_all('/insert\s+into\s+([a-z0-9_.]+)/i', $sql, $m)) {
-        foreach ($m[1] as $t) $crud[$t]['C'] = true;
-    }
-
-    /* --- 4) UPDATE ------------------------------------------- */
-    if (preg_match_all('/update\s+([a-z0-9_.]+)/i', $sql, $m)) {
-        foreach ($m[1] as $t) $crud[$t]['U'] = true;
-    }
-
-    /* --- 5) DELETE ------------------------------------------- */
-    if (preg_match_all('/delete\s+from\s+([a-z0-9_.]+)/i', $sql, $m)) {
-        foreach ($m[1] as $t) $crud[$t]['D'] = true;
-    }
-
-    /* --- 6) SELECT 系 ---------------------------------------- */
-    if (strpos($sqlL, 'select') !== false) {
-        /* 6-A) FROM / JOIN テーブル → R */
-        if (preg_match_all('/(?:from|join)\s+([a-z0-9_.]+)/i', $sql, $m)) {
-            foreach ($m[1] as $t) $crud[$t]['R'] = true;
-        }
-        /* 6-B) SELECT … INTO TEMP → C */
-        if (preg_match_all('/into\s+temp\s+([a-z0-9_.]+)/i', $sql, $m)) {
-            foreach ($m[1] as $t) $crud["{$t}@temp"]['C'] = true;
+    // 3. JOINおよびFROM句の参照テーブル抽出（サブクエリ除外）
+    if (preg_match_all('/\b(?:FROM|JOIN)\s+(?!\()`?([A-Za-z0-9_\.]+)`?/i', $sql, $matches)) {
+        foreach ($matches[1] as $tableName) {
+            // 既に主操作で登録済みでない場合にR分類
+            if (!isset($tables[$tableName])) {
+                $tables[$tableName] = 'R';
+            }
         }
     }
 
-    /* --- 7) WITH 句 (CTE) ------------------------------------ */
-    if (preg_match_all('/with\s+([a-z0-9_]+)\s+as\s*\(/i', $sql, $m)) {
-        foreach ($m[1] as $cte) $crud["{$cte}@temp"]['C'] = true;
-    }
-
-    /* --- 8) UPDATE / DELETE + FROM (読取テーブル) ------------ */
-    if (preg_match_all('/\b(?:update|delete)[\s\S]*?\bfrom\s+([a-z0-9_.]+)/i', $sql, $m)) {
-        foreach ($m[1] as $t) $crud[$t]['R'] = true;
-    }
-
-    /* --- 正規化： 必ず C/R/U/D の 4 キーを持たせる ----------- */
-    foreach ($crud as $tbl => $ops) {
-        $crud[$tbl] = array_merge(['C'=>false,'R'=>false,'U'=>false,'D'=>false], $ops);
-    }
-    return $crud;
+    return $tables;
 }
