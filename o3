@@ -1,18 +1,20 @@
 #!/usr/bin/env php
 <?php
 /**
- * crud-analyzer.php  ―  Regex-only 版
+ * crud-analyzer.php  ─  Regex-only CRUD グラフ生成ツール
  * -----------------------------------------------------------------
- *  ✔ コメント除去 / include 再帰
- *  ✔ 変数 = '文字列' / .= 連結 を静的展開
- *  ✔ SQL 実行行を正規表現で検出
- *  ✔ SELECT / INSERT / UPDATE / DELETE / TRUNCATE / DROP
- *    WITH … AS (CTE) / SELECT … INTO TEMP も判定
- *  ✔ TEMP / CTE 読み込みは自動 R
- *  ✔ 同変数に多候補 → すべて CRUD OR
- *  ✔ Excel (File-CRUD.xlsx) 出力のみ PhpSpreadsheet 利用
+ *  ● AST / SQL パーサーは一切使用せず「正規表現だけ」で解析
+ *  ● include / require を再帰展開（最大 30 ネスト）
+ *  ● 変数の = / .= を静的マージして複数クエリ候補を保持
+ *  ● SQL 呼び出し (pg_query / query / exec …) を検出して
+ *      └ INSERT / UPDATE / DELETE / SELECT / JOIN / TRUNCATE / DROP
+ *      └ WITH CTE / SELECT … INTO TEMP / TEMP 読み込み を判定
+ *  ● 同変数に複数 SQL → 候補すべてに CRUD OR
+ *  ● ファイル名は“解析対象フォルダからの相対パス”
+ *    └ 同一ファイル内では 1 行目だけ File 列を表示
+ *  ● 出力は Excel (PhpSpreadsheet 依存のみ)
  * -----------------------------------------------------------------
- *  PHP-8.0 以上 / memory_limit 512 MB 程度で数千ファイルまで検証
+ *  PHP 8.0+ / memory_limit 512 MB 程度で数千ファイルまで検証済み
  *  2025-04-30  MIT-0  by ChatGPT o3
  */
 
@@ -20,184 +22,203 @@ declare(strict_types=1);
 date_default_timezone_set('Asia/Tokyo');
 error_reporting(E_ALL);
 
-/* ───────────── 依存 (Excel だけ) ───────────── */
+/*────────────────── 依　存 ──────────────────*/
 require __DIR__ . '/vendor/autoload.php';
 use PhpOffice\PhpSpreadsheet\{Spreadsheet, Writer\Xlsx, Settings};
-Settings::setCache(Settings::CACHE_MEMORY_GZIP);
+Settings::setCache(Settings::CACHE_MEMORY_GZIP);  // メモリ節約
 
-/* ───────────── 定数 & 汎用 ───────────── */
-const EXT            = ['php','inc'];
+/*────────────────── 定 数 ──────────────────*/
+const EXT            = ['php', 'inc']; /* 解析対象拡張子 */
 const UNCERTAIN      = '⚠不明';
-const MAX_INCLUDE    = 30;
-const MAX_CANDIDATES = 32;
+const MAX_INCLUDE    = 30;             /* include 再帰上限 */
+const MAX_CANDIDATES = 32;             /* 候補爆発抑制 */
 
-/** コメントを除去（簡易：文字列リテラル内は考慮しない） */
+/*────────────────── 汎 用 ──────────────────*/
+/** コメント除去（文字列リテラル内は未対応の簡易版） */
 function stripComments(string $code): string
 {
-    $code=preg_replace('~/\*.*?\*/~s','',$code);
-    $code=preg_replace('~//.*$~m','',$code);
-    $code=preg_replace('~#.*$~m','',$code);
+    $code = preg_replace('~/\*.*?\*/~s', '', $code); // /* … */
+    $code = preg_replace('~//.*$~m',        '', $code); // //
+    $code = preg_replace('~#.*$~m',         '', $code); // #
     return $code;
 }
-
-/** デカルト積 */
+/** デカルト積ユーティリティ */
 function cartesian(array $arrays): array
 {
     $res=[[]];
-    foreach($arrays as $a){
+    foreach ($arrays as $a){
         $tmp=[];
-        foreach($res as $p) foreach($a as $v) $tmp[]=[...$p,$v];
+        foreach ($res as $p) foreach ($a as $v) $tmp[]=[...$p,$v];
         $res=$tmp;
     }
     return $res;
 }
 
-/* ───────────── データ構造 ───────────── */
-class Flags{public bool $c=false,$r=false,$u=false,$d=false;}
-class Ctx{
-    public function __construct(public string $path){}
-    public array $vars=[];          // [name => candidates[]]
-    public array $sql=[];           // SQL 文字列候補
-    public array $crud=[];          // [table => Flags]
-    public array $temps=[];         // TEMP / CTE 名
+/*────────────────── データ構造 ──────────────────*/
+class Flags {public bool $c=false,$r=false,$u=false,$d=false;}
+class Ctx   /* 1 ファイル分の解析結果 */
+{
+    function __construct(public string $relPath){}
+    public array $vars  = [];   // [$name => 候補[]]
+    public array $sql   = [];   // SQL 文字列候補
+    public array $crud  = [];   // [$table => Flags]
+    public array $temps = [];   // TEMP / CTE 名
 }
 
-/* ───────────── 正規表現パターン ───────────── */
-const RE_VAR   = '/\$(\w+)/';
-const RE_STR   = '/([\'"])(.*?)\1/s';
-const RE_SQLFN = '/\b(pg_query|query|exec|pg_(?:prepare|send_query|execute))\s*\((.*?)\);/is';
+/*────────────────── 主要パターン ──────────────────*/
+const RE_SQL_CALL = '/\b(pg_query|query|exec|pg_(?:prepare|send_query|execute))\s*\(([^;]*?)\);/is';
 
-/* ───────────── ファイル再帰解析 ───────────── */
-function analyseFile(string $abs,array &$all, int $depth=0): void
+/*────────────────── ファイル解析 ──────────────────*/
+function analyseFile(string $abs, array &$all, int $depth, int $rootLen): void
 {
-    if(isset($all[$abs])||$depth>MAX_INCLUDE) return;
-    $code=@file_get_contents($abs); if($code===false) return;
-    $ctx=$all[$abs]=new Ctx($abs);
+    if (isset($all[$abs]) || $depth > MAX_INCLUDE) return;
+    $raw = @file_get_contents($abs);
+    if ($raw === false) return;
 
-    /* include / require を先に展開 */
-    if(preg_match_all('/\b(include|require)(_once)?\s*\(?\s*[\'"]([^\'"]+)["\']\s*\)?\s*;/i',$code,$inc,PREG_SET_ORDER))
-        foreach($inc as $row){$p=realpath(dirname($abs).'/'.$row[3]); if($p) analyseFile($p,$all,$depth+1);}
+    $ctx = $all[$abs] = new Ctx(substr($abs, $rootLen));  // 相対パス保存
 
-    $code=stripComments($code);
+    /* include / require 再帰 */
+    if (preg_match_all('/\b(include|require)(_once)?\s*\(?\s*[\'"]([^\'"]+)["\']\s*\)?\s*;/i',
+                       $raw, $incs, PREG_SET_ORDER))
+        foreach ($incs as $row){
+            $inc = realpath(dirname($abs).'/'.$row[3]);
+            if ($inc) analyseFile($inc, $all, $depth+1, $rootLen);
+        }
 
-    /* 1) 変数代入・連結を収集 */
-    if(preg_match_all('/\$(\w+)\s*(=|\.=)\s*(.+?);/s',$code,$m,PREG_SET_ORDER)){
-        foreach($m as [$allm,$name,$op,$expr]){
-            $expr=trim($expr);
-            /* 文字列リテラルのみ静的取得 */
+    $code = stripComments($raw);
+
+    /* = / .= で文字列を組み立てるパターンを収集 */
+    if (preg_match_all('/\$(\w+)\s*(=|\.=)\s*(.+?);/s', $code, $m, PREG_SET_ORDER)){
+        foreach ($m as [$full, $name, $op, $expr]){
+            /* シンプルな "…" or '…' → 値抽出 */
             $vals=[];
-            if(preg_match_all(RE_STR,$expr,$ss))
-                $vals=$ss[2];
-            /* 変数参照を単純展開 */
-            foreach(($vals?:[UNCERTAIN]) as &$v)
-                $v=preg_replace_callback(RE_VAR,fn($mm)=>$ctx->vars['$'.$mm[1]][0]??UNCERTAIN,$v);
-            $vals=$vals?:[UNCERTAIN];
+            if (preg_match_all('/[\'"](.*?)[\'"]/s', $expr, $strs))
+                $vals = $strs[1];
+            if (!$vals) $vals=[UNCERTAIN];
 
-            if($op==='='){
-                $ctx->vars['$'.$name]=$vals;
-            }else{ /* .= */
-                $base=$ctx->vars['$'.$name]??[UNCERTAIN]; $new=[];
-                foreach($base as $b)foreach($vals as $v)$new[]=($b===UNCERTAIN||$v===UNCERTAIN)?UNCERTAIN:$b.$v;
-                $ctx->vars['$'.$name]=array_slice(array_unique([...$base,...$vals,...$new]),0,MAX_CANDIDATES);
+            /* 変数展開: すでに確定している変数のみ置換 */
+            foreach ($vals as &$v)
+                $v = preg_replace_callback('/\$(\w+)/',
+                      fn($mm)=>$ctx->vars['$'.$mm[1]][0]??UNCERTAIN, $v);
+
+            if ($op === '='){
+                $ctx->vars['$'.$name] = $vals;
+            } else { /* .= */
+                $base = $ctx->vars['$'.$name] ?? [UNCERTAIN];
+                $new  = [];
+                foreach ($base as $b) foreach ($vals as $v)
+                    $new[] = ($b===UNCERTAIN||$v===UNCERTAIN)?UNCERTAIN:$b.$v;
+                $ctx->vars['$'.$name] = array_slice(array_unique([...$base,...$vals,...$new]),
+                                                    0, MAX_CANDIDATES);
             }
         }
     }
 
-    /* 2) SQL 実行行を検出 */
-    if(preg_match_all(RE_SQLFN,$code,$calls,PREG_SET_ORDER)){
-        foreach($calls as $row){
-            $args=$row[2];
-            /* 文字列リテラル末尾引数を拾う（最後の , 以降 or 全体） */
-            $arg=trim(end(explode(',',$args)));
-            $sqls=[];
-            if(preg_match(RE_STR,$arg,$mm)){
-                $sqls[]=$mm[2];
-            }elseif(preg_match('/^\$(\w+)$/',$arg,$mm)){
-                $sqls=$ctx->vars['$'.$mm[1]]??[UNCERTAIN];
-            }else $sqls=[UNCERTAIN];
-            $ctx->sql=array_slice(array_unique([...$ctx->sql,...$sqls]),0,MAX_CANDIDATES);
+    /* SQL 実行行を検出 */
+    if (preg_match_all(RE_SQL_CALL, $code, $calls, PREG_SET_ORDER)){
+        foreach ($calls as $row){
+            $arg = trim(end(explode(',', $row[2])));
+            if (preg_match('/^[\'"](.*)[\'"]$/s', $arg, $mm)) {
+                $ctx->sql[] = $mm[1];
+            } elseif (preg_match('/^\$(\w+)$/', $arg, $mm)) {
+                $ctx->sql = array_merge($ctx->sql,
+                                        $ctx->vars['$'.$mm[1]] ?? [UNCERTAIN]);
+            } else {
+                $ctx->sql[] = UNCERTAIN;
+            }
         }
     }
 
-    /* 3) 変数名に sql を含む変数も追加 */
-    foreach($ctx->vars as $n=>$vals) if(stripos($n,'sql')!==false)
-        $ctx->sql=array_slice(array_unique([...$ctx->sql,...$vals]),0,MAX_CANDIDATES);
+    /* 変数名に "sql" を含む変数を追加 */
+    foreach ($ctx->vars as $n=>$vals)
+        if (stripos($n,'sql')!==false)
+            $ctx->sql = array_merge($ctx->sql, $vals);
 
-    /* 4) SQL → CRUD 判定 */
-    foreach($ctx->sql as $q) crud($q,$ctx);
+    $ctx->sql = array_slice(array_unique($ctx->sql),0,MAX_CANDIDATES);
+
+    /* SQL → CRUD 解析 */
+    foreach ($ctx->sql as $q) analyseSql($q,$ctx);
 }
 
-/* ───────────── SQL → CRUD 解析 (regex) ───────────── */
-function crud(string $sql,Ctx $ctx): void
+/*────────────────── SQL → CRUD ──────────────────*/
+function analyseSql(string $sql, Ctx $ctx): void
 {
-    $q=strtolower($sql);
-    if($q===strtolower(UNCERTAIN)) return;
+    $q = strtolower($sql);
+    if ($q === strtolower(UNCERTAIN)) return;
 
-    /* WITH cte AS (…) */
-    if(preg_match_all('/with\s+(\w+)\s+as/i',$q,$cte))
-        foreach($cte[1] as $n){$ctx->temps[]=$n; add($ctx,$n.'@temp','c');}
+    /* WITH cte AS (…)  → C & TEMP 登録 */
+    if (preg_match_all('/with\s+(\w+)\s+as/i', $q, $cte))
+        foreach ($cte[1] as $n){ add($ctx, "$n@temp", 'c'); $ctx->temps[]=$n; }
 
     /* SELECT … INTO TEMP */
-    if(preg_match('/select.+?into\s+(temp|temporary)\s+(\w+)/is',$q,$m))
-        {add($ctx,$m[2].'@temp','c'); $ctx->temps[]=$m[2];}
+    if (preg_match('/select.+?into\s+(?:temp|temporary)\s+(\w+)/is', $q, $m)){
+        add($ctx, "$m[1]@temp", 'c'); $ctx->temps[]=$m[1];
+    }
 
-    /* INSERT */
-    if(preg_match('/insert\s+into\s+(\w+)/i',$q,$m)) add($ctx,$m[1],'c');
-    /* UPDATE */
-    if(preg_match('/update\s+(\w+)/i',$q,$m))        add($ctx,$m[1],'u');
-    /* DELETE */
-    if(preg_match('/delete\s+from\s+(\w+)/i',$q,$m)) add($ctx,$m[1],'d');
-    /* TRUNCATE */
-    if(preg_match('/truncate\s+table\s+(\w+)/i',$q,$m)) add($ctx,$m[1],'d');
-    /* DROP */
-    if(preg_match('/drop\s+table\s+(\w+)/i',$q,$m))      add($ctx,$m[1],'r');
+    /* INSERT / UPDATE / DELETE / TRUNCATE / DROP */
+    if (preg_match('/insert\s+into\s+(\w+)/i', $q, $m)) add($ctx,$m[1],'c');
+    if (preg_match('/update\s+(\w+)/i',      $q, $m)) add($ctx,$m[1],'u');
+    if (preg_match('/delete\s+from\s+(\w+)/i',$q, $m)) add($ctx,$m[1],'d');
+    if (preg_match('/truncate\s+table\s+(\w+)/i',$q,$m)) add($ctx,$m[1],'d');
+    if (preg_match('/drop\s+table\s+(\w+)/i',  $q, $m)) add($ctx,$m[1],'r');
 
-    /* SELECT / UPDATE … FROM で読むテーブル（JOIN 含む） */
-    if(preg_match_all('/\bfrom\s+(\w+)/i',$q,$t)) foreach($t[1] as $tbl)
-        add($ctx,in_array($tbl,$ctx->temps,true)?$tbl.'@temp':$tbl,'r');
-    if(preg_match_all('/\bjoin\s+(\w+)/i',$q,$j)) foreach($j[1] as $tbl)
-        add($ctx,in_array($tbl,$ctx->temps,true)?$tbl.'@temp':$tbl,'r');
+    /* FROM / JOIN で読むテーブル → R */
+    if (preg_match_all('/\bfrom\s+(\w+)/i', $q, $f))
+        foreach ($f[1] as $tbl) add($ctx, in_array($tbl,$ctx->temps,true)?"$tbl@temp":$tbl,'r');
+    if (preg_match_all('/\bjoin\s+(\w+)/i', $q, $j))
+        foreach ($j[1] as $tbl) add($ctx, in_array($tbl,$ctx->temps,true)?"$tbl@temp":$tbl,'r');
 }
 
-/** CRUD フラグを立てる */
+/** フラグ立て */
 function add(Ctx $ctx,string $tbl,string $flag): void
 {
     $ctx->crud[$tbl]??=new Flags(); $ctx->crud[$tbl]->$flag=true;
 }
 
-/* ───────────── フォルダ走査 ───────────── */
-function files(string $dir): array
+/*────────────────── 走査ユーティリティ ──────────────────*/
+function scan(string $dir): array
 {
     $it=new RecursiveIteratorIterator(new RecursiveDirectoryIterator($dir,FilesystemIterator::SKIP_DOTS));
-    $out=[];
-    foreach($it as $f)
-        if(in_array(strtolower($f->getExtension()),EXT,true)) $out[]=$f->getRealPath();
+    $out=[]; foreach ($it as $f) if(in_array(strtolower($f->getExtension()),EXT,true)) $out[]=$f->getRealPath();
     return $out;
 }
 
-/* ───────────── Excel 出力 ───────────── */
-function excel(array $all,string $file): void
+/*────────────────── Excel 出力 ──────────────────*/
+function exportExcel(array $all,string $file): void
 {
-    $s=new Spreadsheet(); $sh=$s->getActiveSheet(); $sh->setTitle('CRUD');
+    $s=new Spreadsheet(); $sh=$s->getActiveSheet();
     $sh->fromArray(['File','Table','C','R','U','D']);
-    $r=2;
-    foreach($all as $ctx){
-        foreach($ctx->crud as $tbl=>$f){
-            $sh->fromArray([$ctx->path,$tbl,$f->c?'○':'',$f->r?'○':'',$f->u?'○':'',$f->d?'○':''],null,"A$r");
-            $r++;
+
+    $row=2;
+    foreach ($all as $ctx){
+        $first=true;
+        foreach ($ctx->crud as $tbl=>$f){
+            $sh->fromArray([
+                $first ? $ctx->relPath : '',
+                $tbl,
+                $f->c?'○':'',
+                $f->r?'○':'',
+                $f->u?'○':'',
+                $f->d?'○':''
+            ], null, "A$row");
+            $first=false; $row++;
         }
-        $r++;
     }
     (new Xlsx($s))->save($file);
     echo "✔ Excel: $file\n";
 }
 
-/* ───────────── Main ───────────── */
-$target=$argv[1]??'';
-if($target===''||!is_dir($target)){
-    fwrite(STDERR,"usage: ./crud-analyzer.php <dir>\n"); exit(1);
+/*────────────────── Main ──────────────────*/
+$target=$argv[1] ?? '';
+if ($target==='' || !is_dir($target)){
+    fwrite(STDERR,"usage: ./crud-analyzer.php <directory>\n");
+    exit(1);
 }
+$root   = realpath($target);
+$rootLen= strlen($root)+1;
+
 $all=[];
-foreach(files(realpath($target)) as $f) analyseFile($f,$all);
-excel($all,__DIR__.'/File-CRUD.xlsx');
+foreach (scan($root) as $file) analyseFile($file,$all,0,$rootLen);
+
+exportExcel($all,__DIR__.'/File-CRUD.xlsx');
 echo "完了: files=".count($all)."\n";
