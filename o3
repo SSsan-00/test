@@ -1,56 +1,46 @@
 #!/usr/bin/env php
 <?php
 /**
- * crud-analyzer.php  –  File-CRUD 図ジェネレータ
+ * crud-analyzer.php  ―  Regex-only 版
  * -----------------------------------------------------------------
- *  ○ include/require 再帰（循環検知）
- *  ○ 変数・定数・複雑式 静的評価（多値対応）
- *  ○ ユーザー関数テーブル＋束縛付き再帰評価
- *  ○ エイリアス / JOIN / サブクエリ / WITH(CTE) / SELECT … INTO TEMP
- *  ○ CREATE TEMP / DROP / TRUNCATE / ON CONFLICT
- *  ○ “同じ変数に複数 SQL” も候補すべて CRUD OR
- *  ○ AST が読めないファイルは正規表現フォールバック
- *  ○ コメント除去 → AST サイズ縮小
- *  ○ 一時配列 shrink() で解放 → メモリ節約
- *  ○ PhpSpreadsheet を GZIP キャッシュ
- *  ○ Excel (File-CRUD.xlsx) & Log.txt 出力
+ *  ✔ コメント除去 / include 再帰
+ *  ✔ 変数 = '文字列' / .= 連結 を静的展開
+ *  ✔ SQL 実行行を正規表現で検出
+ *  ✔ SELECT / INSERT / UPDATE / DELETE / TRUNCATE / DROP
+ *    WITH … AS (CTE) / SELECT … INTO TEMP も判定
+ *  ✔ TEMP / CTE 読み込みは自動 R
+ *  ✔ 同変数に多候補 → すべて CRUD OR
+ *  ✔ Excel (File-CRUD.xlsx) 出力のみ PhpSpreadsheet 利用
  * -----------------------------------------------------------------
- *  2025-04-30   MIT-0   by ChatGPT o3
+ *  PHP-8.0 以上 / memory_limit 512 MB 程度で数千ファイルまで検証
+ *  2025-04-30  MIT-0  by ChatGPT o3
  */
 
 declare(strict_types=1);
 date_default_timezone_set('Asia/Tokyo');
 error_reporting(E_ALL);
 
-/*─────────────────────────── 依存 ───────────────────────────*/
+/* ───────────── 依存 (Excel だけ) ───────────── */
 require __DIR__ . '/vendor/autoload.php';
-use PhpParser\{Error as PhpParserError, Node, NodeTraverser,
-               NodeVisitorAbstract, ParserFactory};
-use PHPSQLParser\PHPSQLParser;
 use PhpOffice\PhpSpreadsheet\{Spreadsheet, Writer\Xlsx, Settings};
+Settings::setCache(Settings::CACHE_MEMORY_GZIP);
 
-/*──────────────────── ランタイム／キャッシュ設定 ─────────────*/
-ini_set('memory_limit', '1024M');       // 必要に応じて調整 or -1
-gc_enable();                            // GC を確実に有効化
-Settings::setCache(Settings::CACHE_MEMORY_GZIP);  // Excel セルを GZIP
-
-/*──────────────────── 定数 & ヘルパ ────────────────────────*/
-const UNCERTAIN      = '⚠不明';
+/* ───────────── 定数 & 汎用 ───────────── */
 const EXT            = ['php','inc'];
-const MAX_INCLUDE    = 50;              // include/require 再帰上限
-const MAX_FUNC_DEPTH = 5;               // 関数呼び出し再帰上限
-const MAX_CANDIDATES = 32;              // 多値爆発抑制（超過で UNCERTAIN）
+const UNCERTAIN      = '⚠不明';
+const MAX_INCLUDE    = 30;
+const MAX_CANDIDATES = 32;
 
-/** コメントを簡易除去（文字列内は考慮しない） */
+/** コメントを除去（簡易：文字列リテラル内は考慮しない） */
 function stripComments(string $code): string
 {
-    $code=preg_replace('~/\*.*?\*/~s','',$code);   // /**/ ブロック
-    $code=preg_replace('~//.*$~m','',$code);       // // 行
-    $code=preg_replace('~#.*$~m','',$code);        // # 行
+    $code=preg_replace('~/\*.*?\*/~s','',$code);
+    $code=preg_replace('~//.*$~m','',$code);
+    $code=preg_replace('~#.*$~m','',$code);
     return $code;
 }
 
-/** デカルト積ユーティリティ */
+/** デカルト積 */
 function cartesian(array $arrays): array
 {
     $res=[[]];
@@ -62,446 +52,152 @@ function cartesian(array $arrays): array
     return $res;
 }
 
-/*──────────────────── データモデル ─────────────────────────*/
-class CrudFlags{public bool $c=false,$r=false,$u=false,$d=false;}
-
-class FunctionDef{
-    public function __construct(
-        public string $name,
-        public array  $params,       // [ '$param' => defaultCandidates[] ]
-        public Node\Stmt\Function_ $body
-    ){}
-}
-
-class FileContext{
+/* ───────────── データ構造 ───────────── */
+class Flags{public bool $c=false,$r=false,$u=false,$d=false;}
+class Ctx{
     public function __construct(public string $path){}
-    /** @var array<string,string[]> */ public array $variables=[];
-    /** @var string[]                 */ public array $sqlCandidates=[];
-    /** @var array<string,CrudFlags>  */ public array $crud=[];
-    /** @var string[]                 */ public array $tempTables=[];
-
-    /** 解析後に重い一時配列を解放してメモリ回収 */
-    public function shrink(): void
-    {
-        $this->variables=$this->sqlCandidates=$this->tempTables=[];
-        gc_collect_cycles();
-    }
+    public array $vars=[];          // [name => candidates[]]
+    public array $sql=[];           // SQL 文字列候補
+    public array $crud=[];          // [table => Flags]
+    public array $temps=[];         // TEMP / CTE 名
 }
 
-class Project{
-    /** @var array<string,FileContext> */ public array $files=[];
-    /** @var array<string,FunctionDef> */ public array $funcDefs=[];
-    public array $log=[];
-    function addLog(string $m){$this->log[]=date('[H:i:s] ').$m;}
-}
+/* ───────────── 正規表現パターン ───────────── */
+const RE_VAR   = '/\$(\w+)/';
+const RE_STR   = '/([\'"])(.*?)\1/s';
+const RE_SQLFN = '/\b(pg_query|query|exec|pg_(?:prepare|send_query|execute))\s*\((.*?)\);/is';
 
-/*──────────────── ExpressionEvaluator ────────────────*/
-class ExpressionEvaluator
+/* ───────────── ファイル再帰解析 ───────────── */
+function analyseFile(string $abs,array &$all, int $depth=0): void
 {
-    public function __construct(
-        private FileContext $ctx,
-        private array $locals=[],
-        private int   $depth=0
-    ){}
-    /** @return string[]|null */
-    public function eval(Node $n): ?array
-    {
-        if($this->depth>MAX_FUNC_DEPTH) return [UNCERTAIN];
+    if(isset($all[$abs])||$depth>MAX_INCLUDE) return;
+    $code=@file_get_contents($abs); if($code===false) return;
+    $ctx=$all[$abs]=new Ctx($abs);
 
-        /* 1) 文字列リテラル */
-        if($n instanceof Node\Scalar\String_) return [$n->value];
+    /* include / require を先に展開 */
+    if(preg_match_all('/\b(include|require)(_once)?\s*\(?\s*[\'"]([^\'"]+)["\']\s*\)?\s*;/i',$code,$inc,PREG_SET_ORDER))
+        foreach($inc as $row){$p=realpath(dirname($abs).'/'.$row[3]); if($p) analyseFile($p,$all,$depth+1);}
 
-        /* 2) Encapsed / ヒアドック */
-        if($n instanceof Node\Scalar\Encapsed){
-            $out=[''];
-            foreach($n->parts as $p){
-                $seg=$this->rec($p)??[UNCERTAIN]; $tmp=[];
-                foreach($out as $b)foreach($seg as $s)$tmp[]=$b.$s;
-                $out=$tmp;
-            }
-            return array_slice(array_unique($out),0,MAX_CANDIDATES);
-        }
-
-        /* 3) 変数 */
-        if($n instanceof Node\Expr\Variable && is_string($n->name))
-            return $this->locals['$'.$n->name]??$this->ctx->variables['$'.$n->name]??null;
-
-        /* 4) '.' 連結 */
-        if($n instanceof Node\Expr\BinaryOp\Concat)
-            return $this->cross($n->left,$n->right,fn($a,$b)=>$a.$b);
-
-        /* 5) 算術 (+ - * / %) → 文字列 */
-        if($n instanceof Node\Expr\BinaryOp
-           && method_exists($n,'getOperatorSigil')
-           && in_array($n->getOperatorSigil(),['+','-','*','/','%'],true))
-            return $this->cross(
-                $n->left,$n->right,
-                fn($a,$b)=>is_numeric($a)&&is_numeric($b)
-                    ? (string)eval("return {$a}{$n->getOperatorSigil()}{$b};")
-                    : UNCERTAIN
-            );
-
-        /* 6) 三項演算子 */
-        if($n instanceof Node\Expr\Ternary)
-            return array_slice(array_unique([
-                ...($this->rec($n->if ?? $n->cond)??[UNCERTAIN]),
-                ...($this->rec($n->else)??[UNCERTAIN])
-            ]),0,MAX_CANDIDATES);
-
-        /* 7) Null 合体 */
-        if($n instanceof Node\Expr\BinaryOp\Coalesce)
-            return array_slice(array_unique([
-                ...($this->rec($n->left)??[UNCERTAIN]),
-                ...($this->rec($n->right)??[UNCERTAIN])
-            ]),0,MAX_CANDIDATES);
-
-        /* 8) sprintf / implode / join */
-        if($n instanceof Node\Expr\FuncCall && $n->name instanceof Node\Name){
-            $fn=strtolower((string)$n->name);
-            if(in_array($fn,['sprintf','vsprintf'])){
-                $fmt=$this->rec($n->args[0]->value)??[UNCERTAIN];
-                $sets=[]; for($i=1;$i<count($n->args);$i++) $sets[]=$this->rec($n->args[$i]->value)??[UNCERTAIN];
-                $out=[]; foreach($fmt as $f) foreach(cartesian($sets) as $s) $out[]=vsprintf($f,$s);
-                return array_slice(array_unique($out),0,MAX_CANDIDATES);
-            }
-            if(in_array($fn,['implode','join'])&&count($n->args)===2){
-                $g=$this->rec($n->args[0]->value)[0]??','; $arr=$this->rec($n->args[1]->value);
-                if($arr&&!in_array(UNCERTAIN,$arr,true)) return [$g.implode($g,$arr)];
-            }
-        }
-        return null;
-    }
-    private function rec(Node $n):?array{return(new self($this->ctx,$this->locals,$this->depth+1))->eval($n);}
-    private function cross(Node $l,Node $r,callable $f):array{
-        $a=$this->rec($l)??[UNCERTAIN]; $b=$this->rec($r)??[UNCERTAIN]; $o=[];
-        foreach($a as $x)foreach($b as $y){
-            $o[]=$f($x,$y);
-            if(count($o)>=MAX_CANDIDATES){$o[]=UNCERTAIN;break 2;}
-        }
-        return array_unique($o);
-    }
-}
-
-/*──────────────── Visitor: 関数定義収集 ─────────────────*/
-class FunctionCollectVisitor extends NodeVisitorAbstract
-{
-    public function __construct(private Project $proj,private string $file){}
-    public function enterNode(Node $n):null|int|Node{
-        if(!$n instanceof Node\Stmt\Function_) return null;
-        $params=[];
-        foreach($n->getParams() as $p){
-            $def=$p->default?(new ExpressionEvaluator($this->proj->files[$this->file]))->eval($p->default):[UNCERTAIN];
-            $params['$'.$p->var->name]=$def;
-        }
-        $this->proj->funcDefs[(string)$n->name]=new FunctionDef((string)$n->name,$params,$n);
-        return null;
-    }
-}
-
-/*──────────────── Visitor: 変数代入 / 結合 ─────────────────*/
-class EvaluateVisitor extends NodeVisitorAbstract
-{
-    private ExpressionEvaluator $ev;
-    public function __construct(private FileContext $ctx,private Project $proj,private array $locals=[]) {}
-    public function beforeTraverse(array $n){$this->ev=new ExpressionEvaluator($this->ctx,$this->locals);}
-    public function enterNode(Node $n):null|int|Node
-    {
-        if($n instanceof Node\Expr\Assign && $n->var instanceof Node\Expr\Variable && is_string($n->var->name)){
-            $name='$'.$n->var->name; $vals=$this->ev->eval($n->expr)??[UNCERTAIN];
-            $this->ctx->variables[$name]=array_slice(array_unique([...($this->ctx->variables[$name]??[]), ...$vals]),0,MAX_CANDIDATES);
-        }
-        if($n instanceof Node\Expr\AssignOp\Concat && $n->var instanceof Node\Expr\Variable && is_string($n->var->name)){
-            $name='$'.$n->var->name; $add=$this->ev->eval($n->expr)??[UNCERTAIN];
-            $base=$this->ctx->variables[$name]??[UNCERTAIN]; $new=[];
-            foreach($base as $b)foreach($add as $a)$new[]=($b===UNCERTAIN||$a===UNCERTAIN)?UNCERTAIN:$b.$a;
-            $this->ctx->variables[$name]=array_slice(array_unique([...$base,...$add,...$new]),0,MAX_CANDIDATES);
-        }
-        return null;
-    }
-}
-
-/*──────────────── Visitor: SQL 抽出 & 関数再帰 ───────────────*/
-class SqlCallVisitor extends NodeVisitorAbstract
-{
-    public function __construct(private FileContext $ctx,private Project $proj,private array $locals=[]) {}
-    private ExpressionEvaluator $ev;
-    public function beforeTraverse(array $n){$this->ev=new ExpressionEvaluator($this->ctx,$this->locals);}
-    public function enterNode(Node $n):null|int|Node
-    {
-        if(!$n instanceof Node\Expr\FuncCall||!$n->name instanceof Node\Name) return null;
-        $fname=(string)$n->name;
-
-        /* ユーザー関数再帰 */
-        if(isset($this->proj->funcDefs[$fname])){
-            $def=$this->proj->funcDefs[$fname]; $bind=[];
-            foreach($def->params as $i=>$pname){
-                $arg=$n->args[$i]->value ?? null;
-                $bind[$pname]=$arg?($this->ev->eval($arg)??[UNCERTAIN]):$def->params[$pname];
-            }
-            if(($this->locals['_depth']??0)<MAX_FUNC_DEPTH){
-                $loc=[...$bind,'_depth'=>($this->locals['_depth']??0)+1];
-                $tr=new NodeTraverser();
-                $tr->addVisitor(new EvaluateVisitor($this->ctx,$this->proj,$loc));
-                $tr->addVisitor(new self($this->ctx,$this->proj,$loc));
-                $tr->traverse($def->body->stmts);
-            }
-        }
-
-        /* SQL 実行系 */
-        $lower=strtolower($fname);
-        if(in_array($lower,['pg_query','query','exec','pg_prepare','pg_send_query','pg_execute'])){
-            $arg=end($n->args)->value ?? null;
-            $vals=$arg?($this->ev->eval($arg)??[UNCERTAIN]):[UNCERTAIN];
-            $this->ctx->sqlCandidates=array_slice(array_unique([...$this->ctx->sqlCandidates,...$vals]),0,MAX_CANDIDATES);
-        }
-        return null;
-    }
-}
-
-/*──────────────── FROM 句→テーブル抽出 ───────────────────*/
-function tablesFrom(array $clause): array
-{
-    $tbls=[];
-    foreach($clause as $c){
-        if(($c['expr_type']??'')==='table')                $tbls[]=$c['table'];
-        if(isset($c['join_type'])&&isset($c['table']))     $tbls[]=$c['table'];
-        if(($c['expr_type']??'')==='subquery' && isset($c['sub_tree']))
-            $tbls=array_merge($tbls,tablesFrom($c['sub_tree']['FROM']??[]));
-    }
-    return $tbls;
-}
-
-/*──────────────── サブクエリ再帰 ─────────────────────────*/
-function analyzeCrudSubTree(array $sub,array $views,array $procs,FileContext $ctx): array
-{
-    $sql=$sub['raw'] ?? null;
-    return $sql ? analyzeCrud($sql,$views,$procs,$ctx) : [];
-}
-
-/*──────────────── SQL → CRUD 判定 ───────────────────────*/
-function analyzeCrud(string $sql,array $views,array $procs,FileContext $ctx): array
-{
-    if($sql===UNCERTAIN) return [];
-    try{$tree=(new PHPSQLParser($sql,true))->parsed;}catch(\Throwable){return [];}
-
-    $r=[];
-    $add=function(string $tbl,string $flag)use(&$r){
-        $r[$tbl]??=new CrudFlags(); $r[$tbl]->$flag=true;
-    };
-    $tag=function($t)use($views,$procs){
-        return in_array($t,$views)?$t.'@view'
-             :(in_array($t,$procs)?$t.'@proc':$t);
-    };
-    $stmt=strtoupper(array_key_first($tree)??'');
-    /* WITH 句 (CTE) */
-    if(isset($tree['WITH']['subqueries'])){
-        foreach($tree['WITH']['subqueries'] as $cte){
-            $n=$cte['alias']['name']??null;
-            if($n){$add($n.'@temp','c'); $ctx->tempTables[]=$n;}
-            if(isset($cte['sub_tree'])){
-                foreach(analyzeCrudSubTree($cte['sub_tree'],$views,$procs,$ctx) as $t=>$f){
-                    $r[$t]??=new CrudFlags();
-                    foreach(['c','r','u','d'] as $k) $r[$t]->$k|=$f->$k;
-                }
-            }
-        }
-    }
-
-    /* ステートメント種別 */
-    switch($stmt){
-        /* FROM 句すべて R + TEMP の読取も R */
-        case'WITH':case'SELECT':case'UPDATE':case'DELETE':case'INSERT':
-            foreach(tablesFrom($tree['FROM']??[]) as $t){
-                $tbl=in_array($t,$ctx->tempTables,true)?$t.'@temp':$tag($t);
-                $add($tbl,'r');
-            }
-            /* SELECT … INTO TEMP */
-            if(isset($tree['INTO'])){
-                foreach($tree['INTO'] as $in)
-                    if(($in['expr_type']??'')==='table'){
-                        $add($in['table'].'@temp','c');
-                        $ctx->tempTables[]=$in['table'];
-                    }
-            }
-            break;
-
-        /* INSERT → C (+U if ON CONFLICT) */
-        case'INSERT':
-            $tbl=$tree['INSERT'][0]['table']??null;
-            if($tbl){
-                $add($tag($tbl),'c');
-                if(isset($tree['ONCONFLICT'])) $add($tag($tbl),'u');
-            }
-            break;
-
-        /* UPDATE → U */
-        case'UPDATE':
-            if(isset($tree['UPDATE'][0]['table'])) $add($tag($tree['UPDATE'][0]['table']),'u');
-            break;
-
-        /* DELETE/TRUNCATE → D */
-        case'DELETE':case'TRUNCATE':
-            foreach(($tree[$stmt]??[]) as $x) if(isset($x['table'])) $add($tag($x['table']),'d');
-            break;
-
-        /* DROP → R（参照破棄として） */
-        case'DROP':
-            if(isset($tree['TABLE'][0]['table'])) $add($tag($tree['TABLE'][0]['table']),'r');
-            break;
-
-        /* CREATE TEMP TABLE → C */
-        case'CREATE':
-            if(isset($tree['TABLE']['no_quotes']['parts'][0])){
-                $t=$tree['TABLE']['no_quotes']['parts'][0];
-                $add($t.'@temp','c'); $ctx->tempTables[]=$t;
-            }
-            break;
-    }
-    return $r;
-}
-
-/*──────────────── フォールバック (正規表現) ───────────────*/
-function fallbackParse(string $code,FileContext $ctx): void
-{
     $code=stripComments($code);
 
-    /* 変数 = / .= 抽出 */
+    /* 1) 変数代入・連結を収集 */
     if(preg_match_all('/\$(\w+)\s*(=|\.=)\s*(.+?);/s',$code,$m,PREG_SET_ORDER)){
-        foreach($m as [$all,$var,$op,$expr]){
-            $parser=(new ParserFactory)->createForNewestSupportedVersion();
-            try{$ast=$parser->parse('<?php '.$expr.';')[0]->expr??null;}catch(\Throwable){$ast=null;}
-            $vals=$ast?(new ExpressionEvaluator($ctx))->eval($ast):[UNCERTAIN];
-            $name='$'.$var;
+        foreach($m as [$allm,$name,$op,$expr]){
+            $expr=trim($expr);
+            /* 文字列リテラルのみ静的取得 */
+            $vals=[];
+            if(preg_match_all(RE_STR,$expr,$ss))
+                $vals=$ss[2];
+            /* 変数参照を単純展開 */
+            foreach(($vals?:[UNCERTAIN]) as &$v)
+                $v=preg_replace_callback(RE_VAR,fn($mm)=>$ctx->vars['$'.$mm[1]][0]??UNCERTAIN,$v);
+            $vals=$vals?:[UNCERTAIN];
+
             if($op==='='){
-                $ctx->variables[$name]=$vals;
-            }else{
-                $base=$ctx->variables[$name]??[UNCERTAIN]; $new=[];
-                foreach($base as $b)foreach($vals as $v)
-                    $new[]=($b===UNCERTAIN||$v===UNCERTAIN)?UNCERTAIN:$b.$v;
-                $ctx->variables[$name]=array_slice(array_unique([...$base,...$vals,...$new]),0,MAX_CANDIDATES);
+                $ctx->vars['$'.$name]=$vals;
+            }else{ /* .= */
+                $base=$ctx->vars['$'.$name]??[UNCERTAIN]; $new=[];
+                foreach($base as $b)foreach($vals as $v)$new[]=($b===UNCERTAIN||$v===UNCERTAIN)?UNCERTAIN:$b.$v;
+                $ctx->vars['$'.$name]=array_slice(array_unique([...$base,...$vals,...$new]),0,MAX_CANDIDATES);
             }
         }
     }
 
-    /* SQL 実行呼び出し */
-    if(preg_match_all('/\b(pg_query|query|exec|pg_prepare|pg_send_query)\s*\(([^;]*?)\);/i',$code,$m,PREG_SET_ORDER)){
-        foreach($m as $row){
-            $arg=trim(end(explode(',',$row[2])));
-            if(preg_match('/^[\'"](.+)[\'"]$/s',$arg,$mm)){
-                $ctx->sqlCandidates[]=$mm[1];
+    /* 2) SQL 実行行を検出 */
+    if(preg_match_all(RE_SQLFN,$code,$calls,PREG_SET_ORDER)){
+        foreach($calls as $row){
+            $args=$row[2];
+            /* 文字列リテラル末尾引数を拾う（最後の , 以降 or 全体） */
+            $arg=trim(end(explode(',',$args)));
+            $sqls=[];
+            if(preg_match(RE_STR,$arg,$mm)){
+                $sqls[]=$mm[2];
             }elseif(preg_match('/^\$(\w+)$/',$arg,$mm)){
-                $ctx->sqlCandidates=array_merge($ctx->sqlCandidates,$ctx->variables['$'.$mm[1]]??[UNCERTAIN]);
-            }else $ctx->sqlCandidates[]=UNCERTAIN;
+                $sqls=$ctx->vars['$'.$mm[1]]??[UNCERTAIN];
+            }else $sqls=[UNCERTAIN];
+            $ctx->sql=array_slice(array_unique([...$ctx->sql,...$sqls]),0,MAX_CANDIDATES);
         }
     }
 
-    /* DROP / TRUNCATE / SELECT … INTO TEMP を直接検出 */
-    if(preg_match_all('~\b(SELECT.+?INTO\s+TEMP\s+\w+|TRUNCATE\s+TABLE\s+\w+|DROP\s+TABLE\s+\w+)~is',$code,$mm))
-        $ctx->sqlCandidates=array_merge($ctx->sqlCandidates,$mm[0]);
+    /* 3) 変数名に sql を含む変数も追加 */
+    foreach($ctx->vars as $n=>$vals) if(stripos($n,'sql')!==false)
+        $ctx->sql=array_slice(array_unique([...$ctx->sql,...$vals]),0,MAX_CANDIDATES);
+
+    /* 4) SQL → CRUD 判定 */
+    foreach($ctx->sql as $q) crud($q,$ctx);
 }
 
-/*──────────────── 走査ユーティリティ ─────────────────────*/
-function scan(string $dir):array{
+/* ───────────── SQL → CRUD 解析 (regex) ───────────── */
+function crud(string $sql,Ctx $ctx): void
+{
+    $q=strtolower($sql);
+    if($q===strtolower(UNCERTAIN)) return;
+
+    /* WITH cte AS (…) */
+    if(preg_match_all('/with\s+(\w+)\s+as/i',$q,$cte))
+        foreach($cte[1] as $n){$ctx->temps[]=$n; add($ctx,$n.'@temp','c');}
+
+    /* SELECT … INTO TEMP */
+    if(preg_match('/select.+?into\s+(temp|temporary)\s+(\w+)/is',$q,$m))
+        {add($ctx,$m[2].'@temp','c'); $ctx->temps[]=$m[2];}
+
+    /* INSERT */
+    if(preg_match('/insert\s+into\s+(\w+)/i',$q,$m)) add($ctx,$m[1],'c');
+    /* UPDATE */
+    if(preg_match('/update\s+(\w+)/i',$q,$m))        add($ctx,$m[1],'u');
+    /* DELETE */
+    if(preg_match('/delete\s+from\s+(\w+)/i',$q,$m)) add($ctx,$m[1],'d');
+    /* TRUNCATE */
+    if(preg_match('/truncate\s+table\s+(\w+)/i',$q,$m)) add($ctx,$m[1],'d');
+    /* DROP */
+    if(preg_match('/drop\s+table\s+(\w+)/i',$q,$m))      add($ctx,$m[1],'r');
+
+    /* SELECT / UPDATE … FROM で読むテーブル（JOIN 含む） */
+    if(preg_match_all('/\bfrom\s+(\w+)/i',$q,$t)) foreach($t[1] as $tbl)
+        add($ctx,in_array($tbl,$ctx->temps,true)?$tbl.'@temp':$tbl,'r');
+    if(preg_match_all('/\bjoin\s+(\w+)/i',$q,$j)) foreach($j[1] as $tbl)
+        add($ctx,in_array($tbl,$ctx->temps,true)?$tbl.'@temp':$tbl,'r');
+}
+
+/** CRUD フラグを立てる */
+function add(Ctx $ctx,string $tbl,string $flag): void
+{
+    $ctx->crud[$tbl]??=new Flags(); $ctx->crud[$tbl]->$flag=true;
+}
+
+/* ───────────── フォルダ走査 ───────────── */
+function files(string $dir): array
+{
     $it=new RecursiveIteratorIterator(new RecursiveDirectoryIterator($dir,FilesystemIterator::SKIP_DOTS));
-    $out=[]; foreach($it as $f) if(in_array(strtolower($f->getExtension()),EXT,true)) $out[]=$f->getRealPath();
-    return $out;
-}
-function detectIncludes(string $code,string $base):array{
-    $out=[]; $code=stripComments($code);
-    if(preg_match_all('/\b(include|require)(_once)?\s*\(?\s*[\'"]([^\'"]+)["\']\s*\)?\s*;/i',$code,$m,PREG_SET_ORDER))
-        foreach($m as $row) if(($abs=realpath($base.'/'.$row[3]))) $out[]=$abs;
+    $out=[];
+    foreach($it as $f)
+        if(in_array(strtolower($f->getExtension()),EXT,true)) $out[]=$f->getRealPath();
     return $out;
 }
 
-/*──────────────── Pass-0: 関数定義収集 ───────────────────*/
-function collectFunctions(Project $p):void{
-    foreach($p->files as $ctx){
-        $code=@file_get_contents($ctx->path); if($code===false)continue;
-        $code=stripComments($code);
-        try{$ast=(new ParserFactory)->createForNewestSupportedVersion()->parse($code);}catch(\Throwable){continue;}
-        $tr=new NodeTraverser(); $tr->addVisitor(new FunctionCollectVisitor($p,$ctx->path)); $tr->traverse($ast);
-    }
-}
-
-/*──────────────── Pass-1: 本解析 ─────────────────────────*/
-function analyzeFile(string $abs,Project $proj,array $views,array $procs,int $depth=0):void
+/* ───────────── Excel 出力 ───────────── */
+function excel(array $all,string $file): void
 {
-    if($proj->files[$abs]??false || $depth>MAX_INCLUDE) return;
-    $code=@file_get_contents($abs); if($code===false)return;
-    $ctx=new FileContext($abs); $proj->files[$abs]=$ctx;
-
-    foreach(detectIncludes($code,dirname($abs)) as $inc)
-        analyzeFile($inc,$proj,$views,$procs,$depth+1);
-
-    $parser=(new ParserFactory)->createForNewestSupportedVersion();
-    try{$ast=$parser->parse(stripComments($code));}
-    catch(PhpParserError $e){
-        $proj->addLog("AST ERROR {$abs}: ".$e->getMessage());
-        fallbackParse($code,$ctx); goto crud;
-    }
-
-    $tr=new NodeTraverser();
-    $tr->addVisitor(new EvaluateVisitor($ctx,$proj));
-    $tr->addVisitor(new SqlCallVisitor($ctx,$proj));
-    $tr->traverse($ast);
-
-    /* 変数名に 'sql' を含む候補も SQL とみなす */
-    foreach($ctx->variables as $n=>$vals)
-        if(stripos($n,'sql')!==false)
-            $ctx->sqlCandidates=array_slice(array_unique([...$ctx->sqlCandidates,...$vals]),0,MAX_CANDIDATES);
-
-crud:
-    foreach($ctx->sqlCandidates as $sql)
-        foreach(analyzeCrud($sql,$views,$procs,$ctx) as $tbl=>$f){
-            $ctx->crud[$tbl]??=new CrudFlags();
-            foreach(['c','r','u','d'] as $k) $ctx->crud[$tbl]->$k|=$f->$k;
-        }
-
-    /* 一時配列を解放 */
-    $ctx->shrink();
-}
-
-/*──────────────── Excel & Log 出力 ───────────────────────*/
-function exportExcel(Project $proj,string $file):void
-{
-    $s=new Spreadsheet(); $sh=$s->getActiveSheet(); $sh->setTitle('File-CRUD');
-    $sh->fromArray(['File','Table','C','R','U','D','⚠不明?']);
-    $row=2;
-    foreach($proj->files as $ctx){
-        if($ctx->crud===[]) continue;
-        $unc=in_array(UNCERTAIN,$ctx->sqlCandidates,true)?'⚠':'';
+    $s=new Spreadsheet(); $sh=$s->getActiveSheet(); $sh->setTitle('CRUD');
+    $sh->fromArray(['File','Table','C','R','U','D']);
+    $r=2;
+    foreach($all as $ctx){
         foreach($ctx->crud as $tbl=>$f){
-            $sh->fromArray([$ctx->path,$tbl,$f->c?'○':'',$f->r?'○':'',$f->u?'○':'',$f->d?'○':'',$unc],null,"A{$row}");
-            $row++;
+            $sh->fromArray([$ctx->path,$tbl,$f->c?'○':'',$f->r?'○':'',$f->u?'○':'',$f->d?'○':''],null,"A$r");
+            $r++;
         }
-        $row++; // 空行
+        $r++;
     }
-    (new Xlsx($s))->save($file); echo "✔ Excel: {$file}\n";
-}
-function exportLog(Project $p,string $file):void{
-    if($p->log===[]) return; file_put_contents($file,implode("\n",$p->log)); echo "✔ Log:   {$file}\n";
+    (new Xlsx($s))->save($file);
+    echo "✔ Excel: $file\n";
 }
 
-/*────────────────────────── Main ─────────────────────────*/
-$target=$argv[1]??''; if($target===''||!is_dir($target)){
-    fwrite(STDERR,"usage: ./crud-analyzer.php <directory>\n"); exit(1);
+/* ───────────── Main ───────────── */
+$target=$argv[1]??'';
+if($target===''||!is_dir($target)){
+    fwrite(STDERR,"usage: ./crud-analyzer.php <dir>\n"); exit(1);
 }
-
-/* initial scan */
-$proj=new Project();
-foreach(scan(realpath($target)) as $f) $proj->files[$f]=new FileContext($f);
-
-/* collect function defs */
-collectFunctions($proj);
-
-/* optional view / proc lists */
-$views=file_exists('view_list.txt')      ? file('view_list.txt',FILE_IGNORE_NEW_LINES)      : [];
-$procs=file_exists('procedure_list.txt') ? file('procedure_list.txt',FILE_IGNORE_NEW_LINES) : [];
-
-/* full analysis */
-foreach(array_keys($proj->files) as $f) analyzeFile($f,$proj,$views,$procs);
-
-/* output */
-exportExcel($proj,__DIR__.'/File-CRUD.xlsx');
-exportLog($proj,__DIR__.'/Log.txt');
-echo "完了: files=".count($proj->files)."  funcs=".count($proj->funcDefs)."\n";
+$all=[];
+foreach(files(realpath($target)) as $f) analyseFile($f,$all);
+excel($all,__DIR__.'/File-CRUD.xlsx');
+echo "完了: files=".count($all)."\n";
