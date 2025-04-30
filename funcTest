@@ -1,0 +1,586 @@
+#!/usr/bin/env php
+<?php
+declare(strict_types=1);
+
+/**
+ * crud_one_sheet.php ─ 関数再帰解決対応・完全版
+ * ───────────────────────────────────────────
+ *  ✔ 2 パス解析
+ *      - パス1: すべてのユーザー定義関数 / メソッドを AST で収集し、
+ *               関数内部の SQL → CRUD を解析 (directCrud)
+ *               呼び出し関数名リスト (calls) も同時に保存
+ *      - パス2: 各ファイルを再解析し
+ *               · 直書き SQL
+ *               · 呼び出し関数 / メソッド (catalog 参照, 再帰済)
+ *               を合算して CRUD 図を生成
+ *  ✔ 再帰伝播
+ *      - FunctionCatalog::propagate() で DAG を固定点計算
+ *        (無限再帰を避ける visited セット付き)
+ *  ✔ フォールバック
+ *      - PHPSQLParser が失敗 or CRUD 空 → fallbackCrud() 正規表現で補完
+ *  ✔ Excel 出力
+ *      - 1 シート (File / Table / C R U D)
+ *      - 同じファイル名は 1 行目のみ表示
+ *
+ *  対応 SQL:
+ *    DROP/TRUNCATE                → D
+ *    CREATE TEMP TABLE            → C
+ *    INSERT                       → C
+ *    UPDATE                       → U (+ FROM/JOIN R)
+ *    DELETE                       → D (+ USING/JOIN/ FROM R)
+ *    SELECT …                     → R
+ *    SELECT … INTO TEMP           → C
+ *    WITH CTE                     → C (cte@temp)
+ *    JOIN/FROM (直後が '(' ならサブクエリ → 無視) → R
+ *
+ *  ライブラリ:
+ *    - phpspreadsheet
+ *    - phpsqlparser
+ *    - nikic/php-parser
+ *
+ *  © ChatGPT o3 (2025-05-01)
+ */
+
+require_once __DIR__ . '/vendor/autoload.php';
+
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+use PhpOffice\PhpSpreadsheet\Worksheet\Worksheet;
+use PhpOffice\PhpSpreadsheet\Settings;
+use PhpParser\ParserFactory;
+use PhpParser\Node;
+use PhpParser\NodeTraverser;
+use PhpParser\NodeVisitorAbstract;
+use PhpParser\Node\Name\FullyQualified;
+use PhpParser\NodeVisitor\NameResolver;
+use PHPSQLParser\PHPSQLParser;
+
+/* =============================================================
+ |  0. 文字列ユーティリティ
+ * ===========================================================*/
+
+/** コメント除去 & 改行 \n 統一 */
+function stripComments(string $code): string
+{
+    $pat = [
+        '/\/\*.*?\*\//s',            // /** … */ /* … */
+        '/(?<!:)\/\/.*|#.*$/m',      // // …   # …
+        '/<!--.*?-->/s',             // HTML
+    ];
+    $code = preg_replace($pat, ['', '', ''], $code) ?? $code;
+    return str_replace(["\r\n", "\r"], "\n", $code);
+}
+
+/** define('CONST','val') を抽出 */
+function collectDefines(string $code): array
+{
+    preg_match_all(
+        '/define\s*\(\s*[\'"]([A-Z0-9_]+)[\'"]\s*,\s*[\'"]([^\'"]+)[\'"]\s*\)/i',
+        $code, $m, PREG_SET_ORDER
+    );
+    return array_column($m, 2, 1);
+}
+
+/** include/require 1 階層パス抽出 */
+function collectIncludes(string $code, string $base): array
+{
+    preg_match_all(
+        '/\b(include|require)(_once)?\s*\(\s*[\'"]([^\'"]+)[\'"]\s*\)/i',
+        $code, $m
+    );
+    $out = [];
+    foreach ($m[3] ?? [] as $rel) {
+        $abs = realpath($rel) ?: realpath("$base/$rel");
+        if ($abs && is_file($abs)) $out[] = $abs;
+    }
+    return $out;
+}
+
+/**
+ * $sql ブロックを
+ *   ['expr'=>式,'vars'=>変数スナップ] で yield
+ */
+function extractSqlBlocks(string $code): \Generator
+{
+    $vars = [];   // 文字列リテラル変数
+    $cur  = '';   // 組み立て中の式
+
+    foreach (explode("\n", $code) as $ln) {
+        // 文字列リテラル代入
+        if (preg_match('/\$([a-zA-Z_]\w*)\s*=\s*[\'"]([^\'"]*)[\'"]\s*;/', $ln, $m)) {
+            $vars[$m[1]] = $m[2];
+            continue;
+        }
+        // $sql = 代入開始
+        if (preg_match('/\$(sql)\s*=\s*(.+?);/i', $ln, $m)) {
+            if ($cur !== '') yield ['expr'=>$cur,'vars'=>$vars];
+            $cur = trim($m[2]);
+            continue;
+        }
+        // $sql .= 連結
+        if (preg_match('/\$(sql)\s*\.\=\s*(.+?);/i', $ln, $m)) {
+            $cur .= ' . ' . trim($m[2]);
+            continue;
+        }
+        // flush
+        if ($cur !== '' && strpos($ln, '.=') === false) {
+            yield ['expr'=>$cur,'vars'=>$vars];
+            $cur = '';
+        }
+    }
+    if ($cur !== '') yield ['expr'=>$cur,'vars'=>$vars];
+}
+
+/** ドット演算・sprintf 簡易評価 */
+function evalConcat(string $expr, array $const, array $vars): string
+{
+    // sprintf
+    if (preg_match('/sprintf\s*\(\s*([\'"])(.+?)\1\s*,\s*(.+)\)$/i', $expr, $m)) {
+        $fmt  = $m[2];
+        $args = array_map(
+            fn($a)=>evalConcat(trim($a), $const, $vars),
+            preg_split('/\s*,\s*/', $m[3])
+        );
+        return @vsprintf($fmt, $args) ?: '';
+    }
+
+    $out='';
+    foreach (preg_split('/\s*\.\s*/', $expr) as $p) {
+        $p=trim($p); if($p==='')continue;
+        if ($p[0]==='"' || $p[0]==="'") { // 文字列
+            $s=stripslashes(substr($p,1,-1));
+            if ($p[0]==='"') {
+                $s=preg_replace_callback('/\$([a-zA-Z_]\w*)/',
+                    fn($m)=>$vars[$m[1]]??$m[0], $s);
+            }
+            $out.=$s; continue;
+        }
+        if ($p[0]==='$') {                // 変数
+            $out.=$vars[substr($p,1)]??$p; continue;
+        }
+        if (isset($const[$p])) {          // 定数
+            $out.=$const[$p]; continue;
+        }
+        $out.=$p;                         // その他
+    }
+    return $out;
+}
+
+/*─────────────────────────────────────────
+ |  1. CRUD 解析 (collectCrud / fallbackCrud)
+ *────────────────────────────────────────*/
+
+/**
+ * 再帰的に PHPSQLParser ツリーを歩き CRUD を収集
+ */
+function collectCrud(array $tree, string $sql, array &$crud): void
+{
+    /* 基本 4 文 + 方言 */
+    if ($tree['INSERT']??false) {
+        $t=$tree['INSERT'][0]['no_quotes']['parts'][0]??'';
+        if($t)$crud[$t]['C']=true;
+    }
+    if ($tree['UPDATE']??false) {
+        $t=$tree['UPDATE'][0]['table']??'';
+        if($t)$crud[$t]['U']=true;
+    }
+    if ($tree['DELETE']??false) {
+        $t=$tree['FROM'][0]['table']??'';
+        if($t)$crud[$t]['D']=true;
+    }
+    if ($tree['SELECT']??false) {
+        foreach ($tree['FROM']??[] as $f) {
+            $tbl=$f['table']??''; if($tbl)$crud[$tbl]['R']=true;
+        }
+        if ($tree['INTO']??false) {
+            foreach ($tree['INTO'] as $i) {
+                $t=$i['table']??''; if(!$t)continue;
+                $t=preg_match('/\btemp\b/i',$i['base_expr'])?"{$t}@temp":$t;
+                $crud[$t]['C']=true;
+            }
+        }
+    }
+    /* JOINパターン */
+    foreach ($tree['FROM']??[] as $f) {
+        if(!empty($f['join_type'])) {
+            $tbl=$f['table']??''; if($tbl)$crud[$tbl]['R']=true;
+        }
+    }
+    /* UPDATE/DELETE ... FROM 参照 → R */
+    if ($tree['UPDATE']??false || $tree['DELETE']??false) {
+        foreach (array_slice($tree['FROM']??[],1) as $f) {
+            $tbl=$f['table']??''; if($tbl)$crud[$tbl]['R']=true;
+        }
+    }
+    /* CREATE TEMP TABLE */
+    if (($tree['CREATE']??false)&&($tree['TABLE']??false)) {
+        $t=$tree['TABLE']['no_quotes']['parts'][0]??'';
+        if($t) { $t=preg_match('/\btemp\b/i',$sql)?"{$t}@temp":$t; $crud[$t]['C']=true; }
+    }
+
+    /* 再帰探索 */
+    foreach ($tree as $v) {
+        if (is_array($v)) collectCrud($v,'',$crud);
+    }
+}
+
+/**
+ * フォールバック（正規表現）– JOIN/FROM 直後サブクエリ除外対応
+ */
+function fallbackCrud(string $sql): array
+{
+    $crud=[];
+    $sqlL=strtolower($sql);
+
+    // DROP/TRUNCATE
+    if(preg_match_all('/\b(?:drop|truncate)\s+table\s+([a-z0-9_.]+)/i',$sql,$m))
+        foreach($m[1] as $t)$crud[$t]['D']=true;
+
+    // CREATE TEMP TABLE
+    if(preg_match_all('/create\s+(?:temporary|temp)\s*table\s+([a-z0-9_.]+)/i',$sql,$m))
+        foreach($m[1] as $t)$crud["{$t}@temp"]['C']=true;
+
+    // INSERT
+    if(preg_match_all('/insert\s+(?:into\s+)?([a-z0-9_.]+)/i',$sql,$m))
+        foreach($m[1] as $t)$crud[$t]['C']=true;
+
+    // UPDATE
+    if(preg_match_all('/update\s+([a-z0-9_.]+)/i',$sql,$m))
+        foreach($m[1] as $t)$crud[$t]['U']=true;
+
+    // DELETE
+    if(preg_match_all('/delete\s+from\s+([a-z0-9_.]+)/i',$sql,$m))
+        foreach($m[1] as $t)$crud[$t]['D']=true;
+
+    // SELECT FROM/JOIN 読取 (サブクエリ除外)
+    if(strpos($sqlL,'select')!==false) {
+        if(preg_match_all('/\bfrom\s+(?!\()(?:only\s+)?([a-z0-9_.]+)/i',$sql,$m))
+            foreach($m[1] as $t)$crud[$t]['R']=true;
+        if(preg_match_all('/\bjoin\s+(?!\()(?:only\s+)?([a-z0-9_.]+)/i',$sql,$m))
+            foreach($m[1] as $t)$crud[$t]['R']=true;
+        // SELECT ... INTO TEMP
+        if(preg_match_all('/into\s+temp\s+([a-z0-9_.]+)/i',$sql,$m))
+            foreach($m[1] as $t)$crud["{$t}@temp"]['C']=true;
+    }
+
+    // WITH CTE
+    if(preg_match_all('/with\s+([a-z0-9_]+)\s+as\s*\(/i',$sql,$m))
+        foreach($m[1] as $cte)$crud["{$cte}@temp"]['C']=true;
+
+    // UPDATE/DELETE … FROM 参照
+    if(preg_match_all('/\b(?:update|delete)[\s\S]*?\bfrom\s+(?!\()(?:only\s+)?([a-z0-9_.]+)/i',$sql,$m))
+        foreach($m[1] as $t)$crud[$t]['R']=true;
+
+    // 正規化
+    foreach($crud as $tbl=>$ops)
+        $crud[$tbl]=array_merge(['C'=>false,'R'=>false,'U'=>false,'D'=>false],$ops);
+    return $crud;
+}
+
+
+/* =============================================================
+ |  2. FunctionCatalog  (再帰解決・メソッド含む)
+ * ===========================================================*/
+
+/**
+ * 関数 / メソッド ⇒ CRUD マップ（再帰展開済） を保持
+ */
+class FunctionCatalog
+{
+    /** @var array<string,array{crud:array, calls:string[]}> */
+    private array $raw = [];    // 直接 CRUD と呼び出し
+    /** @var array<string,array> */   private array $resolved = [];
+
+    private \PhpParser\Parser $parser;
+    private \PhpParser\NodeTraverser $trv;
+    private array $defines;
+
+    public function __construct(array $defines)
+    {
+        $this->defines = $defines;
+        $this->parser  = (new ParserFactory)->create(ParserFactory::PREFER_PHP7);
+        $this->trv     = new NodeTraverser();
+        $this->trv->addVisitor(new NameResolver());
+    }
+
+    /** ファイル群から raw を作成 */
+    public function build(array $files): void
+    {
+        foreach ($files as $file) {
+            $code = file_get_contents($file);
+            try { $ast = $this->trv->traverse($this->parser->parse($code)); }
+            catch(\Throwable){ continue; }
+
+            $finder = new PhpParser\NodeFinder();
+            // 関数
+            foreach ($finder->findInstanceOf($ast, Node\Stmt\Function_::class) as $fn) {
+                /** @var Node\Stmt\Function_ $fn */
+                $this->registerFunction($fn, $code);
+            }
+            // クラスメソッド
+            foreach ($finder->findInstanceOf($ast, Node\Stmt\ClassMethod::class) as $mtd) {
+                /** @var Node\Stmt\ClassMethod $mtd */
+                $this->registerMethod($mtd, $code);
+            }
+        }
+        // 再帰伝播
+        $this->propagate();
+    }
+
+    /** 登録キーを統一 */
+    private static function key(string $name, ?string $class=null): string
+    {
+        return $class ? strtolower("$class::$name") : strtolower($name);
+    }
+
+    /** Function_ 登録 */
+    private function registerFunction(Node\Stmt\Function_ $fn, string $code): void
+    {
+        $key = self::key($fn->name->toString());
+        [$crud,$calls] = $this->analyzeBody($fn, $code);
+        if ($crud||$calls) $this->raw[$key] = ['crud'=>$crud,'calls'=>$calls];
+    }
+
+    /** ClassMethod 登録 */
+    private function registerMethod(Node\Stmt\ClassMethod $mtd, string $code): void
+    {
+        $class = $mtd->getAttribute('parent')->name->toString();
+        $key   = self::key($mtd->name->toString(), $class);
+        [$crud,$calls] = $this->analyzeBody($mtd, $code);
+        if($crud||$calls) $this->raw[$key] = ['crud'=>$crud,'calls'=>$calls];
+    }
+
+    /** Function/Method の本体文字列を抽出し SQL→CRUD, 呼び出し→calls */
+    private function analyzeBody(Node $fn, string $code): array
+    {
+        $start=$fn->getStartFilePos(); $end=$fn->getEndFilePos();
+        $body = substr($code,$start,$end-$start+1);
+        // SQL 抽出
+        $crud=[];
+        foreach (extractSqlBlocks(stripComments($body)) as $blk) {
+            $sql = evalConcat($blk['expr'],$this->defines,$blk['vars']);
+            $sql = trim($sql); if($sql==='') continue;
+            try{
+                $tree = (new PHPSQLParser($sql,true))->parsed;
+                collectCrud($tree,$sql,$crud);
+            }catch(\Throwable){
+                $crud = array_merge_recursive($crud, fallbackCrud($sql));
+            }
+        }
+        foreach ($crud as $t=>$ops)
+            $crud[$t]=array_merge(['C'=>false,'R'=>false,'U'=>false,'D'=>false],$ops);
+
+        // 呼び出し関数名リスト
+        $calls=[];
+        $finder=new PhpParser\NodeFinder();
+        foreach ($finder->findInstanceOf($fn, Node\Expr\FuncCall::class) as $call) {
+            if($call->name instanceof Node\Name){
+                $calls[]=self::key($call->name->toString());
+            }
+        }
+        foreach ($finder->findInstanceOf($fn, Node\Expr\StaticCall::class) as $call) {
+            $cls=$call->class instanceof Node\Name ? $call->class->toString() : null;
+            if($cls && $call->name instanceof Node\Identifier){
+                $calls[] = self::key($call->name->toString(), $cls);
+            }
+        }
+        return [$crud, array_unique($calls)];
+    }
+
+    /** 再帰的に CRUD 伝播 (固定点計算) */
+    private function propagate(): void
+    {
+        // 初期化
+        foreach ($this->raw as $k=>$v) $this->resolved[$k]=$v['crud'];
+
+        $changed=true;
+        $loop=0;
+        while($changed && $loop<20){ // 20回で十分
+            $changed=false; $loop++;
+            foreach ($this->raw as $fn=>$info) {
+                foreach ($info['calls'] as $callee) {
+                    if (!isset($this->resolved[$callee])) continue;
+                    foreach ($this->resolved[$callee] as $tbl=>$ops) {
+                        $before=$this->resolved[$fn][$tbl]??['C'=>false,'R'=>false,'U'=>false,'D'=>false];
+                        $after = array_merge($before,$ops);
+                        if ($after!==$before) {
+                            $this->resolved[$fn][$tbl]=$after;
+                            $changed=true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /** CRUD 取得 (解決済) */
+    public function get(string $fnKey): array
+    {
+        return $this->resolved[strtolower($fnKey)]??[];
+    }
+
+    /** 存在確認 */
+    public function has(string $fnKey): bool
+    {
+        return isset($this->resolved[strtolower($fnKey)]);
+    }
+}
+
+
+/* =============================================================
+ |  3. CrudOneSheet メイン
+ * ===========================================================*/
+class CrudOneSheet
+{
+    private Spreadsheet $book;
+    private Worksheet   $sheet;
+    private array       $defines = [];
+    private array       $visited = [];
+    private array       $files   = [];
+    private array       $result  = [];
+    private FunctionCatalog $catalog;
+
+    public function __construct(private string $root)
+    {
+        Settings::setCache(Settings::CACHE_MEMORY_GZIP);
+        $this->book  = new Spreadsheet();
+        $this->sheet = $this->book->getActiveSheet();
+        $this->sheet->setTitle('CRUD');
+        $this->sheet->fromArray(['File','Table','C','R','U','D'],null,'A1');
+        $this->sheet->freezePane('A2');
+
+        $this->files = $this->scan($root);
+        foreach($this->files as $f) $this->defines += $this->collectConst($f);
+
+        $this->catalog = new FunctionCatalog($this->defines);
+        $this->catalog->build($this->files);
+    }
+
+    /** ディレクトリ再帰 */
+    private function scan(string $dir): array
+    {
+        $rii=new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($dir,FilesystemIterator::SKIP_DOTS)
+        );
+        $out=[];
+        foreach($rii as $f){
+            if($f->isFile()&&preg_match('/\.(php|inc)$/i',$f->getFilename()))
+                $out[]=$f->getRealPath();
+        }
+        return $out;
+    }
+
+    /** include 定数 1 階層 */
+    private function collectConst(string $file): array
+    {
+        if($this->visited[$file]??false) return [];
+        $this->visited[$file]=true;
+        $code=stripComments(file_get_contents($file));
+        $defs=collectDefines($code);
+        foreach(collectIncludes($code,dirname($file)) as $inc)
+            $defs += $this->collectConst($inc);
+        return $defs;
+    }
+
+    /** 実行 */
+    public function run(): void
+    {
+        foreach($this->files as $file) $this->analyze($file);
+        $this->writeExcel();
+        (new Xlsx($this->book))->save(__DIR__.'/crud_one_sheet.xlsx');
+        echo "生成完了: ".realpath(__DIR__.'/crud_one_sheet.xlsx').PHP_EOL;
+    }
+
+    /** ファイル解析 */
+    private function analyze(string $file): void
+    {
+        $code=stripComments(file_get_contents($file));
+
+        /* 1) 直接 SQL */
+        foreach(extractSqlBlocks($code) as $blk){
+            $sql=trim(evalConcat($blk['expr'],$this->defines,$blk['vars']));
+            if($sql==='')continue;
+            $crud=[];
+            try{
+                $tree=(new PHPSQLParser($sql,true))->parsed;
+                collectCrud($tree,$sql,$crud);
+            }catch(\Throwable){
+                $crud=fallbackCrud($sql);
+            }
+            $this->mergeCrud($file,$crud);
+        }
+
+        /* 2) 関数 / メソッド呼び出し */
+        $parser=(new ParserFactory)->create(ParserFactory::PREFER_PHP7);
+        try{ $ast=$parser->parse(file_get_contents($file)); }
+        catch(\Throwable){ return; }
+
+        $finder=new PhpParser\NodeFinder();
+        // 関数呼び出し
+        foreach($finder->findInstanceOf($ast,Node\Expr\FuncCall::class) as $call){
+            if($call->name instanceof Node\Name){
+                $key=strtolower($call->name->toString());
+                if($this->catalog->has($key))
+                    $this->mergeCrud($file,$this->catalog->get($key));
+            }
+        }
+        // StaticCall
+        foreach($finder->findInstanceOf($ast,Node\Expr\StaticCall::class) as $call){
+            if($call->class instanceof Node\Name && $call->name instanceof Node\Identifier){
+                $key=FunctionCatalog::key($call->name->toString(), $call->class->toString());
+                if($this->catalog->has($key))
+                    $this->mergeCrud($file,$this->catalog->get($key));
+            }
+        }
+    }
+
+    /** マージ (OR) */
+    private function mergeCrud(string $file,array $crud): void
+    {
+        foreach($crud as $tbl=>$ops){
+            $this->result[$file][$tbl]=array_merge(
+                $this->result[$file][$tbl]??['C'=>false,'R'=>false,'U'=>false,'D'=>false],
+                $ops
+            );
+        }
+    }
+
+    /** Excel 書込 */
+    private function writeExcel(): void
+    {
+        $row=2;
+        foreach($this->result as $file=>$tbls){
+            $rel=ltrim(str_replace($this->root,'',$file),DIRECTORY_SEPARATOR);
+            $first=true;
+            foreach($tbls as $tbl=>$ops){
+                $this->sheet->setCellValue("A{$row}",$first?$rel:''); $first=false;
+                $this->sheet->setCellValue("B{$row}",$tbl);
+                $this->sheet->setCellValue("C{$row}",$ops['C']?'✓':'');
+                $this->sheet->setCellValue("D{$row}",$ops['R']?'✓':'');
+                $this->sheet->setCellValue("E{$row}",$ops['U']?'✓':'');
+                $this->sheet->setCellValue("F{$row}",$ops['D']?'✓':'');
+                $row++;
+            }
+            $row++; // 空行
+        }
+        foreach(['A','B','C','D','E','F'] as $col)
+            $this->sheet->getColumnDimension($col)->setAutoSize(true);
+    }
+}
+
+
+/* =============================================================
+ |  4. CLI エントリ
+ * ===========================================================*/
+if(php_sapi_name()!=='cli'){
+    fwrite(STDERR,"CLI で実行してください\n");exit(1);
+}
+$target=$argv[1]??'';
+if($target===''||!is_dir($target)){
+    fwrite(STDERR,"Usage: php crud_one_sheet.php <target_dir>\n");exit(1);
+}
+try{
+    (new CrudOneSheet(realpath($target)))->run();
+}catch(\Throwable $e){
+    fwrite(STDERR,"Fatal: {$e->getMessage()}\n");exit(1);
+}
