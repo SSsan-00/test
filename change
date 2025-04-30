@@ -1,0 +1,270 @@
+#!/usr/bin/env php
+<?php
+/**
+ * cleanup.php
+ * --------------------------------------------
+ *  legacy-PHP ソースを対象に、次の処理を行います。
+ *
+ *   1. コメントをすべて削除（//, #, /* */, <!-- -->）
+ *   2. 不要な空白を圧縮（改行は 1 つ残し、連続スペースは 1 つに圧縮）
+ *   3. 配列キーが bareword（未定義定数）の場合に 'キー' と補完
+ *      ・多次元配列もトークン単位で走査するので自動対応
+ *
+ * 依存ライブラリ  : なし（token_get_all 等のビルトインのみ）
+ * 対応 PHP バージョン : 7.4 以降（strict_types 指定）
+ *
+ * 使い方
+ *   php cleanup.php [-w] <ファイル or ディレクトリ>
+ *     -w/--write  ... 変換後のソースで **上書き** します（デフォルトは標準出力）
+ *   実行時は UTF-8 へ自動再エンコードされます（BOM は除去）。
+ *
+ * --------------------------------------------
+ * @author ChatGPT
+ * @license MIT
+ */
+declare(strict_types=1);
+
+/* ── CLI パラメータ解析 ──────────────────────────────── */
+
+$argv = $_SERVER['argv'];
+array_shift($argv);                           // スクリプト名除去
+
+$writeBack = false;
+if (isset($argv[0]) && ($argv[0] === '-w' || $argv[0] === '--write')) {
+    $writeBack = true;
+    array_shift($argv);
+}
+
+if (empty($argv) || in_array($argv[0], ['-h', '--help'], true)) {
+    fwrite(STDERR, <<<HELP
+    usage: php cleanup.php [-w] <file|directory>
+
+       -w, --write   Overwrite the original file(s) in place
+       -h, --help    Show this help
+
+    HELP);
+    exit(0);
+}
+
+$targetPath = realpath($argv[0]);
+if ($targetPath === false) {
+    fwrite(STDERR, "Error: Path not found.\n");
+    exit(1);
+}
+
+/* ── 処理エントリ ─────────────────────────────────── */
+
+$files = collectPhpFiles($targetPath);
+
+foreach ($files as $file) {
+    $source  = file_get_contents($file);
+    $source  = toUtf8($source);               // 文字コード統一
+    $defines = collectUserDefinedConstants($source);
+
+    // ♦ 1パス目 : 未定義定数キーの判定用にユーザー定数を蓄積
+    $definedConsts = array_merge(
+        array_keys(get_defined_constants(true)['Core'] ?? get_defined_constants()),
+        $defines
+    );
+
+    // ♦ 2パス目 : トークン変換 → 文字列化
+    $clean = transformSource($source, $definedConsts);
+
+    if ($writeBack) {
+        file_put_contents($file, $clean);
+        echo "[OK]  $file\n";
+    } else {
+        // ファイル境界を分かりやすく区切って出力
+        $sep = str_repeat('=', 80);
+        echo "\n{$sep}\n{$file}\n{$sep}\n";
+        echo $clean, "\n";
+    }
+}
+
+/* =======================================================================
+ *                         関数定義ブロック
+ * ===================================================================== */
+
+/**
+ * 再帰的に *.php / *.inc を収集
+ *
+ * @return string[]
+ */
+function collectPhpFiles(string $path): array
+{
+    if (is_file($path)) {
+        return preg_match('/\.(php|inc)$/i', $path) ? [$path] : [];
+    }
+
+    $rii = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator(
+            $path,
+            FilesystemIterator::SKIP_DOTS | FilesystemIterator::FOLLOW_SYMLINKS
+        )
+    );
+
+    $files = [];
+    foreach ($rii as $file) {
+        /** @var SplFileInfo $file */
+        if ($file->isFile() && preg_match('/\.(php|inc)$/i', $file->getFilename())) {
+            $files[] = $file->getRealPath();
+        }
+    }
+    return $files;
+}
+
+/**
+ * ファイル内の define('CONST', …) パターンを全部拾う
+ *
+ * @return string[]
+ */
+function collectUserDefinedConstants(string $code): array
+{
+    $constants = [];
+    if (preg_match_all(
+        '/\bdefine\s*\(\s*[\'"]([A-Z_\x80-\xff][A-Z0-9_\x80-\xff]*)[\'"]\s*,/i',
+        $code,
+        $m
+    )) {
+        $constants = $m[1];
+    }
+    return $constants;
+}
+
+/**
+ * コメント削除・空白圧縮・キー補完をまとめて実施
+ */
+function transformSource(string $code, array $definedConsts): string
+{
+    $tokens = token_get_all($code);
+    $tokens = quoteArrayKeys($tokens, $definedConsts);
+    return rebuildSource($tokens);
+}
+
+/**
+ * 配列キー T_STRING を 'キー' に差し替え
+ *
+ * アルゴリズム
+ *  ┌─────┬─────────────┐
+ *  │  …  │ '[' ws* T_STRING ws* (']' | '=>' ) │
+ *  └─────┴─────────────┘
+ */
+function quoteArrayKeys(array $tokens, array $definedConsts): array
+{
+    $count = count($tokens);
+
+    for ($i = 0; $i < $count; $i++) {
+        // '[' 以外は無視
+        if ($tokens[$i] !== '[') {
+            continue;
+        }
+
+        // ▸ 次の実トークン（空白はスキップ）
+        $j = $i + 1;
+        while ($j < $count && is_array($tokens[$j]) && $tokens[$j][0] === T_WHITESPACE) {
+            $j++;
+        }
+
+        // 期待: T_STRING
+        if ($j >= $count || !is_array($tokens[$j]) || $tokens[$j][0] !== T_STRING) {
+            continue;
+        }
+
+        $key = $tokens[$j][1];
+
+        // ▸ その次の非空白トークンを確認
+        $k = $j + 1;
+        while ($k < $count && is_array($tokens[$k]) && $tokens[$k][0] === T_WHITESPACE) {
+            $k++;
+        }
+        if ($k >= $count) {
+            continue;
+        }
+
+        // ']','=>' のどちらかでなければキーではない
+        if (!in_array($tokens[$k], [']', '=>'], true)) {
+            continue;
+        }
+
+        // キーワード or 既定定数 はスキップ
+        $lower = strtolower($key);
+        if (in_array($lower, ['true', 'false', 'null'], true)) {
+            continue;
+        }
+        if (in_array($key, $definedConsts, true)) {
+            continue;                           // 定義済みならそのまま
+        }
+
+        // ♦ 補完： 'KEY'
+        $escaped = addcslashes($key, "'\\");
+        $tokens[$j] = [T_CONSTANT_ENCAPSED_STRING, "'{$escaped}'"];
+    }
+
+    return $tokens;
+}
+
+/**
+ * 変換済みトークン列を「コメント除去 & 空白圧縮」しながら文字列化
+ */
+function rebuildSource(array $tokens): string
+{
+    $out        = '';
+    $prevNL     = false;       // 直前に改行を出力したか
+    $needSpace  = false;       // 直前が識別子で次が識別子の時スペース保障
+
+    foreach ($tokens as $tok) {
+        if (is_array($tok)) {
+            [$id, $text] = $tok;
+
+            switch ($id) {
+                case T_COMMENT:
+                case T_DOC_COMMENT:
+                    // 完全に捨てる
+                    continue;
+
+                case T_WHITESPACE:
+                    // 改行を 1 つだけ残し、スペースは文脈で調整
+                    if (strpos($text, "\n") !== false) {
+                        if (!$prevNL) {
+                            $out   .= "\n";
+                            $prevNL = true;
+                            $needSpace = false;
+                        }
+                    } else {
+                        $needSpace = true;
+                    }
+                    continue;
+
+                default:
+                    // 2 連続識別子の衝突を防ぐためのスペース
+                    if ($needSpace && (ctype_alnum($text[0]) || $text[0] === '_')) {
+                        $out .= ' ';
+                    }
+                    $out      .= $text;
+                    $prevNL    = false;
+                    $needSpace = false;
+            }
+        } else { // 単一文字トークン
+            $out      .= $tok;
+            $prevNL   = ($tok === "\n");
+            $needSpace = false;
+        }
+    }
+    return $out;
+}
+
+/**
+ * すべて UTF-8 に統一（BOM も除去）
+ */
+function toUtf8(string $str): string
+{
+    if (!function_exists('mb_detect_encoding')) {
+        // mbstring 拡張が無効でも動くようにフォールバック
+        return ltrim($str, "\xEF\xBB\xBF");
+    }
+
+    $enc = mb_detect_encoding($str, ['UTF-8', 'SJIS', 'EUC-JP', 'ISO-8859-1'], true)
+        ?: 'UTF-8';
+    $str = mb_convert_encoding($str, 'UTF-8', $enc);
+    return ltrim($str, "\xEF\xBB\xBF");        // 先頭 BOM 削除
+}
