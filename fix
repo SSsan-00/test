@@ -1,0 +1,247 @@
+#!/usr/bin/env php
+<?php
+/**
+ * fix_array_keys.php
+ * ----------------------------------------------------------------
+ *  📌 目的
+ *    ──────────────────────────────────────────────────────
+ *    レガシー PHP/INC ファイルで「配列キーがクォートされていない」問題を
+ *    自動的に補正するワンファイル CLI ツール。
+ *
+ *      1) 単一識別子キー   : 定義済み定数なら実値へ、未定義なら '識別子' へ
+ *      2) 連結演算子キー    : $var . bar   → $var . 'bar'
+ *                             CONST . bar  → CONST . 'bar'（CONST 未定義時）
+ *                             CONST_OK . _EN → CONST_OK . '_EN'（左は保持）
+ *      3) 多次元配列        : AST ベースで再帰処理、深さ無制限
+ *
+ *    変換後ファイルは入力フォルダと同じ構造で <input_dir>_fixed/ へ出力
+ *    （第 2 引数で出力フォルダを自由に指定可能）
+ *
+ *  💡 依存
+ *    composer require nikic/php-parser:^5
+ *
+ *  💡 使い方
+ *      php fix_array_keys.php <input_dir> [output_dir]
+ *
+ *  ✔ Tested on PHP 8.1
+ * ----------------------------------------------------------------
+ */
+
+declare(strict_types=1);
+
+require_once __DIR__ . '/vendor/autoload.php';
+
+use PhpParser\{Node, NodeTraverser, NodeVisitorAbstract, ParserFactory};
+use PhpParser\Node\Expr;
+use PhpParser\Node\Scalar\String_;
+use PhpParser\PrettyPrinter\Standard;
+
+/* ====== 設定 ====== */
+const TARGET_EXT = ['php', 'inc'];        // 対象拡張子（小文字比較）
+
+/* ====== 引数チェック ====== */
+if ($argc < 2) {
+    fwrite(STDERR, "Usage: php fix_array_keys.php <input_dir> [output_dir]\n");
+    exit(1);
+}
+
+$inputDir = realpath($argv[1]) ?: null;
+if (!$inputDir || !is_dir($inputDir)) {
+    fwrite(STDERR, "ERROR: invalid input directory: {$argv[1]}\n");
+    exit(1);
+}
+
+$outputDir = $argv[2] ?? $inputDir . '_fixed';
+if (!is_dir($outputDir) && !mkdir($outputDir, 0777, true)) {
+    fwrite(STDERR, "ERROR: cannot create output directory: {$outputDir}\n");
+    exit(1);
+}
+
+/* ====== パーサ & プリンタ ====== */
+$parser  = (new ParserFactory)->createForNewestSupportedVersion();
+$printer = new Standard();
+
+/* ----------------------------------------------------------------
+ * 1st pass: プロジェクト全体から「定数 → 値」マップを構築
+ * ---------------------------------------------------------------- */
+$constantCollector = new class extends NodeVisitorAbstract {
+    /** @var array<string,string>  CONST_NAME => value */
+    public array $map = [];
+
+    public function enterNode(Node $node): void
+    {
+        /* -- const 宣言 ------------------------------ */
+        // e.g.) const STATUS_OK = 'ok';
+        if ($node instanceof Node\Stmt\Const_) {
+            foreach ($node->consts as $const) {
+                if ($const->value instanceof String_) {
+                    $this->map[$const->name->toString()] = $const->value->value;
+                }
+            }
+        }
+
+        /* -- define() 呼び出し ----------------------- */
+        // e.g.) define('STATUS_OK', 'ok');
+        if ($node instanceof Expr\FuncCall
+            && $node->name instanceof Node\Name
+            && strtolower($node->name->toString()) === 'define'
+            && count($node->args) >= 2
+            && $node->args[0]->value instanceof String_
+            && $node->args[1]->value instanceof String_
+        ) {
+            $cName  = $node->args[0]->value->value;
+            $cValue = $node->args[1]->value->value;
+            $this->map[$cName] = $cValue;
+        }
+    }
+};
+
+/* -- ディレクトリ走査して定数収集 -- */
+foreach (traverseFiles($inputDir) as $filePath) {
+    try {
+        $ast = $parser->parse(file_get_contents($filePath));
+        $tr  = new NodeTraverser();
+        $tr->addVisitor($constantCollector);
+        $tr->traverse($ast);
+    } catch (\Throwable $e) {
+        // 解析不能でも無視（パス 2 でフォールバックコピーする）
+        fwrite(STDERR, "WARN skip constants ({$filePath}): {$e->getMessage()}\n");
+    }
+}
+$constantMap = $constantCollector->map;
+
+/* ----------------------------------------------------------------
+ * 2nd pass: 配列キーを正規化して書き出し
+ * ---------------------------------------------------------------- */
+$makeNormalizer = static function (array $constMap): NodeVisitorAbstract {
+
+    // クロージャ: 未定義識別子 → String_ へ
+    $quoteIfBareIdent = function (Node $node) use ($constMap): Node {
+        // ConstFetch = 未クォート識別子 or 定数呼び出し
+        if ($node instanceof Expr\ConstFetch) {
+            $ident = $node->name->toString();
+            if (!array_key_exists($ident, $constMap)) {
+                // 定数未定義 → '識別子' へ置換
+                return new String_($ident, $node->getAttributes());
+            }
+        }
+        return $node; // そのまま
+    };
+
+    return new class($constMap, $quoteIfBareIdent) extends NodeVisitorAbstract {
+
+        public function __construct(
+            private readonly array   $constMap,
+            private readonly Closure $quote
+        ) {}
+
+        /**
+         * enterNode() で必要に応じてノードを置換
+         */
+        public function enterNode(Node $node)
+        {
+            /* === (A) 単一識別子キー ===================== */
+            if ($node instanceof Expr\ArrayItem && $node->key instanceof Node) {
+                if ($node->key instanceof Expr\ConstFetch) {
+                    $name = $node->key->name->toString();
+
+                    if (array_key_exists($name, $this->constMap)) {
+                        // 定義済み定数 → 実値へ
+                        return new Expr\ArrayItem(
+                            $node->value,
+                            new String_($this->constMap[$name]),
+                            $node->byRef,
+                            $node->getAttributes()
+                        );
+                    }
+                    // 未定義識別子 → '識別子'
+                    return new Expr\ArrayItem(
+                        $node->value,
+                        new String_($name),
+                        $node->byRef,
+                        $node->getAttributes()
+                    );
+                }
+            }
+
+            /* === (B) 連結演算子キー ==================== */
+            if ($node instanceof Expr\BinaryOp\Concat) {
+                // 左右に補完を適用
+                $newLeft  = ($this->quote)($node->left);
+                $newRight = ($this->quote)($node->right);
+
+                // どちらかが変更されたら新ノードを返す
+                if ($newLeft !== $node->left || $newRight !== $node->right) {
+                    return new Expr\BinaryOp\Concat($newLeft, $newRight, $node->getAttributes());
+                }
+            }
+
+            return null; // 変更なし
+        }
+    };
+};
+
+/* -- メイン変換ループ -- */
+foreach (traverseFiles($inputDir) as $srcPath) {
+
+    /* 出力ファイルパスを決定（ディレクトリ構造維持） */
+    $rel      = substr($srcPath, strlen($inputDir) + 1);
+    $destPath = $outputDir . DIRECTORY_SEPARATOR . $rel;
+    $destDir  = dirname($destPath);
+
+    if (!is_dir($destDir) && !mkdir($destDir, 0777, true)) {
+        fwrite(STDERR, "ERROR: cannot create directory {$destDir}\n");
+        continue;
+    }
+
+    $code = file_get_contents($srcPath);
+    if ($code === false) {
+        fwrite(STDERR, "WARN: cannot read {$srcPath}\n");
+        continue;
+    }
+
+    try {
+        /* --- AST 生成 & 変換 --- */
+        $ast = $parser->parse($code);
+
+        $tr = new NodeTraverser();
+        $tr->addVisitor($makeNormalizer($constantMap));
+        $fixedAst = $tr->traverse($ast);
+
+        /* --- コード再生成 & 保存 --- */
+        $fixedCode = $printer->prettyPrintFile($fixedAst);
+        file_put_contents($destPath, $fixedCode);
+
+    } catch (\Throwable $e) {
+        // パース失敗: 元ファイルをコピーだけ
+        fwrite(STDERR, "WARN raw copy ({$srcPath}): {$e->getMessage()}\n");
+        file_put_contents($destPath, $code);
+    }
+}
+
+/* *****************************************************************
+ * 関数: traverseFiles()
+ * -----------------------------------------------------------------
+ *  指定ディレクトリを深さ優先で走査し、対象拡張子のファイルを yield
+ * **************************************************************** */
+function traverseFiles(string $baseDir): iterable
+{
+    $iter = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator(
+            $baseDir,
+            FilesystemIterator::SKIP_DOTS | FilesystemIterator::FOLLOW_SYMLINKS
+        ),
+        RecursiveIteratorIterator::LEAVES_ONLY
+    );
+
+    /** @var SplFileInfo $info */
+    foreach ($iter as $info) {
+        if (!$info->isFile()) {
+            continue;
+        }
+        $ext = strtolower($info->getExtension());
+        if (in_array($ext, TARGET_EXT, true)) {
+            yield $info->getPathname();
+        }
+    }
+}
