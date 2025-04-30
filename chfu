@@ -1,0 +1,183 @@
+<?php
+/**
+ * LegacyCleaner
+ * -----------------------------------------------------------
+ *  ・コメント完全除去           （//, #, /* */, <!-- -->）
+ *  ・不要な空白の圧縮           （改行 1 行残し／連続スペース最小化）
+ *  ・未定義定数キー → 'キー' 補完（多次元配列 OK）
+ *
+ * 依存ライブラリ : なし（token_get_all, mb_* のみ）
+ * 対応 PHP       : 7.4 以上
+ * 名前空間       : LegacyCleaner
+ * -----------------------------------------------------------
+ * usage:
+ *   use LegacyCleaner;
+ *   $clean = LegacyCleaner\clean($code, $extraConsts = []);
+ *
+ * @license MIT
+ */
+declare(strict_types=1);
+
+namespace LegacyCleaner;
+
+/**
+ * メイン関数：レガシー PHP コードをクリーンアップして返す
+ *
+ * @param string   $code           元ソースコード
+ * @param string[] $presetConsts   事前に「定義済み」とみなす定数名（省略可）
+ * @return string  変換後コード（UTF-8）
+ */
+function clean(string $code, array $presetConsts = []): string
+{
+    // 1) 文字コード統一（UTF-8／BOM 除去）
+    $code = toUtf8($code);
+
+    // 2) ファイル内の define('CONST',…) を取得
+    $userConsts = collectUserDefinedConstants($code);
+
+    // 3) 組込み ＋ ユーザー ＋ 呼び出し元指定 をマージ
+    $definedConsts = array_merge(
+        $presetConsts,
+        $userConsts,
+        array_keys(get_defined_constants(true)['Core'] ?? get_defined_constants())
+    );
+
+    // 4) トークン列へ分解 → 補完 → 組み立て
+    $tokens = token_get_all($code);
+    $tokens = quoteArrayKeys($tokens, $definedConsts);
+    return rebuildSource($tokens);
+}
+
+/* =======================================================================
+ *                            内部関数
+ * ===================================================================== */
+
+/**
+ * ファイル内 define() を列挙
+ *
+ * @return string[] 定数名配列
+ */
+function collectUserDefinedConstants(string $code): array
+{
+    if (!preg_match_all(
+        '/\bdefine\s*\(\s*[\'"]([A-Z_\x80-\xff][A-Z0-9_\x80-\xff]*)[\'"]\s*,/i',
+        $code,
+        $m
+    )) {
+        return [];
+    }
+    return $m[1];
+}
+
+/**
+ * 配列キーが bareword なら '文字列' へ補完する
+ *
+ *  ┌─────┬─────────────┐
+ *  │  …  │ '[' ws* T_STRING ws* (']'|'=>') │
+ *  └─────┴─────────────┘
+ */
+function quoteArrayKeys(array $tokens, array $definedConsts): array
+{
+    $c = count($tokens);
+
+    for ($i = 0; $i < $c; $i++) {
+        if ($tokens[$i] !== '[') {
+            continue;
+        }
+        // 次の非空白トークン
+        $j = $i + 1;
+        while ($j < $c && is_array($tokens[$j]) && $tokens[$j][0] === T_WHITESPACE) {
+            $j++;
+        }
+        // T_STRING でなければスキップ
+        if ($j >= $c || !is_array($tokens[$j]) || $tokens[$j][0] !== T_STRING) {
+            continue;
+        }
+        $key = $tokens[$j][1];
+
+        // 直後の非空白トークン
+        $k = $j + 1;
+        while ($k < $c && is_array($tokens[$k]) && $tokens[$k][0] === T_WHITESPACE) {
+            $k++;
+        }
+        if ($k >= $c || !in_array($tokens[$k], [']', '=>'], true)) {
+            continue;                           // インデックスではない
+        }
+
+        // 既知定数 or 真偽 null はそのまま
+        $lower = strtolower($key);
+        if (in_array($lower, ['true', 'false', 'null'], true)
+            || in_array($key, $definedConsts, true)) {
+            continue;
+        }
+
+        // --- 補完 ---
+        $escaped     = addcslashes($key, "'\\");
+        $tokens[$j]  = [T_CONSTANT_ENCAPSED_STRING, "'{$escaped}'"];
+    }
+
+    return $tokens;
+}
+
+/**
+ * コメント除去＋空白圧縮しながらトークン列を文字列へ
+ */
+function rebuildSource(array $tokens): string
+{
+    $out       = '';
+    $prevNL    = false;  // 直前に改行を出力したか
+    $needSpace = false;  // 連続識別子衝突回避用スペース
+
+    foreach ($tokens as $tok) {
+        if (is_array($tok)) {
+            [$id, $text] = $tok;
+
+            switch ($id) {
+                case T_COMMENT:
+                case T_DOC_COMMENT:
+                    continue;                   // コメントは完全に捨てる
+
+                case T_WHITESPACE:
+                    if (strpos($text, "\n") !== false) {
+                        if (!$prevNL) {
+                            $out .= "\n";
+                            $prevNL = true;
+                        }
+                    } else {
+                        $needSpace = true;      // 単純スペースは後で判断
+                    }
+                    continue;
+
+                default:
+                    if ($needSpace
+                        && (ctype_alnum($text[0]) || $text[0] === '_')) {
+                        $out .= ' ';
+                    }
+                    $out      .= $text;
+                    $prevNL    = false;
+                    $needSpace = false;
+            }
+        } else {                                // 単一文字トークン
+            $out      .= $tok;
+            $prevNL    = ($tok === "\n");
+            $needSpace = false;
+        }
+    }
+    return $out;
+}
+
+/**
+ * 文字コードを UTF-8 へ統一し BOM を除去
+ */
+function toUtf8(string $src): string
+{
+    if (function_exists('mb_detect_encoding')) {
+        $enc = mb_detect_encoding(
+            $src,
+            ['UTF-8', 'SJIS', 'EUC-JP', 'ISO-8859-1'],
+            true
+        ) ?: 'UTF-8';
+        $src = mb_convert_encoding($src, 'UTF-8', $enc);
+    }
+    return ltrim($src, "\xEF\xBB\xBF"); // BOM 削除
+}
