@@ -1,0 +1,304 @@
+#!/usr/bin/env php
+<?php
+declare(strict_types=1);
+
+/**
+ * proc_analyzer.php — ストアドプロシージャ専用スタンドアロン解析ツール
+ * --------------------------------------------------------------
+ * 依存:
+ *   composer require "phpoffice/phpspreadsheet:^4.2" "greenlion/php-sql-parser:^4.7"
+ *   （PHPSQLParser は greenlion/php-sql-parser に含まれます）
+ *
+ * 使い方:
+ *   php proc_analyzer.php <target_dir> [--list=procedure_list.txt] [--defs=definitions_dir] [--out=analysis.xlsx] [--depth=5]
+ *
+ *     <target_dir>             : 走査するルートディレクトリ (必須)
+ *     --list=<path>            : プロシージャ名一覧ファイル (デフォルト ./procedure_list.txt)
+ *     --defs=<dir>             : CREATE FUNCTION/PROCEDURE 定義 SQL を格納したディレクトリ (デフォルト ./procedure_definitions)
+ *     --out=<file.xlsx>        : 出力 Excel ファイル名 (デフォルト stored_proc_analysis.xlsx)
+ *     --depth=<int>            : ネスト解析最大深度 (デフォルト 5)
+ *
+ * 出力:
+ *   <file.xlsx> 内に "Stored-Procedures" シートを生成し、以下の列を出力します。
+ *     File | Procedure | Args | Tables | C | R | U | D
+ *   CRUD 列はからですが、将来拡張用に確保しています。
+ *
+ * --------------------------------------------------------------
+ */
+
+require __DIR__ . '/vendor/autoload.php';
+
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+use PhpOffice\PhpSpreadsheet\Worksheet\Worksheet;
+use PhpOffice\PhpSpreadsheet\Cell\Coordinate;
+use PHPSQLParser\PHPSQLParser;
+use Exception;
+
+//───────────────────────────────────────────────────────────────
+//  CLI パラメータ解析
+//───────────────────────────────────────────────────────────────
+
+$opts = getopt('', [
+    'list::',   // procedure list path
+    'defs::',   // definitions dir path
+    'out::',    // output xlsx file
+    'depth::',  // recursion depth
+    'help::',
+]);
+
+if ($opts === false || isset($opts['help']) || $argc < 2) {
+    fwrite(STDERR, "Usage: php proc_analyzer.php <target_dir> [--list=procedure_list.txt] [--defs=definitions_dir] [--out=analysis.xlsx] [--depth=5]\n");
+    exit(1);
+}
+
+$targetDir = realpath($argv[1]);
+if ($targetDir === false || !is_dir($targetDir)) {
+    fwrite(STDERR, "[Error] Target directory not found: {$argv[1]}\n");
+    exit(1);
+}
+
+$listPath  = isset($opts['list']) ? $opts['list'] : __DIR__ . DIRECTORY_SEPARATOR . 'procedure_list.txt';
+$defDir    = isset($opts['defs']) ? rtrim($opts['defs'], DIRECTORY_SEPARATOR) : (__DIR__ . DIRECTORY_SEPARATOR . 'procedure_definitions');
+$outFile   = isset($opts['out'])  ? $opts['out'] : 'stored_proc_analysis.xlsx';
+$maxDepth  = isset($opts['depth']) && ctype_digit((string)$opts['depth']) ? (int)$opts['depth'] : 5;
+
+if (!is_file($listPath)) {
+    fwrite(STDERR, "[Error] Procedure list not found: {$listPath}\n");
+    exit(1);
+}
+if (!is_dir($defDir)) {
+    fwrite(STDOUT, "[Info] Definition directory not found — proceeding without definitions: {$defDir}\n");
+}
+
+//───────────────────────────────────────────────────────────────
+//  コメント除去ユーティリティ
+//───────────────────────────────────────────────────────────────
+
+/**
+ * 非常に単純なコメント除去 (/* *\/ , //, #, HTML) が必要な場合のみ使用。
+ * 厳密さより速度を優先。PHP コード中の SQL 文字列に影響しないよう最小限。
+ */
+function strip_comments(string $code): string
+{
+    // ブロックコメント
+    $code = preg_replace('/\/\*.*?\*\//s', '', $code) ?? $code;
+    // 行コメント // または #
+    $code = preg_replace('/(^|[^:])\/\/.*$/m', '$1', $code) ?? $code;
+    $code = preg_replace('/(^|[^:])#.*$/m', '$1', $code) ?? $code;
+    // HTML コメント
+    return preg_replace('/<!--.*?-->/s', '', $code) ?? $code;
+}
+
+//───────────────────────────────────────────────────────────────
+//  StoredProcedureAnalyzer クラス
+//───────────────────────────────────────────────────────────────
+
+class StoredProcedureAnalyzer
+{
+    /** @var string[] */
+    private array $procList;
+    private string $procDefinitionDir;
+    private int $maxDepth;
+
+    /** @var array<int, array{file:string,procedure:string,args:string,tables:string}> */
+    private array $results = [];
+
+    /** @var array<string, string[]> プロシージャ => テーブルキャッシュ */
+    private array $procCache = [];
+
+    /** @var string[] */
+    private array $callStack = [];
+
+    public function __construct(array $procList, string $definitionDir, int $maxDepth = 5)
+    {
+        $this->procList          = $procList;
+        $this->procDefinitionDir = rtrim($definitionDir, DIRECTORY_SEPARATOR);
+        $this->maxDepth          = $maxDepth;
+    }
+
+    //==== 公開メソッド ======================================================
+
+    /**
+     * 指定ディレクトリ配下の PHP/INC ファイルを再帰的に解析
+     */
+    public function analyzeDirectory(string $dir): void
+    {
+        $rii = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS)
+        );
+        foreach ($rii as $fileInfo) {
+            /** @var SplFileInfo $fileInfo */
+            if (!$fileInfo->isFile()) {
+                continue;
+            }
+            $ext = strtolower($fileInfo->getExtension());
+            if (!in_array($ext, ['php', 'inc'], true)) {
+                continue;
+            }
+            $code = file_get_contents($fileInfo->getPathname());
+            if ($code === false) {
+                continue;
+            }
+            $this->analyzeFile($fileInfo->getPathname(), $code);
+        }
+    }
+
+    /**
+     * 収集済みデータを Spreadsheet に書き込んで返す
+     */
+    public function toSpreadsheet(): Spreadsheet
+    {
+        $spreadsheet = new Spreadsheet();
+        $sheet       = new Worksheet($spreadsheet, 'Stored-Procedures');
+        $spreadsheet->removeSheetByIndex(0);
+        $spreadsheet->addSheet($sheet, 0);
+
+        $headers = ['File', 'Procedure', 'Args', 'Tables', 'C', 'R', 'U', 'D'];
+        $sheet->fromArray($headers, null, 'A1');
+
+        $row = 2;
+        foreach ($this->results as $r) {
+            $sheet->fromArray([
+                $r['file'],
+                $r['procedure'],
+                $r['args'],
+                $r['tables'],
+                '', '', '', '',
+            ], null, 'A' . $row);
+            ++$row;
+        }
+
+        // 列幅自動調整
+        foreach (range(1, count($headers)) as $col) {
+            $sheet->getColumnDimension(Coordinate::stringFromColumnIndex($col))->setAutoSize(true);
+        }
+
+        return $spreadsheet;
+    }
+
+    //==== 内部ユーティリティ ==============================================
+
+    private function analyzeFile(string $filePath, string $code): void
+    {
+        $clean = strip_comments($code);
+        foreach ($this->procList as $proc) {
+            $pattern = '/\b(?:CALL|SELECT)\s+' . preg_quote($proc, '/') . '\s*\(([^)]*)\)/i';
+            if (preg_match_all($pattern, $clean, $matches, PREG_SET_ORDER)) {
+                foreach ($matches as $m) {
+                    $args   = trim($m[1]);
+                    $tables = $this->resolveProcedureTables($proc, 0);
+                    $this->results[] = [
+                        'file'      => $filePath,
+                        'procedure' => $proc,
+                        'args'      => $args,
+                        'tables'    => implode(', ', $tables),
+                    ];
+                }
+            }
+        }
+    }
+
+    /**
+     * プロシージャ定義 SQL を解析し、操作テーブル一覧を再帰解決
+     *
+     * @return string[]
+     */
+    private function resolveProcedureTables(string $proc, int $depth): array
+    {
+        if (isset($this->procCache[$proc])) {
+            return $this->procCache[$proc];
+        }
+        if ($depth >= $this->maxDepth) {
+            return [];
+        }
+        $defFile = $this->procDefinitionDir
+            ? $this->procDefinitionDir . DIRECTORY_SEPARATOR . $proc . '.sql'
+            : '';
+        if (!$defFile || !is_file($defFile)) {
+            return [];
+        }
+        $sql = file_get_contents($defFile) ?: '';
+        // コメント除去
+        $sqlClean = preg_replace('/--.*?$|\/\*.*?\*\//ms', '', $sql) ?? $sql;
+
+        // 主パース
+        $tables = [];
+        try {
+            $parser = new PHPSQLParser($sqlClean, true);
+            $tables = $this->extractTables($parser->parsed);
+        } catch (Exception $e) {
+            $tables = $this->fallbackTables($sqlClean);
+        }
+
+        // ネストしたプロシージャ呼び出しを解決
+        foreach ($this->procList as $cand) {
+            $callPat = '/\b(?:CALL|SELECT)\s+' . preg_quote($cand, '/') . '\s*\(/i';
+            if (preg_match($callPat, $sqlClean) && !in_array($cand, $this->callStack, true)) {
+                $this->callStack[] = $cand;
+                $tables = array_merge($tables, $this->resolveProcedureTables($cand, $depth + 1));
+                array_pop($this->callStack);
+            }
+        }
+        $tables = array_values(array_unique($tables));
+        $this->procCache[$proc] = $tables;
+        return $tables;
+    }
+
+    /**
+     * PHPSQLParser ツリーからテーブル名抽出
+     */
+    private function extractTables(array $tree): array
+    {
+        $tables = [];
+        $stack  = [$tree];
+        while ($stack) {
+            $node = array_pop($stack);
+            if (!is_array($node)) {
+                continue;
+            }
+            foreach ($node as $k => $v) {
+                if ($k === 'table' && is_string($v)) {
+                    $tables[] = $v;
+                } elseif (is_array($v)) {
+                    $stack[] = $v;
+                }
+            }
+        }
+        return array_values(array_unique($tables));
+    }
+
+    private function fallbackTables(string $sql): array
+    {
+        $tbl = [];
+        $re  = [
+            '/\bINSERT\s+INTO\s+([a-zA-Z0-9_.]+)/i',
+            '/\bUPDATE\s+([a-zA-Z0-9_.]+)/i',
+            '/\bDELETE\s+FROM\s+([a-zA-Z0-9_.]+)/i',
+            '/\bFROM\s+([a-zA-Z0-9_.]+)/i',
+        ];
+        foreach ($re as $p) {
+            if (preg_match_all($p, $sql, $m)) {
+                foreach ($m[1] as $t) {
+                    $tbl[] = $t;
+                }
+            }
+        }
+        return array_values(array_unique($tbl));
+    }
+}
+
+//───────────────────────────────────────────────────────────────
+//  実行処理
+//───────────────────────────────────────────────────────────────
+
+$procList = array_values(array_filter(array_map('trim', file($listPath, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES))));
+
+$analyzer = new StoredProcedureAnalyzer($procList, $defDir, $maxDepth);
+$analyzer->analyzeDirectory($targetDir);
+
+$spreadsheet = $analyzer->toSpreadsheet();
+$writer      = new Xlsx($spreadsheet);
+$writer->save($outFile);
+
+fwrite(STDOUT, "[Success] Stored procedure analysis completed. Output: {$outFile}\n");
