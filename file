@@ -3,64 +3,65 @@
 declare(strict_types=1);
 
 /**
- * crud_excel_generator.php
- * ────────────────────────────────────────────
- *  指定フォルダ配下の PHP/INC ファイルを解析し、
- *  $sql 変数ごとの SQL を再構成 → CRUD 判定 →
- *  Excel( xlsx ) に「ファイル別 CRUD 図」を出力。
+ * crud_single_sheet.php
+ * ──────────────────────────────────────────────────
+ *  指定ディレクトリ内の PHP/INC を静的解析し、
+ *  ・定数 / 文字列リテラル変数 を収集
+ *  ・$sql 変数ごとにクエリを再構築
+ *  ・PHPSQLParser で CRUD 判定（PostgreSQL 方言対応）
+ *  結果を **1 枚の Excel シート** に集計して保存する。
  *
- *  依存:  greenlion/php-sql-parser
- *         phpoffice/phpspreadsheet
+ *  依存 : greenlion/php-sql-parser
+ *        phpoffice/phpspreadsheet
  *
- *  実行:  php crud_excel_generator.php <target_dir>
+ *  使い方 : php crud_single_sheet.php <target_dir>
  *
- *  © ChatGPT(o3) 2025-04-30
+ *  © ChatGPT (o3) 2025-04-30
  */
 
 require_once __DIR__ . '/vendor/autoload.php';
 
+use PHPSQLParser\PHPSQLParser;
 use PhpOffice\PhpSpreadsheet\Spreadsheet;
 use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 use PhpOffice\PhpSpreadsheet\Settings;
-use PHPSQLParser\PHPSQLParser;
 
-/* ========= 0. 共通ユーティリティ ===================== */
+/* --------------------------------------------------
+ |  ユーティリティ
+ * -------------------------------------------------*/
 
 /**
- * 冗長なコメント削除 & 改行正規化
+ * ソースコードから PHP・HTML コメントを除去し、改行を \n に統一
  */
 function stripComments(string $code): string
 {
     $patterns = [
-        // ブロックコメント
-        '/\/\*.*?\*\//s',
-        // 行コメント (// .. or # ..)
-        '/(?<!:)\/\/.*|#.*$/m',
-        // HTML コメント
-        '/<!--.*?-->/s',
+        '/\/\*.*?\*\//s',            // ブロック /* ... */
+        '/(?<!:)\/\/.*|#.*$/m',      // 行 //...  #...
+        '/<!--.*?-->/s',             // HTML <!-- ... -->
     ];
     $code = preg_replace($patterns, ['', '', ''], $code) ?? $code;
     return str_replace(["\r\n", "\r"], "\n", $code);
 }
 
 /**
- * define('CONST','val') を抽出
+ * define('NAME','value') を連想配列化
  *
  * @return array<string,string>
  */
 function collectDefines(string $code): array
 {
     preg_match_all(
-        '/define\s*\(\s*[\'"](?<k>[A-Z0-9_]+)[\'"]\s*,\s*[\'"](?<v>[^\'"]+)[\'"]\s*\)/i',
+        '/define\s*\(\s*[\'"](?<n>[A-Z0-9_]+)[\'"]\s*,\s*[\'"](?<v>[^\'"]+)[\'"]\s*\)/i',
         $code,
         $m,
         PREG_SET_ORDER
     );
-    return array_column($m, 'v', 'k');
+    return array_column($m, 'v', 'n');
 }
 
 /**
- * $var = 'literal'; を収集（簡易）
+ * $var = 'literal'; だけを収集（複雑な式は対象外）
  *
  * @return array<string,string>
  */
@@ -72,21 +73,21 @@ function collectLiteralVars(string $code): array
         $m,
         PREG_SET_ORDER
     );
-    return array_column($m, 2, 1);
+    return array_column($m, 2, 1);  // [varName => value]
 }
 
 /**
- * include/require を抽出（2階層まで）
+ * include / require を抽出してファイルパス配列を返す（1階層）
  */
-function collectIncludeFiles(string $code, string $base): array
+function collectIncludes(string $code, string $base): array
 {
     preg_match_all(
-        '/\binclude(?:_once)?|require(?:_once)?\b\s*\(\s*[\'"]([^\'"]+)[\'"]\s*\)/i',
+        '/\b(include|require)(_once)?\s*\(\s*[\'"]([^\'"]+)[\'"]\s*\)/i',
         $code,
         $m
     );
     $files = [];
-    foreach ($m[1] ?? [] as $path) {
+    foreach ($m[3] ?? [] as $path) {
         $abs = realpath($path) ?: realpath("$base/$path");
         if ($abs && is_file($abs)) $files[] = $abs;
     }
@@ -94,25 +95,53 @@ function collectIncludeFiles(string $code, string $base): array
 }
 
 /**
- * 文字列結合された式を静的評価
+ * $sql 変数の **式** を 1 ステートメントずつ yield
  */
-function evaluateConcat(string $expr, array $const, array $vars): string
+function* extractSqlExpr(string $code): iterable
 {
-    // sprintf 等の単純パターン "SELECT %s" を置換
+    $cur = '';
+    foreach (explode("\n", $code) as $ln) {
+        // 代入開始
+        if (preg_match('/\$(sql)\s*=\s*(?<e>.+?);/i', $ln, $m)) {
+            if ($cur !== '') yield $cur;
+            $cur = trim($m['e']);
+            continue;
+        }
+        // 連結 (.=)
+        if (preg_match('/\$(sql)\s*\.\=\s*(?<e>.+?);/i', $ln, $m)) {
+            $cur .= ' . ' . trim($m['e']);
+            continue;
+        }
+        // ↑以外の行 → flush
+        if ($cur !== '' && !preg_match('/\.\=/', $ln)) {
+            yield $cur;
+            $cur = '';
+        }
+    }
+    if ($cur !== '') yield $cur;
+}
+
+/**
+ * ドット演算等を静的評価して最終 SQL 文字列を返す（簡易）
+ */
+function evalConcat(string $expr, array $const, array $vars): string
+{
+    // "SELECT %s" を sprintf で組み立てる単純型
     if (preg_match('/sprintf\s*\(\s*([\'"])(?<fmt>.+?)\1\s*,\s*(?<args>.+)\)$/i', $expr, $m)) {
         $fmt  = $m['fmt'];
-        $args = preg_split('/\s*,\s*/', $m['args']);
-        foreach ($args as $i => $a) {
-            $args[$i] = evaluateConcat(trim($a), $const, $vars);
-        }
+        $args = array_map(
+            fn($a) => evalConcat(trim($a), $const, $vars),
+            preg_split('/\s*,\s*/', $m['args'])
+        );
         return vsprintf($fmt, $args);
     }
 
     // ドット演算子で分割
-    $parts = preg_split('/\s*\.\s*/', $expr);
     $out = '';
-    foreach ($parts as $p) {
-        $p = trim($p);
+    foreach (preg_split('/\s*\.\s*/', $expr) as $part) {
+        $p = trim($part);
+        if ($p === '') continue;
+
         // 文字列リテラル
         if ($p[0] === '"' || $p[0] === "'") {
             $str = stripslashes(substr($p, 1, -1));
@@ -124,18 +153,21 @@ function evaluateConcat(string $expr, array $const, array $vars): string
             $out .= $str;
             continue;
         }
+
         // 変数
         if ($p[0] === '$') {
             $key = substr($p, 1);
             $out .= $vars[$key] ?? $p;
             continue;
         }
+
         // 定数
         if (isset($const[$p])) {
             $out .= $const[$p];
             continue;
         }
-        // 数値 / 未解決
+
+        // そのまま
         $out .= $p;
     }
 
@@ -143,224 +175,184 @@ function evaluateConcat(string $expr, array $const, array $vars): string
 }
 
 /**
- * $sql 変数の “式” を 1 ステートメントずつ取り出す
- *
- * yield される値は **生の PHP 式文字列**。
- */
-function* extractSqlExpressions(string $code): iterable
-{
-    $current = '';
-    foreach (explode("\n", $code) as $line) {
-        if (preg_match('/\$(sql)\s*=\s*(?<exp>.+?);/i', $line, $m)) {
-            if ($current !== '') yield $current;
-            $current = trim($m['exp']);
-            continue;
-        }
-        if (preg_match('/\$(sql)\s*\.\=\s*(?<exp>.+?);/i', $line, $m)) {
-            $current .= ' . ' . trim($m['exp']);
-            continue;
-        }
-        // 行の終端で flush
-        if ($current !== '' && !preg_match('/\.\=/i', $line)) {
-            yield $current;
-            $current = '';
-        }
-    }
-    if ($current !== '') yield $current;
-}
-
-/**
- * PHPSQLParser の parse 結果 → CRUD 判定
+ * PHPSQLParser パース結果 → CRUD 判定
  *
  * @return array<string,array{C:bool,R:bool,U:bool,D:bool}>
  */
-function crudFromParsed(array $parsed): array
+function parseCrud(array $tree): array
 {
     $crud = [];
 
-    // -----------------------------
     // INSERT
-    if ($parsed['INSERT'] ?? false) {
-        $tbl = $parsed['INSERT'][0]['no_quotes']['parts'][0] ?? '';
-        $crud[$tbl]['C'] = true;
+    if ($tree['INSERT'] ?? false) {
+        $t = $tree['INSERT'][0]['no_quotes']['parts'][0] ?? '';
+        $crud[$t]['C'] = true;
     }
     // UPDATE
-    if ($parsed['UPDATE'] ?? false) {
-        $tbl = $parsed['UPDATE'][0]['table'] ?? '';
-        $crud[$tbl]['U'] = true;
+    if ($tree['UPDATE'] ?? false) {
+        $t = $tree['UPDATE'][0]['table'] ?? '';
+        $crud[$t]['U'] = true;
     }
     // DELETE
-    if ($parsed['DELETE'] ?? false) {
-        $tbl = $parsed['FROM'][0]['table'] ?? '';
-        $crud[$tbl]['D'] = true;
+    if ($tree['DELETE'] ?? false) {
+        $t = $tree['FROM'][0]['table'] ?? '';
+        $crud[$t]['D'] = true;
     }
-    // SELECT (PostgreSQL: SELECT INTO)
-    if ($parsed['SELECT'] ?? false) {
-        // FROM 句 = 読み取り
-        foreach ($parsed['FROM'] ?? [] as $f) {
+    // SELECT ＆ PostgreSQL INTO
+    if ($tree['SELECT'] ?? false) {
+        foreach ($tree['FROM'] ?? [] as $f) {
             $t = $f['table'] ?? '';
             if ($t !== '') $crud[$t]['R'] = true;
         }
-        // INTO 句 = 書き込み (PostgreSQL)
-        if ($parsed['INTO'] ?? false) {
-            foreach ($parsed['INTO'] as $into) {
-                $dest = $into['table'] ?? '';
-                if ($dest !== '') {
-                    // TEMP table 判定
-                    $dest = preg_match('/\btemp\b/i', $into['base_expr'])
-                        ? "{$dest}@temp" : $dest;
-                    $crud[$dest]['C'] = true;
-                }
+        if ($tree['INTO'] ?? false) {
+            foreach ($tree['INTO'] as $i) {
+                $t = $i['table'] ?? '';
+                if ($t === '') continue;
+                $t = preg_match('/\btemp\b/i', $i['base_expr']) ? "{$t}@temp" : $t;
+                $crud[$t]['C'] = true;
             }
         }
     }
 
-    // 配列正規化
-    foreach ($crud as $t => $ops) {
-        $crud[$t] = array_merge(['C'=>false,'R'=>false,'U'=>false,'D'=>false], $ops);
+    // 正規化
+    foreach ($crud as $tbl => $ops) {
+        $crud[$tbl] = array_merge(['C'=>false,'R'=>false,'U'=>false,'D'=>false], $ops);
     }
     return $crud;
 }
 
-/* ========= 1. メインクラス =========================== */
-
-class CrudExcelGenerator
+/* --------------------------------------------------
+ |  メインクラス（単一シート集計）
+ * -------------------------------------------------*/
+class OneSheetCrudGenerator
 {
     private Spreadsheet $book;
-    /** @var array<string,int> sheetName => index */
-    private array $sheetIndexes = [];
+    private \PhpOffice\PhpSpreadsheet\Worksheet\Worksheet $sheet;
 
-    /** キャッシュ済み定数（ファイル横断） */
+    /** @var array<string,bool> include 追跡 */
+    private array $visited = [];
+    /** @var array<string,string> 定数キャッシュ */
     private array $globalConst = [];
 
-    /** 既読 include ファイル */
-    private array $visited = [];
+    /** 結果 [file][table] = ['C'=>bool …] */
+    private array $result = [];
 
-    public function __construct(private string $rootDir)
+    public function __construct(private string $root)
     {
-        // ─ Excel 初期化
+        // Excel 初期設定
         Settings::setCache(Settings::CACHE_MEMORY_GZIP);
-        $this->book = new Spreadsheet();
-        // デフォルトシートは不要なので削除
-        $this->book->removeSheetByIndex(0);
+        $this->book  = new Spreadsheet();
+        $this->sheet = $this->book->getActiveSheet();
+        $this->sheet->setTitle('CRUD');
+        // ヘッダ
+        $this->sheet->fromArray(['File', 'Table', 'C', 'R', 'U', 'D'], null, 'A1');
+        $this->sheet->freezePane('A2');
     }
 
+    /* 実行 */
     public function run(): void
     {
-        foreach ($this->scan($this->rootDir) as $file) {
-            $this->globalConst += $this->collectConstRecursive($file, 2);
-            $crud = $this->analyze($file);
-            $this->writeSheet($file, $crud);
+        // ① 対象ファイル列挙
+        foreach ($this->scan($this->root) as $file) {
+            // ② 定数取得（include 1 階層）
+            $this->globalConst += $this->collectConst($file);
+
+            // ③ 解析
+            $this->analyze($file);
         }
 
-        $writer = new Xlsx($this->book);
-        $writer->save(__DIR__ . '/crud_report.xlsx');
-        echo "生成完了: " . realpath(__DIR__ . '/crud_report.xlsx') . PHP_EOL;
+        // ④ Excel へ書き込み
+        $this->writeExcel();
+        // 保存
+        $out = __DIR__ . '/crud_one_sheet.xlsx';
+        (new Xlsx($this->book))->save($out);
+        echo "生成完了: " . realpath($out) . PHP_EOL;
     }
 
-    /* ----- フォルダ走査 ------------------------------------ */
+    /* --- フォルダ走査 ------ */
     private function scan(string $dir): array
     {
         $rii = new RecursiveIteratorIterator(
             new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS)
         );
-        $out = [];
+        $files = [];
         foreach ($rii as $f) {
             if ($f->isFile() && preg_match('/\.(php|inc)$/i', $f->getFilename())) {
-                $out[] = $f->getRealPath();
+                $files[] = $f->getRealPath();
             }
         }
-        return $out;
+        return $files;
     }
 
-    /* ----- 定数収集 (include を辿る) ------------------------- */
-    private function collectConstRecursive(string $file, int $depth): array
+    /* --- 定数収集 (include 1 階層) ---- */
+    private function collectConst(string $file): array
     {
-        if ($depth < 0 || ($this->visited[$file] ?? false)) return [];
+        if ($this->visited[$file] ?? false) return [];
         $this->visited[$file] = true;
 
         $code = stripComments(file_get_contents($file));
         $const = collectDefines($code);
 
-        foreach (collectIncludeFiles($code, dirname($file)) as $inc) {
-            $const += $this->collectConstRecursive($inc, $depth - 1);
+        foreach (collectIncludes($code, dirname($file)) as $inc) {
+            $const += $this->collectConst($inc);
         }
         return $const;
     }
 
-    /* ----- 単一ファイル解析 -------------------------------- */
-    private function analyze(string $file): array
+    /* --- ファイル単位解析 ---- */
+    private function analyze(string $file): void
     {
         $code = stripComments(file_get_contents($file));
         $vars = collectLiteralVars($code);
 
-        $crudAll = [];
-        foreach (extractSqlExpressions($code) as $expr) {
-            $sql = evaluateConcat($expr, $this->globalConst, $vars);
+        foreach (extractSqlExpr($code) as $expr) {
+            $sql = evalConcat($expr, $this->globalConst, $vars);
             $sql = trim($sql);
-
             if ($sql === '') continue;
 
             try {
                 $tree = (new PHPSQLParser($sql, true))->parsed;
-                $crud = crudFromParsed($tree);
+                $crud = parseCrud($tree);
 
-                // マージ
+                // 結合
                 foreach ($crud as $tbl => $ops) {
-                    $crudAll[$tbl] = array_merge(
-                        $crudAll[$tbl] ?? ['C'=>false,'R'=>false,'U'=>false,'D'=>false],
-                        $ops
-                    );
+                    $ref =& $this->result[$file][$tbl];
+                    $ref = array_merge($ref ?? ['C'=>false,'R'=>false,'U'=>false,'D'=>false], $ops);
                 }
             } catch (Throwable $e) {
-                // パース不能は無視（ログ出力するならここ）
+                // パース不可 -> 無視 or ログ
             }
         }
-        return $crudAll;
     }
 
-    /* ----- Excel シート出力 -------------------------------- */
-    private function writeSheet(string $file, array $crud): void
+    /* --- Excel 書込 ---- */
+    private function writeExcel(): void
     {
-        if (!$crud) return;
-
-        // Excel シート名は 31 文字制限
-        $name = substr(preg_replace('/[^A-Za-z0-9_\-]/', '_', basename($file)), 0, 31);
-        // 重複したら _2, _3…
-        $orig = $name;
-        $i = 2;
-        while (isset($this->sheetIndexes[$name])) {
-            $name = substr($orig, 0, 31 - strlen("_$i")) . "_$i";
-            $i++;
-        }
-
-        $sheet = $this->book->createSheet();
-        $sheet->setTitle($name);
-        $this->sheetIndexes[$name] = $sheet->getParent()->getIndex($sheet);
-
-        // ヘッダ
-        $sheet->fromArray(['Table', 'C', 'R', 'U', 'D'], null, 'A1');
         $row = 2;
-
-        foreach ($crud as $tbl => $ops) {
-            $sheet->setCellValue("A{$row}", $tbl);
-            $sheet->setCellValue("B{$row}", $ops['C'] ? '✓' : '');
-            $sheet->setCellValue("C{$row}", $ops['R'] ? '✓' : '');
-            $sheet->setCellValue("D{$row}", $ops['U'] ? '✓' : '');
-            $sheet->setCellValue("E{$row}", $ops['D'] ? '✓' : '');
+        foreach ($this->result as $file => $tbls) {
+            $rel = ltrim(str_replace($this->root, '', $file), DIRECTORY_SEPARATOR);
+            foreach ($tbls as $tbl => $ops) {
+                $this->sheet->setCellValue("A{$row}", $rel);
+                $this->sheet->setCellValue("B{$row}", $tbl);
+                $this->sheet->setCellValue("C{$row}", $ops['C'] ? '✓' : '');
+                $this->sheet->setCellValue("D{$row}", $ops['R'] ? '✓' : '');
+                $this->sheet->setCellValue("E{$row}", $ops['U'] ? '✓' : '');
+                $this->sheet->setCellValue("F{$row}", $ops['D'] ? '✓' : '');
+                $row++;
+            }
+            // ファイル間を 1 行空けると見やすい
             $row++;
         }
-
-        // 簡易フォーマット
-        foreach (['A','B','C','D','E'] as $col) {
-            $sheet->getColumnDimension($col)->setAutoSize(true);
+        // 列幅自動
+        foreach (['A','B','C','D','E','F'] as $col) {
+            $this->sheet->getColumnDimension($col)->setAutoSize(true);
         }
-        $sheet->freezePane('A2');
     }
 }
 
-/* ========= 2. 実行エントリ =============================== */
-
+/* --------------------------------------------------
+ | 実行エントリ
+ * -------------------------------------------------*/
 if (php_sapi_name() !== 'cli') {
     fwrite(STDERR, "CLI で実行してください。\n");
     exit(1);
@@ -368,13 +360,13 @@ if (php_sapi_name() !== 'cli') {
 
 $target = $argv[1] ?? '';
 if ($target === '' || !is_dir($target)) {
-    fwrite(STDERR, "Usage: php crud_excel_generator.php <target_dir>\n");
+    fwrite(STDERR, "Usage: php crud_single_sheet.php <target_dir>\n");
     exit(1);
 }
 
 try {
-    (new CrudExcelGenerator(realpath($target)))->run();
+    (new OneSheetCrudGenerator(realpath($target)))->run();
 } catch (Throwable $e) {
-    fwrite(STDERR, "致命的エラー: {$e->getMessage()}\n");
+    fwrite(STDERR, "Fatal: {$e->getMessage()}\n");
     exit(1);
 }
