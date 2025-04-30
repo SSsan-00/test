@@ -1,0 +1,137 @@
+#!/usr/bin/env php
+<?php
+/**
+ * cleaner.php
+ * ----------
+ * 指定フォルダ配下の .php / .inc ファイルを走査し、
+ *   1) 最初の "?>" 以降を削除（存在する場合のみ）
+ *   2) PHP コメントを完全除去
+ * したファイルを <入力ディレクトリ>_clean（または引数で指定したフォルダ）へ
+ * 元と同じディレクトリ構造で保存するワンファイル CLI ツール。
+ *
+ * 使い方:
+ *   php cleaner.php <input_dir> [output_dir]
+ *
+ * 例:
+ *   php cleaner.php /var/www/html
+ *   → /var/www/html_clean/ 以下に結果を出力
+ *
+ *   php cleaner.php ./src ./dist/clean
+ *   → ./dist/clean/ 以下に結果を出力
+ *
+ * PHP 8.1 以上推奨
+ */
+
+declare(strict_types=1);
+
+const TARGET_EXTENSIONS = ['php', 'inc'];
+
+/* ========= 引数とフォルダ準備 ========= */
+if ($argc < 2) {
+    fwrite(STDERR, "Usage: php cleaner.php <input_dir> [output_dir]\n");
+    exit(1);
+}
+
+$inputDir  = realpath($argv[1] ?? '');
+if ($inputDir === false || !is_dir($inputDir)) {
+    fwrite(STDERR, "ERROR: input_dir is not a valid directory: {$argv[1]}\n");
+    exit(1);
+}
+
+$outputDir = $argv[2] ?? $inputDir . '_clean';
+if (!is_dir($outputDir) && !mkdir($outputDir, 0777, true)) {
+    fwrite(STDERR, "ERROR: failed to create output directory: {$outputDir}\n");
+    exit(1);
+}
+
+/* ========= メイン処理 ========= */
+$iterator = new RecursiveIteratorIterator(
+    new RecursiveDirectoryIterator(
+        $inputDir,
+        FilesystemIterator::SKIP_DOTS | FilesystemIterator::FOLLOW_SYMLINKS
+    ),
+    RecursiveIteratorIterator::SELF_FIRST
+);
+
+foreach ($iterator as $fileInfo) {
+    /** @var SplFileInfo $fileInfo */
+    if (!$fileInfo->isFile()) {
+        continue;
+    }
+
+    $ext = strtolower($fileInfo->getExtension());
+    if (!in_array($ext, TARGET_EXTENSIONS, true)) {
+        continue; // .php / .inc 以外は無視
+    }
+
+    $relPath = substr($fileInfo->getPathname(), strlen($inputDir) + 1); // 入力 dir からの相対パス
+    $destPath = $outputDir . DIRECTORY_SEPARATOR . $relPath;
+
+    // 必要なら中間ディレクトリを生成
+    $destDir = dirname($destPath);
+    if (!is_dir($destDir) && !mkdir($destDir, 0777, true)) {
+        fwrite(STDERR, "ERROR: cannot create directory {$destDir}\n");
+        continue;
+    }
+
+    // === ファイル読み込み & 変換 ===
+    $source = file_get_contents($fileInfo->getPathname());
+    if ($source === false) {
+        fwrite(STDERR, "WARNING: failed to read {$fileInfo->getPathname()}\n");
+        continue;
+    }
+
+    // 1) "?>" 以降を削除
+    $pos = strpos($source, '?>');
+    if ($pos !== false) {
+        $source = substr($source, 0, $pos);
+    }
+
+    // 2) コメント除去
+    $cleaned = stripPhpComments($source);
+
+    // === 書き出し ===
+    file_put_contents($destPath, $cleaned);
+}
+
+/* ========= 関数定義 ========= */
+
+/**
+ * PHP コメントを安全に除去する
+ *
+ * @param string $code 元コード
+ * @return string コメント除去後コード
+ */
+function stripPhpComments(string $code): string
+{
+    $prependTag = false;
+
+    // token_get_all() はオープンタグ必須 → 無ければ仮タグを付与
+    if (!preg_match('/^\s*<\?(php|=)/i', $code)) {
+        $code       = "<?php\n" . $code;
+        $prependTag = true;
+    }
+
+    $tokens = token_get_all($code);
+    $clean  = '';
+
+    foreach ($tokens as $token) {
+        if (is_array($token)) {
+            // $token = [ TOKEN_ID, string, line ]
+            if ($token[0] === T_COMMENT || $token[0] === T_DOC_COMMENT) {
+                continue; // コメントはスキップ
+            }
+            $clean .= $token[1];
+        } else {
+            // 文字列トークン ( ; { } など)
+            $clean .= $token;
+        }
+    }
+
+    // 先頭に仮タグを付けた場合は削除
+    if ($prependTag) {
+        $clean = preg_replace('/^\s*<\?php\s*/i', '', $clean, 1);
+    }
+
+    return $clean;
+}
