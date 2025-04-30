@@ -15,7 +15,9 @@
  *
  * 使い方
  *   php cleanup.php [-w] <ファイル or ディレクトリ>
- *     -w/--write  ... 変換後のソースで **上書き** します（デフォルトは標準出力）
+ *     -w/--write  ... 変換後のソースを「元ファイルはそのままに」、同ディレクトリ内に
+ *                     <元ファイル名>.cleaned.<ext> という別ファイルで出力します
+ *     -h/--help   ... ヘルプ表示
  *   実行時は UTF-8 へ自動再エンコードされます（BOM は除去）。
  *
  * --------------------------------------------
@@ -27,22 +29,23 @@ declare(strict_types=1);
 /* ── CLI パラメータ解析 ──────────────────────────────── */
 
 $argv = $_SERVER['argv'];
-array_shift($argv);                           // スクリプト名除去
+array_shift($argv);  // スクリプト名除去
 
 $writeBack = false;
-if (isset($argv[0]) && ($argv[0] === '-w' || $argv[0] === '--write')) {
+if (isset($argv[0]) && in_array($argv[0], ['-w', '--write'], true)) {
     $writeBack = true;
     array_shift($argv);
 }
 
 if (empty($argv) || in_array($argv[0], ['-h', '--help'], true)) {
     fwrite(STDERR, <<<HELP
-    usage: php cleanup.php [-w] <file|directory>
+usage: php cleanup.php [-w] <file|directory>
 
-       -w, --write   Overwrite the original file(s) in place
-       -h, --help    Show this help
+   -w, --write   変換後を別ファイル（<元名>.cleaned.<ext>）で出力します
+   -h, --help    このヘルプ
 
-    HELP);
+HELP
+    );
     exit(0);
 }
 
@@ -71,10 +74,18 @@ foreach ($files as $file) {
     $clean = transformSource($source, $definedConsts);
 
     if ($writeBack) {
-        file_put_contents($file, $clean);
-        echo "[OK]  $file\n";
+        // ── 別ファイル出力処理 ─────────────────────────
+        // 元ファイルはそのままに、新ファイル名を生成して書き込む
+        $info    = pathinfo($file);
+        $outFile = $info['dirname']
+                 . DIRECTORY_SEPARATOR
+                 . $info['filename']
+                 . '.cleaned.'
+                 . $info['extension'];
+        file_put_contents($outFile, $clean);
+        echo "[OK] $outFile\n";
     } else {
-        // ファイル境界を分かりやすく区切って出力
+        // ── 標準出力モード（ファイル境界を表示）─────────
         $sep = str_repeat('=', 80);
         echo "\n{$sep}\n{$file}\n{$sep}\n";
         echo $clean, "\n";
@@ -143,18 +154,12 @@ function transformSource(string $code, array $definedConsts): string
 
 /**
  * 配列キー T_STRING を 'キー' に差し替え
- *
- * アルゴリズム
- *  ┌─────┬─────────────┐
- *  │  …  │ '[' ws* T_STRING ws* (']' | '=>' ) │
- *  └─────┴─────────────┘
  */
 function quoteArrayKeys(array $tokens, array $definedConsts): array
 {
     $count = count($tokens);
 
     for ($i = 0; $i < $count; $i++) {
-        // '[' 以外は無視
         if ($tokens[$i] !== '[') {
             continue;
         }
@@ -181,7 +186,6 @@ function quoteArrayKeys(array $tokens, array $definedConsts): array
             continue;
         }
 
-        // ']','=>' のどちらかでなければキーではない
         if (!in_array($tokens[$k], [']', '=>'], true)) {
             continue;
         }
@@ -192,12 +196,12 @@ function quoteArrayKeys(array $tokens, array $definedConsts): array
             continue;
         }
         if (in_array($key, $definedConsts, true)) {
-            continue;                           // 定義済みならそのまま
+            continue;
         }
 
         // ♦ 補完： 'KEY'
-        $escaped = addcslashes($key, "'\\");
-        $tokens[$j] = [T_CONSTANT_ENCAPSED_STRING, "'{$escaped}'"];
+        $escaped      = addcslashes($key, "'\\");
+        $tokens[$j]   = [T_CONSTANT_ENCAPSED_STRING, "'{$escaped}'"];
     }
 
     return $tokens;
@@ -209,8 +213,8 @@ function quoteArrayKeys(array $tokens, array $definedConsts): array
 function rebuildSource(array $tokens): string
 {
     $out        = '';
-    $prevNL     = false;       // 直前に改行を出力したか
-    $needSpace  = false;       // 直前が識別子で次が識別子の時スペース保障
+    $prevNL     = false;
+    $needSpace  = false;
 
     foreach ($tokens as $tok) {
         if (is_array($tok)) {
@@ -219,14 +223,12 @@ function rebuildSource(array $tokens): string
             switch ($id) {
                 case T_COMMENT:
                 case T_DOC_COMMENT:
-                    // 完全に捨てる
                     continue;
 
                 case T_WHITESPACE:
-                    // 改行を 1 つだけ残し、スペースは文脈で調整
                     if (strpos($text, "\n") !== false) {
                         if (!$prevNL) {
-                            $out   .= "\n";
+                            $out    .= "\n";
                             $prevNL = true;
                             $needSpace = false;
                         }
@@ -236,15 +238,14 @@ function rebuildSource(array $tokens): string
                     continue;
 
                 default:
-                    // 2 連続識別子の衝突を防ぐためのスペース
                     if ($needSpace && (ctype_alnum($text[0]) || $text[0] === '_')) {
                         $out .= ' ';
                     }
-                    $out      .= $text;
+                    $out       .= $text;
                     $prevNL    = false;
                     $needSpace = false;
             }
-        } else { // 単一文字トークン
+        } else {
             $out      .= $tok;
             $prevNL   = ($tok === "\n");
             $needSpace = false;
@@ -259,12 +260,11 @@ function rebuildSource(array $tokens): string
 function toUtf8(string $str): string
 {
     if (!function_exists('mb_detect_encoding')) {
-        // mbstring 拡張が無効でも動くようにフォールバック
         return ltrim($str, "\xEF\xBB\xBF");
     }
 
     $enc = mb_detect_encoding($str, ['UTF-8', 'SJIS', 'EUC-JP', 'ISO-8859-1'], true)
         ?: 'UTF-8';
     $str = mb_convert_encoding($str, 'UTF-8', $enc);
-    return ltrim($str, "\xEF\xBB\xBF");        // 先頭 BOM 削除
+    return ltrim($str, "\xEF\xBB\xBF");
 }
