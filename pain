@@ -1,0 +1,213 @@
+#!/usr/bin/env php
+<?php
+/**
+ * ---------------------------------------------------------------
+ *  fix_array_keys_nolib.php
+ * ---------------------------------------------------------------
+ *   📌 目的
+ *     ・レガシー PHP／INC ファイルに存在する
+ *         [  FOO         => … ]      // 定数
+ *         [  bar         => … ]      // 裸の識別子
+ *         [ $var . baz   => … ]      // 連結演算子
+ *         [ FOO  . baz   => … ]      // 〃
+ *       ―― といった **クォート漏れ配列キー** を自動修正します。
+ *
+ *   ✔ ライブラリ不要 ― 標準関数 ( token_get_all / 正規表現 ) のみ使用
+ *
+ *   変換ルール
+ *   ----------------------------------------------------------------
+ *     1. 定義済み定数キー         → その「値」を  'シングルクォート' 包囲
+ *        (例)  STATUS_OK        → 'ok'            ※ define/const を静的解析
+ *
+ *     2. 未定義識別子キー         → '識別子' を補完
+ *        (例)  foo             → 'foo'
+ *
+ *     3. 連結演算子 (.) 内の識別子 → 右側 (および多段の全裸識別子) を補完
+ *        (例)  $var . bar      → $var . 'bar'
+ *               FOO . baz      → FOO . 'baz'   (FOO が定義済みでも baz だけ補完)
+ *
+ *   対象拡張子 : .php / .inc   （大文字小文字不問）
+ *   多次元配列 : カンマ区切りをトラバースする簡易スタックで再帰的に処理
+ *
+ *   🛠 使い方
+ *   ----------------------------------------------------------------
+ *       php fix_array_keys_nolib.php <入力ディレクトリ> [出力ディレクトリ]
+ *
+ *     ・出力先を省略すると <入力ディレクトリ>_fixed が生成されます
+ *     ・元ファイルは **一切変更せず**、修正版を丸ごとコピー出力
+ *
+ *   ※ 100% 完全な PHP 構文解析ではなく「静的解析 + 正規表現」の
+ *     ヒューリスティック手法です。複雑怪奇なコードでは手直しが
+ *     要る可能性があります。
+ * ---------------------------------------------------------------
+ */
+
+declare(strict_types=1);
+
+/* ---------- 定数 ---------- */
+const TARGET_EXT  = ['php', 'inc'];          // 解析対象拡張子（小文字比較）
+const STR_SINGLEQ = "'";                     // シングルクォート文字
+
+/* ---------- コマンドライン引数 ---------- */
+if ($argc < 2) {
+    fwrite(STDERR, "Usage: php fix_array_keys_nolib.php <input_dir> [output_dir]\n");
+    exit(1);
+}
+$inputDir = realpath($argv[1]) ?: null;
+if (!$inputDir || !is_dir($inputDir)) {
+    fwrite(STDERR, "ERROR: '{$argv[1]}' is not a valid directory.\n");
+    exit(1);
+}
+$outputDir = $argv[2] ?? $inputDir . '_fixed';
+if (!is_dir($outputDir) && !mkdir($outputDir, 0777, true)) {
+    fwrite(STDERR, "ERROR: cannot create output directory '{$outputDir}'.\n");
+    exit(1);
+}
+
+/* ================================================================
+ *  1st PASS  : 定数マップの収集
+ * --------------------------------------------------------------- */
+$constMap = [];          // CONST_NAME  => 'value'
+
+foreach (traverse_files($inputDir) as $file) {
+    $code = file_get_contents($file);
+    if ($code === false) { continue; }
+
+    // コメント除去 (token_get_all ベースで安全)
+    $codeNoCmt = strip_comments($code);
+
+    // --- const FOO = 'bar'; ----------------------------------
+    if (preg_match_all(
+            '/\bconst\s+([A-Z_][A-Z0-9_]*)\s*=\s*([\'"])(.*?)\2/s',
+            $codeNoCmt, $m, PREG_SET_ORDER))
+    {
+        foreach ($m as $row) { $constMap[$row[1]] = $row[3]; }
+    }
+
+    // --- define('FOO', 'bar'); -------------------------------
+    if (preg_match_all(
+            '/\bdefine\s*\(\s*([\'"])([A-Z_][A-Z0-9_]*)\1\s*,\s*([\'"])(.*?)\3/s',
+            $codeNoCmt, $m, PREG_SET_ORDER))
+    {
+        foreach ($m as $row) { $constMap[$row[2]] = $row[4]; }
+    }
+}
+
+/* ================================================================
+ *  2nd PASS  : 配列キーを補完して出力
+ * --------------------------------------------------------------- */
+foreach (traverse_files($inputDir) as $srcPath) {
+
+    // 出力先パス
+    $relative = substr($srcPath, strlen($inputDir) + 1);
+    $destPath = $outputDir . DIRECTORY_SEPARATOR . $relative;
+    if (!is_dir(dirname($destPath)) && !mkdir(dirname($destPath), 0777, true)) {
+        fwrite(STDERR, "ERROR: cannot mkdir ".dirname($destPath)."\n");
+        continue;
+    }
+
+    $code = file_get_contents($srcPath);
+    if ($code === false) {
+        fwrite(STDERR, "WARN : cannot read {$srcPath}\n");
+        continue;
+    }
+
+    /* ---------- ステップ A : コメント除去 ---------- */
+    $codeNoCmt = strip_comments($code);
+
+    /* ---------- ステップ B : 配列キー置換 ---------- */
+    $fixed = fix_array_keys($codeNoCmt, $constMap);
+
+    /* ---------- ステップ C : 書き込み ---------- */
+    file_put_contents($destPath, $fixed);
+}
+
+/* ****************************************************************
+ *  関数群
+ * ****************************************************************/
+
+/**
+ * ディレクトリを再帰的に走査し、対象拡張子のファイルパスを yield
+ */
+function traverse_files(string $base): iterable
+{
+    $it = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($base,
+            FilesystemIterator::SKIP_DOTS | FilesystemIterator::FOLLOW_SYMLINKS),
+        RecursiveIteratorIterator::LEAVES_ONLY
+    );
+
+    /** @var SplFileInfo $info */
+    foreach ($it as $info) {
+        if (!$info->isFile()) { continue; }
+        if (in_array(strtolower($info->getExtension()), TARGET_EXT, true)) {
+            yield $info->getPathname();
+        }
+    }
+}
+
+/**
+ * token_get_all でコメントトークンを除去
+ */
+function strip_comments(string $code): string
+{
+    $tokens = token_get_all($code);
+    $out    = '';
+    foreach ($tokens as $tok) {
+        if (is_array($tok)) {
+            if ($tok[0] === T_COMMENT || $tok[0] === T_DOC_COMMENT) {
+                continue;               // コメントは捨てる
+            }
+            $out .= $tok[1];            // ソースコード
+        } else {
+            $out .= $tok;               // 記号類
+        }
+    }
+    return $out;
+}
+
+/**
+ * 配列キーをヒューリスティックに補完
+ *
+ *  1) [ IDENT =>                    → ['IDENT' =>
+ *     [ CONST =>                    → ['value' =>
+ *  2) . IDENT (連結内)              → . 'IDENT'
+ */
+function fix_array_keys(string $code, array $constMap): string
+{
+    /* 連結演算子の右側補完
+     *   - CONST or $var  .  baz  → (CONST|$var) . 'baz'
+     *   - スキップ条件: baz が定義済み定数
+     */
+    $code = preg_replace_callback(
+        '/(\.\s*)([A-Za-z_][A-Za-z0-9_]*)\b/',
+        function (array $m) use ($constMap): string {
+            [$all, $dot, $ident] = $m;
+            if (array_key_exists($ident, $constMap)) {
+                return $all;                    // 定数なら触らない
+            }
+            return $dot . STR_SINGLEQ . $ident . STR_SINGLEQ;
+        },
+        $code
+    );
+
+    /* 単一キー補完
+     *   [FOO =>   /  [bar =>
+     */
+    $code = preg_replace_callback(
+        '/\[\s*([A-Za-z_][A-Za-z0-9_]*)\s*=>/',
+        function (array $m) use ($constMap): string {
+            $ident = $m[1];
+
+            if (array_key_exists($ident, $constMap)) {
+                $val = addslashes($constMap[$ident]);
+            } else {
+                $val = $ident;
+            }
+            return '[' . STR_SINGLEQ . $val . STR_SINGLEQ . ' =>';
+        },
+        $code
+    );
+
+    return $code;
+}
