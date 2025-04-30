@@ -1,0 +1,206 @@
+#!/usr/bin/env php
+<?php
+declare(strict_types=1);
+
+require __DIR__ . '/vendor/autoload.php';
+
+use PhpParser\ParserFactory;
+use PhpParser\Node;
+use PhpParser\NodeTraverser;
+use PhpParser\NodeVisitorAbstract;
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+
+/** 対象拡張子 */
+const ALLOWED_EXT = ['php', 'inc'];
+
+/** ─────────────────────  AST 訪問クラス ―───────────────────── */
+class IncludeVisitor extends NodeVisitorAbstract
+{
+    /** @var string[] */
+    public array $includes = [];
+
+    public function enterNode(Node $node)
+    {
+        if ($node instanceof Node\Expr\Include_) {
+            $expr = $node->expr;
+            if ($expr instanceof Node\Scalar\String_) {
+                $this->includes[] = $expr->value;
+            }
+        }
+    }
+}
+
+/** ディレクトリ再帰走査で *.php / *.inc を取得 */
+function collectSourceFiles(string $dir): array
+{
+    $files = [];
+    $it    = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($dir));
+    foreach ($it as $f) {
+        if ($f->isFile() && in_array(strtolower($f->getExtension()), ALLOWED_EXT, true)) {
+            $files[] = $f->getPathname();
+        }
+    }
+    return $files;
+}
+
+/** ─────────── フォールバック: 文字列リテラル include / require 抽出 ─────────── */
+function fallbackIncludes(string $code, string $baseDir): array
+{
+    $includes = [];
+    if (
+        preg_match_all(
+            // include 'path.php'  /  include_once("path.inc")
+            '#\b(include|include_once|require|require_once)\s*(?:\(\s*)?[\'"]([^\'"]+)[\'"]#i',
+            $code,
+            $m
+        )
+    ) {
+        foreach ($m[2] as $raw) {
+            $path       = preg_match('#^(/|[A-Za-z]:[\\/])#', $raw)
+                ? $raw
+                : $baseDir . DIRECTORY_SEPARATOR . $raw;
+            $includes[] = realpath($path) ?: $path;
+        }
+    }
+    return array_unique($includes);
+}
+
+/** ファイル中の include/require を抽出（AST+フォールバック） */
+function extractIncludes(string $file, \PhpParser\Parser $parser): array
+{
+    $code = file_get_contents($file);
+    if ($code === false) return [];
+
+    $baseDir   = dirname($file);
+    $includes  = [];
+
+    try {
+        $ast       = $parser->parse($code);
+        $vis       = new IncludeVisitor();
+        $trav      = new NodeTraverser();
+        $trav->addVisitor($vis);
+        $trav->traverse($ast);
+        $includes  = $vis->includes;
+    } catch (\PhpParser\Error) {
+        // AST 解析失敗 → フォールバックへ
+    }
+
+    /* フォールバック判定
+       - AST 失敗時
+       - もしくは AST 成功でも include が 0 件なら念のため補完 */
+    if (!$includes) {
+        $includes = fallbackIncludes($code, $baseDir);
+    } else {
+        // AST で得た結果にフォールバック結果（重複除去）をマージして精度補完
+        $includes = array_unique(array_merge(
+            array_map(
+                // AST は生文字列 (相対) のままなので同じ realpath 解決を行う
+                fn(string $raw) =>
+                    (preg_match('#^(/|[A-Za-z]:[\\/])#', $raw)
+                        ? $raw
+                        : $baseDir . DIRECTORY_SEPARATOR . $raw),
+                $includes
+            ),
+            fallbackIncludes($code, $baseDir)
+        ));
+        $includes = array_values($includes);
+    }
+
+    return $includes;
+}
+
+/** ルート→再帰的 include 一覧（深さ付き）を構築 */
+function buildTransitive(string $root, array $direct): array
+{
+    $queue   = [];
+    $visited = [];
+    $out     = [];
+
+    foreach ($direct[$root] ?? [] as $inc) {
+        $queue[] = [$inc, 1];
+    }
+
+    while ($queue) {
+        [$cur, $depth] = array_shift($queue);
+        if (isset($visited[$cur])) continue;
+
+        $visited[$cur] = true;
+        $out[]         = ['depth' => $depth, 'path' => $cur];
+
+        foreach ($direct[$cur] ?? [] as $child) {
+            $queue[] = [$child, $depth + 1];
+        }
+    }
+    return $out;
+}
+
+/** 使い方 */
+function usage(): never
+{
+    fwrite(STDERR, "Usage: php include_analyzer.php <project_root> [output.xlsx]\n");
+    exit(1);
+}
+
+/** ─────────────────────  エントリーポイント ―──────────────────── */
+if ($argc < 2) usage();
+
+$rootDir = realpath($argv[1]);
+if (!$rootDir || !is_dir($rootDir)) {
+    fwrite(STDERR, "Invalid directory: {$argv[1]}\n");
+    exit(1);
+}
+$outFile = $argv[2] ?? 'include_analysis.xlsx';
+
+$parser      = (new ParserFactory())->createForNewestSupportedVersion();
+$directGraph = [];
+
+/* 1) 直接 include グラフ構築 */
+foreach (collectSourceFiles($rootDir) as $file) {
+    $directGraph[$file] = extractIncludes($file, $parser);
+}
+
+/* 2) Excel 生成 */
+$book        = new Spreadsheet();
+/* ─ Include-Direct ─ */
+$directSheet = $book->getActiveSheet();
+$directSheet->setTitle('Include-Direct');
+$directSheet->fromArray(['File', 'Included (direct)'], null, 'A1');
+
+$r = 2;
+foreach ($directGraph as $file => $incs) {
+    if (!$incs) {
+        $directSheet->setCellValue("A{$r}", $file);
+        $r++;
+        continue;
+    }
+    foreach ($incs as $i => $inc) {
+        if ($i === 0) $directSheet->setCellValue("A{$r}", $file);
+        $directSheet->setCellValue("B{$r}", $inc);
+        $r++;
+    }
+}
+/* ─ Include-All ─ */
+$allSheet = $book->createSheet();
+$allSheet->setTitle('Include-All');
+$allSheet->fromArray(['Root File', 'Depth', 'Included (transitive)'], null, 'A1');
+
+$r = 2;
+foreach (array_keys($directGraph) as $file) {
+    foreach (buildTransitive($file, $directGraph) as $rec) {
+        $allSheet->setCellValue("A{$r}", $file);
+        $allSheet->setCellValue("B{$r}", (string)$rec['depth']);
+        $allSheet->setCellValue("C{$r}", $rec['path']);
+        $r++;
+    }
+}
+
+/* オートサイズ */
+foreach ([$directSheet, $allSheet] as $sh) {
+    foreach (range('A', 'C') as $col) {
+        $sh->getColumnDimension($col)->setAutoSize(true);
+    }
+}
+
+(new Xlsx($book))->save($outFile);
+echo "✓ Include analysis written → {$outFile}\n";
