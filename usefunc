@@ -1,0 +1,8 @@
+<?php
+require_once __DIR__ . '/src/LegacyCleaner.php';
+
+$rawCode   = file_get_contents('legacy_sample.php');
+$cleanCode = LegacyCleaner\clean($rawCode);   // ← ここで変換
+
+// 以降は $cleanCode を好きに処理
+// 例) $ast = (new PhpParser\ParserFactory)->create(...)->parse($cleanCode);
