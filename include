@@ -13,24 +13,35 @@ use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 use PhpOffice\PhpSpreadsheet\Settings;
 use PhpOffice\PhpSpreadsheet\CachedObjectStorageFactory;
 
-/*────────────────────────── メモリ節約設定 ──────────────────────────*/
-Settings::setCacheStorageMethod(
-    CachedObjectStorageFactory::cache_to_phpTemp,
-    ['memoryCacheSize' => '16MB']
-);
-Settings::setAutoSizeMethod(Settings::AUTOSIZE_METHOD_APPROX);
+/*────────────────────────── メモリ節約設定（未実装環境はスキップ） ──────────────────────────*/
+if (
+    class_exists(Settings::class)
+    && method_exists(Settings::class, 'setCacheStorageMethod')
+    && method_exists(CachedObjectStorageFactory::class, 'cache_to_phpTemp')
+) {
+    Settings::setCacheStorageMethod(
+        CachedObjectStorageFactory::cache_to_phpTemp,
+        ['memoryCacheSize' => '16MB']
+    );
+}
+if (
+    class_exists(Settings::class)
+    && method_exists(Settings::class, 'setAutoSizeMethod')
+) {
+    Settings::setAutoSizeMethod(Settings::AUTOSIZE_METHOD_APPROX);
+}
 
 /*────────────────────────── 定数 ─────────────────────────────*/
 const ALLOWED_EXT = ['php', 'inc'];
 
-/*────────────────────────── AST Visitor for $var = ... ──────────────────────────*/
+/*────────────────────────── AST Visitor for $var assignments ──────────────────────────*/
 class AssignVisitor extends NodeVisitorAbstract
 {
-    public array $vars = []; // ['path'=>'../foo.php', ...]
+    /** @var array<string,string> 変数名→文字列リテラル */
+    public array $vars = [];
 
     public function enterNode(Node $node)
     {
-        // $var = 'literal'; / $var = $otherVar; / $var = $a . 'b';
         if (
             $node instanceof Node\Expr\Assign
             && $node->var instanceof Node\Expr\Variable
@@ -43,7 +54,7 @@ class AssignVisitor extends NodeVisitorAbstract
         }
     }
 
-    // AST外からも呼べるよう public に
+    /** AST外からも呼べるよう public に変更 */
     public function resolveValue(Node $expr): ?string
     {
         if ($expr instanceof Node\Scalar\String_) {
@@ -68,15 +79,17 @@ class AssignVisitor extends NodeVisitorAbstract
 }
 
 /*────────────────────────── ヘルパ関数群 ──────────────────────────*/
-// 再帰ファイル走査（Generator）
+/**
+ * 再帰ディレクトリ走査ジェネレータ
+ * @return Generator<string>
+ */
 function iterateSourceFiles(string $dir): Generator
 {
     $it = new RecursiveIteratorIterator(
         new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS)
     );
     foreach ($it as $f) {
-        if (
-            $f->isFile()
+        if ($f->isFile()
             && in_array(strtolower($f->getExtension()), ALLOWED_EXT, true)
         ) {
             yield $f->getPathname();
@@ -84,7 +97,10 @@ function iterateSourceFiles(string $dir): Generator
     }
 }
 
-// 正規表現フォールバックで「生文字列リテラル」だけ捕捉
+/**
+ * フォールバック正規表現で生文字列リテラルだけ抽出
+ * @return string[]
+ */
 function fallbackIncludes(string $code): array
 {
     preg_match_all(
@@ -95,35 +111,33 @@ function fallbackIncludes(string $code): array
     return array_unique($m[2] ?? []);
 }
 
-// 絶対/相対の raw 値を決め打ちしつつ、「解析用ID (fileId)」を返す
-function makeFileId(string $absPath, string $projectRoot): string
-{
-    $norm = str_replace('\\','/',$absPath);
-    if (str_starts_with($norm, $projectRoot.'/')) {
-        return ltrim(substr($norm, strlen($projectRoot)), '/');
-    }
-    return $norm;
-}
-
-// raw の文字列を filesystem 上のパスに解決
+/**
+ * 生文字列 raw を filesystem パスに解決
+ */
 function resolvePath(string $raw, string $baseDir): string
 {
-    // 絶対リテラルならそのまま realpath → raw も unchanged
     if (preg_match('#^([A-Za-z]:[\\/]|/)#', $raw)) {
         return realpath($raw) ?: $raw;
     }
-    // 相対は baseDir 経由
     $joined = $baseDir . DIRECTORY_SEPARATOR . $raw;
     return realpath($joined) ?: $joined;
 }
 
 /**
- * AST＋フォールバックで「raw文字列」と「解析用 fileId」を返す
- * [
- *   ['raw'=>'../inc/util.php','id'=>'inc/util.php'],
- *   ['raw'=>'/etc/config.php','id'=>'/etc/config.php'],
- *   ...
- * ]
+ * projectRoot 以下なら相対パス、それ以外は絶対パスを返す
+ */
+function makeFileId(string $absPath, string $projectRoot): string
+{
+    $norm = str_replace('\\','/',$absPath);
+    if (str_starts_with($norm, $projectRoot . '/')) {
+        return ltrim(substr($norm, strlen($projectRoot)), '/');
+    }
+    return $norm;
+}
+
+/**
+ * 1 ファイルの include を AST + フォールバック で抽出
+ * @return array<int,array{raw:string,id:string}>
  */
 function extractIncludes(
     string $absFile,
@@ -136,39 +150,33 @@ function extractIncludes(
     // 1) 変数割当収集
     $assignVis = new AssignVisitor();
     try {
-        $ast = $parser->parse($code);
-        (new NodeTraverser())->addVisitor($assignVis)->traverse($ast);
+        $ast = $parser->parse($code) ?? [];
     } catch (\Throwable) {
         $ast = [];
     }
+    $trav = new NodeTraverser();
+    $trav->addVisitor($assignVis);
+    $trav->traverse($ast);
 
     $entries = [];
-    // 2) Include_ ノードごとに raw を取得
+    // 2) Include_ ノードから raw を取得
     foreach ($ast as $node) {
-        if (! $node instanceof Node\Expr\Include_) {
-            continue;
-        }
+        if (! $node instanceof Node\Expr\Include_) continue;
         $raw = null;
-        // 文字列リテラル
         if ($node->expr instanceof Node\Scalar\String_) {
             $raw = $node->expr->value;
-        }
-        // 変数展開
-        elseif (
+        } elseif (
             $node->expr instanceof Node\Expr\Variable
             && isset($assignVis->vars[$node->expr->name])
         ) {
             $raw = $assignVis->vars[$node->expr->name];
-        }
-        // 文字列連結
-        elseif ($node->expr instanceof Node\Expr\BinaryOp\Concat) {
+        } elseif ($node->expr instanceof Node\Expr\BinaryOp\Concat) {
             $raw = $assignVis->resolveValue($node->expr);
         }
-
         if ($raw !== null) {
             $abs = resolvePath($raw, $baseDir);
             $id  = makeFileId($abs, $projectRoot);
-            $entries[$id] = ['raw' => $raw, 'id' => $id];
+            $entries[$id] = ['raw'=>$raw,'id'=>$id];
         }
     }
 
@@ -181,11 +189,14 @@ function extractIncludes(
         }
     }
 
-    // ensure numeric index
     return array_values($entries);
 }
 
-// 深さ付き再帰走査：raw付き
+/**
+ * 深さ付き再帰走査：raw を保持してコールバック
+ * @param callable(string):array<int,array{raw:string,id:string}> $getEntries
+ * @param callable(int,string):void $onEdge
+ */
 function walkTransitive(
     string $rootId,
     callable $getEntries,
@@ -197,20 +208,18 @@ function walkTransitive(
     foreach ($getEntries($rootId) as $e) {
         $queue->enqueue([$e['id'], 1, $e['raw']]);
     }
-
     while (!$queue->isEmpty()) {
         [$cur, $depth, $raw] = $queue->dequeue();
         if (isset($visited[$cur])) continue;
         $visited[$cur] = true;
         $onEdge($depth, $raw);
-
         foreach ($getEntries($cur) as $e) {
             $queue->enqueue([$e['id'], $depth+1, $e['raw']]);
         }
     }
 }
 
-/*────────────────────────── Main ───────────────────────────*/
+/*────────────────────────── Main Entry ───────────────────────────*/
 if ($argc < 2) {
     fwrite(STDERR, "Usage: php include_analyzer.php <project_root> [output.xlsx]\n");
     exit(1);
@@ -222,9 +231,10 @@ if (!$projectRoot || !is_dir($projectRoot)) {
 }
 $outFile = $argv[2] ?? 'include_analysis.xlsx';
 
+// Parser を createForNewestSupportedVersion() でインスタンス化
 $parser = (new ParserFactory())->createForNewestSupportedVersion();
 
-// Excel 準備
+// Excel 初期化
 $book        = new Spreadsheet();
 $directSheet = $book->getActiveSheet()
     ->setTitle('Include-Direct')
@@ -234,21 +244,20 @@ $allSheet    = $book->createSheet()
     ->fromArray(['Root File','Depth','Included (transitive)'],null,'A1');
 $directRow = $allRow = 2;
 
-// ファイル→インクルード情報キャッシュ
+// キャッシュ領域
 $includeCache = [];
 
-// 再帰走査 & 逐次書込
+/* 再帰ファイル走査 & 逐次書き込み */
 foreach (iterateSourceFiles($projectRoot) as $absFile) {
-    // ファイルID = projectRoot下は相対パス, それ以外は絶対パス
     $fileId = makeFileId($absFile, $projectRoot);
 
     // 直接解析
     $entries = extractIncludes($absFile, $parser, $projectRoot);
     $includeCache[$fileId] = $entries;
 
-    // Include-Direct シート
+    // Include-Direct
     if (empty($entries)) {
-        $directSheet->fromArray([$fileId,''], null, "A{$directRow}");
+        $directSheet->fromArray([$fileId, ''], null, "A{$directRow}");
         $directRow++;
     } else {
         foreach ($entries as $i => $e) {
@@ -260,12 +269,12 @@ foreach (iterateSourceFiles($projectRoot) as $absFile) {
         }
     }
 
-    // Include-All シート
+    // Include-All
     walkTransitive(
         $fileId,
         fn($id) => $includeCache[$id] ?? [],
-        function(int $depth, string $raw) use(&$allSheet,&$allRow,$fileId) {
-            $allSheet->fromArray([$fileId,$depth,$raw], null, "A{$allRow}");
+        function(int $depth, string $raw) use (&$allSheet, &$allRow, $fileId) {
+            $allSheet->fromArray([$fileId, $depth, $raw], null, "A{$allRow}");
             $allRow++;
         }
     );
@@ -276,7 +285,7 @@ foreach (iterateSourceFiles($projectRoot) as $absFile) {
 }
 
 // 列幅調整
-foreach ([$directSheet,$allSheet] as $sh) {
+foreach ([$directSheet, $allSheet] as $sh) {
     foreach (['A','B','C'] as $col) {
         $sh->getColumnDimension($col)->setAutoSize(true);
     }
