@@ -2,6 +2,8 @@
 <?php
 declare(strict_types=1);
 
+/* ───────────── CLI 入口 ───────────── */
+
 $argv = $_SERVER['argv'];
 array_shift($argv);
 
@@ -10,7 +12,7 @@ if (empty($argv) || in_array($argv[0], ['-h', '--help'], true)) {
     usage: php cleanup.php <file|directory>
 
       整形後のファイルはカレントディレクトリの edited/ 以下に出力されます。
-      元ファイルは上書きしません。
+      実行前に edited/ の中身はすべて削除されます。
 
     HELP);
     exit($argv ? 0 : 1);
@@ -22,28 +24,35 @@ if ($targetPath === false) {
     exit(1);
 }
 
+/* ───────────── 出力フォルダ準備 ───────────── */
+
+$cwd        = getcwd();
+$editedRoot = $cwd . DIRECTORY_SEPARATOR . 'edited';
+prepareEditedDir($editedRoot);    // ← ここで再帰削除＋mkdir
+
+/* ───────────── ファイル収集 ───────────── */
+
 $files = collectPhpFiles($targetPath);
 if (!$files) {
     fwrite(STDERR, "No PHP/INC files found.\n");
     exit(0);
 }
 
-$basePath   = is_file($targetPath) ? dirname($targetPath) : rtrim($targetPath, DIRECTORY_SEPARATOR);
-$cwd        = getcwd();
-$editedRoot = $cwd . DIRECTORY_SEPARATOR . 'edited';
+$basePath = is_file($targetPath)
+    ? dirname($targetPath)
+    : rtrim($targetPath, DIRECTORY_SEPARATOR);
 
-if (!is_dir($editedRoot) && !mkdir($editedRoot, 0777, true) && !is_dir($editedRoot)) {
-    fwrite(STDERR, "Error: cannot create 'edited' directory.\n");
-    exit(1);
-}
+/* ───────────── 変換＆書き出し ───────────── */
 
 foreach ($files as $file) {
     $source = toUtf8(file_get_contents($file));
+
     $userConsts = collectUserDefinedConstants($source);
-    $defined = array_merge(
+    $defined    = array_merge(
         array_keys(get_defined_constants(true)['Core'] ?? get_defined_constants()),
         $userConsts
     );
+
     $clean = transformSource($source, $defined);
 
     $relative = ltrim(substr($file, strlen($basePath)), DIRECTORY_SEPARATOR);
@@ -59,8 +68,37 @@ foreach ($files as $file) {
     echo "[OK]  {$destPath}\n";
 }
 
-/* === 以下は関数定義部 === */
+/* ───────────── 関数定義群 ───────────── */
 
+/**
+ * edited/ ディレクトリを再作成
+ *  - 既に存在する場合は中身を再帰削除
+ *  - 不存在なら mkdir
+ */
+function prepareEditedDir(string $dir): void
+{
+    if (is_dir($dir)) {
+        $iter = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator(
+                $dir,
+                FilesystemIterator::SKIP_DOTS | FilesystemIterator::CURRENT_AS_PATHNAME
+            ),
+            RecursiveIteratorIterator::CHILD_FIRST
+        );
+        foreach ($iter as $path) {
+            is_dir($path) ? rmdir($path) : unlink($path);
+        }
+    }
+    if (!is_dir($dir) && !mkdir($dir, 0777, true) && !is_dir($dir)) {
+        fwrite(STDERR, "Error: cannot recreate 'edited' directory.\n");
+        exit(1);
+    }
+}
+
+/**
+ * 再帰的に *.php / *.inc ファイルを収集
+ * @return string[]
+ */
 function collectPhpFiles(string $path): array
 {
     if (is_file($path)) {
@@ -84,116 +122,6 @@ function collectPhpFiles(string $path): array
     return $files;
 }
 
-function collectUserDefinedConstants(string $code): array
-{
-    if (preg_match_all(
-        '/\bdefine\s*\(\s*[\'"]([A-Z_\x80-\xff][A-Z0-9_\x80-\xff]*)[\'"]\s*,/i',
-        $code,
-        $m
-    )) {
-        return $m[1];
-    }
-    return [];
-}
+/* …(collectUserDefinedConstants, transformSource, quoteArrayKeys, rebuildSource, toUtf8 は前回と同じなので省略)… */
 
-function transformSource(string $code, array $definedConsts): string
-{
-    $tokens = token_get_all($code);
-    $tokens = quoteArrayKeys($tokens, $definedConsts);
-    return rebuildSource($tokens);
-}
-
-function quoteArrayKeys(array $tokens, array $definedConsts): array
-{
-    $n = count($tokens);
-
-    for ($i = 0; $i < $n; $i++) {
-        if ($tokens[$i] !== '[') {
-            continue;
-        }
-
-        $j = $i + 1;
-        while ($j < $n && is_array($tokens[$j]) && $tokens[$j][0] === T_WHITESPACE) {
-            $j++;
-        }
-        if ($j >= $n || !is_array($tokens[$j]) || $tokens[$j][0] !== T_STRING) {
-            continue;
-        }
-
-        $key = $tokens[$j][1];
-        $k = $j + 1;
-        while ($k < $n && is_array($tokens[$k]) && $tokens[$k][0] === T_WHITESPACE) {
-            $k++;
-        }
-        if ($k >= $n || !in_array($tokens[$k], [']', '=>'], true)) {
-            continue;
-        }
-
-        if (in_array(strtolower($key), ['true', 'false', 'null'], true)) {
-            continue;
-        }
-        if (in_array($key, $definedConsts, true)) {
-            continue;
-        }
-
-        $tokens[$j] = [T_CONSTANT_ENCAPSED_STRING, "'" . addcslashes($key, "'\\") . "'"];
-    }
-    return $tokens;
-}
-
-function rebuildSource(array $tokens): string
-{
-    $out = '';
-    $prevNL = false;
-    $needSpace = false;
-
-    foreach ($tokens as $tok) {
-        if (is_array($tok)) {
-            [$id, $text] = $tok;
-
-            switch ($id) {
-                case T_COMMENT:
-                case T_DOC_COMMENT:
-                    continue 2;
-
-                case T_WHITESPACE:
-                    if (strpos($text, "\n") !== false) {
-                        if (!$prevNL) {
-                            $out .= "\n";
-                            $prevNL = true;
-                        }
-                        $needSpace = false;
-                    } else {
-                        $needSpace = true;
-                    }
-                    continue 2;
-
-                default:
-                    if ($needSpace && (ctype_alnum($text[0]) || $text[0] === '_')) {
-                        $out .= ' ';
-                    }
-                    $out .= $text;
-                    $prevNL = false;
-                    $needSpace = false;
-            }
-        } else {
-            $out .= $tok;
-            $prevNL = ($tok === "\n");
-            $needSpace = false;
-        }
-    }
-    return $out;
-}
-
-function toUtf8(string $str): string
-{
-    if (function_exists('mb_detect_encoding')) {
-        $enc = mb_detect_encoding(
-            $str,
-            ['UTF-8', 'SJIS', 'EUC-JP', 'ISO-8859-1'],
-            true
-        ) ?: 'UTF-8';
-        $str = mb_convert_encoding($str, 'UTF-8', $enc);
-    }
-    return ltrim($str, "\xEF\xBB\xBF");
-}
+/* === 省略部分は “前回回答の内容” と同一 === */
