@@ -1,38 +1,16 @@
 #!/usr/bin/env php
 <?php
-/**
- * cleanup.php  ─ レガシー PHP ソース一括整形ツール
- * ----------------------------------------------------------------------
- *   1. コメントをすべて削除           （//, #, /* */, <!-- -->）
- *   2. 不要な空白を圧縮               （改行は 1 行残し・連続スペース 1 個）
- *   3. bareword 配列キーを補完         （未定義定数なら 'KEY' に置換）
- *   4. 文字コードを UTF-8 に再エンコード（BOM 除去）
- *
- * 使い方:
- *   php cleanup.php <file|directory>
- *     変換後ファイルは「現在の作業ディレクトリ」に
- *     元の階層構造を保ったまま自動出力されます。
- *
- * 対応 PHP : 7.4+
- * 依存     : なし（標準拡張のみ）
- * ----------------------------------------------------------------------
- * @author  ChatGPT
- * @license MIT
- */
 declare(strict_types=1);
 
-/* ──────────────────────── CLI 入口 ─────────────────────── */
-
 $argv = $_SERVER['argv'];
-array_shift($argv);                               // スクリプト名を除去
+array_shift($argv);
 
-// 引数チェック
 if (empty($argv) || in_array($argv[0], ['-h', '--help'], true)) {
     fwrite(STDERR, <<<HELP
     usage: php cleanup.php <file|directory>
 
-      整形後のファイルはカレントディレクトリに生成されます。
-      元ファイルの上書きは一切行いません。
+      整形後のファイルはカレントディレクトリの edited/ 以下に出力されます。
+      元ファイルは上書きしません。
 
     HELP);
     exit($argv ? 0 : 1);
@@ -44,57 +22,45 @@ if ($targetPath === false) {
     exit(1);
 }
 
-// 変換対象ファイル一覧を収集 (*.php / *.inc)
 $files = collectPhpFiles($targetPath);
 if (!$files) {
     fwrite(STDERR, "No PHP/INC files found.\n");
     exit(0);
 }
 
-// 変換処理
-$basePath = is_file($targetPath)
-    ? dirname($targetPath)            // 単一ファイル指定時: 親ディレクトリを基準に
-    : rtrim($targetPath, DIRECTORY_SEPARATOR); // ディレクトリ指定時: そのディレクトリを基準に
-$cwd      = getcwd();
+$basePath   = is_file($targetPath) ? dirname($targetPath) : rtrim($targetPath, DIRECTORY_SEPARATOR);
+$cwd        = getcwd();
+$editedRoot = $cwd . DIRECTORY_SEPARATOR . 'edited';
+
+if (!is_dir($editedRoot) && !mkdir($editedRoot, 0777, true) && !is_dir($editedRoot)) {
+    fwrite(STDERR, "Error: cannot create 'edited' directory.\n");
+    exit(1);
+}
 
 foreach ($files as $file) {
-    // 1) ソース取得 ＆ UTF-8 変換
     $source = toUtf8(file_get_contents($file));
-
-    // 2) ユーザー定義定数を抽出
     $userConsts = collectUserDefinedConstants($source);
-    $defined    = array_merge(
+    $defined = array_merge(
         array_keys(get_defined_constants(true)['Core'] ?? get_defined_constants()),
         $userConsts
     );
-
-    // 3) コメント除去・空白圧縮・キー補完
     $clean = transformSource($source, $defined);
 
-    // 4) 出力先パスを決定（カレント dir 以下に元階層のまま複製）
     $relative = ltrim(substr($file, strlen($basePath)), DIRECTORY_SEPARATOR);
-    $destPath = $cwd . DIRECTORY_SEPARATOR . $relative;
+    $destPath = $editedRoot . DIRECTORY_SEPARATOR . $relative;
 
-    // 5) 必要に応じてディレクトリを生成
     $dir = dirname($destPath);
     if (!is_dir($dir) && !mkdir($dir, 0777, true) && !is_dir($dir)) {
         fwrite(STDERR, "Error: mkdir failed: {$dir}\n");
         continue;
     }
 
-    // 6) ファイル出力
     file_put_contents($destPath, $clean);
     echo "[OK]  {$destPath}\n";
 }
 
-/* ──────────────────── ここから関数定義 ──────────────────── */
+/* === 以下は関数定義部 === */
 
-/**
- * 再帰的に *.php / *.inc ファイルを収集
- *
- * @param string $path 対象パス（ファイルまたはディレクトリ）
- * @return string[]    ファイルパス配列（絶対パス）
- */
 function collectPhpFiles(string $path): array
 {
     if (is_file($path)) {
@@ -118,12 +84,6 @@ function collectPhpFiles(string $path): array
     return $files;
 }
 
-/**
- * ソースコード中の define('CONST', …) からユーザー定義定数を列挙
- *
- * @param string $code 元ソース
- * @return string[]    定数名のリスト
- */
 function collectUserDefinedConstants(string $code): array
 {
     if (preg_match_all(
@@ -136,44 +96,31 @@ function collectUserDefinedConstants(string $code): array
     return [];
 }
 
-/**
- * コメント削除・空白圧縮・bareword キー補完をまとめて実行
- */
 function transformSource(string $code, array $definedConsts): string
 {
-    $tokens = token_get_all($code);                         // PHP をトークン列へ
-    $tokens = quoteArrayKeys($tokens, $definedConsts);      // bareword キー置換
-    return rebuildSource($tokens);                          // コメント除去＆再構築
+    $tokens = token_get_all($code);
+    $tokens = quoteArrayKeys($tokens, $definedConsts);
+    return rebuildSource($tokens);
 }
 
-/**
- * bareword 配列キー (T_STRING) を 'KEY' へ変換
- *
- *  [ T_WHITESPACE ] … をスキップしつつ
- *  '[' 直後に T_STRING があり、その後に ']' か '=>' が続く場合のみ置換。
- *  既定定数・ユーザー定義定数・true/false/null は対象外。
- */
 function quoteArrayKeys(array $tokens, array $definedConsts): array
 {
     $n = count($tokens);
 
     for ($i = 0; $i < $n; $i++) {
         if ($tokens[$i] !== '[') {
-            continue;                                       // '[' でない ⇒ 無関係
+            continue;
         }
 
-        // ── 次の実トークンを取得（空白スキップ）────────────────
         $j = $i + 1;
         while ($j < $n && is_array($tokens[$j]) && $tokens[$j][0] === T_WHITESPACE) {
             $j++;
         }
         if ($j >= $n || !is_array($tokens[$j]) || $tokens[$j][0] !== T_STRING) {
-            continue;                                       // 期待する位置に T_STRING が無い
+            continue;
         }
 
         $key = $tokens[$j][1];
-
-        // ── T_STRING 直後のトークンを確認 (' ] ' か ' => ' であること) ──
         $k = $j + 1;
         while ($k < $n && is_array($tokens[$k]) && $tokens[$k][0] === T_WHITESPACE) {
             $k++;
@@ -182,7 +129,6 @@ function quoteArrayKeys(array $tokens, array $definedConsts): array
             continue;
         }
 
-        // true/false/null・既定/ユーザー定義定数 ⇒ スキップ
         if (in_array(strtolower($key), ['true', 'false', 'null'], true)) {
             continue;
         }
@@ -190,71 +136,55 @@ function quoteArrayKeys(array $tokens, array $definedConsts): array
             continue;
         }
 
-        // ── bareword ⇒ 'KEY' へ置換（エスケープも考慮）──────────
         $tokens[$j] = [T_CONSTANT_ENCAPSED_STRING, "'" . addcslashes($key, "'\\") . "'"];
     }
     return $tokens;
 }
 
-/**
- * トークン列を「コメント除去・空白圧縮」しながら再構築
- *
- * ・改行は 1 行のみ残す（連続改行を圧縮）
- * ・識別子が連続する場合は 1 つスペースを補完
- */
 function rebuildSource(array $tokens): string
 {
-    $out        = '';
-    $prevNL     = false;   // 直前に改行を出力したか
-    $needSpace  = false;   // 識別子衝突回避用スペース
+    $out = '';
+    $prevNL = false;
+    $needSpace = false;
 
     foreach ($tokens as $tok) {
         if (is_array($tok)) {
             [$id, $text] = $tok;
 
             switch ($id) {
-                // ── コメントは完全削除 ──────────────────────
                 case T_COMMENT:
                 case T_DOC_COMMENT:
-                    continue 2;          // foreach へ
+                    continue 2;
 
-                // ── 空白トークン ───────────────────────────
                 case T_WHITESPACE:
                     if (strpos($text, "\n") !== false) {
                         if (!$prevNL) {
-                            $out   .= "\n";   // 連続改行を 1 行に圧縮
+                            $out .= "\n";
                             $prevNL = true;
                         }
                         $needSpace = false;
                     } else {
-                        $needSpace = true;    // 連続識別子の衝突を避ける
+                        $needSpace = true;
                     }
-                    continue 2;          // foreach へ
+                    continue 2;
 
-                // ── それ以外（実コード）────────────────────
                 default:
                     if ($needSpace && (ctype_alnum($text[0]) || $text[0] === '_')) {
                         $out .= ' ';
                     }
-                    $out      .= $text;
-                    $prevNL    = false;
+                    $out .= $text;
+                    $prevNL = false;
                     $needSpace = false;
             }
-        } else {                        // 1 文字トークン
-            $out      .= $tok;
-            $prevNL   = ($tok === "\n");
+        } else {
+            $out .= $tok;
+            $prevNL = ($tok === "\n");
             $needSpace = false;
         }
     }
     return $out;
 }
 
-/**
- * 文字コードを UTF-8 に統一（BOM も除去）
- *
- * ・mbstring が利用可能なら自動判定＋再エンコード
- * ・無効環境でも BOM だけは手動で取り除く
- */
 function toUtf8(string $str): string
 {
     if (function_exists('mb_detect_encoding')) {
@@ -265,6 +195,5 @@ function toUtf8(string $str): string
         ) ?: 'UTF-8';
         $str = mb_convert_encoding($str, 'UTF-8', $enc);
     }
-    // UTF-8 BOM を除去
     return ltrim($str, "\xEF\xBB\xBF");
 }
