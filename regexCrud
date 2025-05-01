@@ -157,14 +157,21 @@ function extractCrudOperations(
     // 6) 単一＋多候補マージ
     $merged = $real + $multiRes;
 
-    // 7) ビューリスト対応(@view)
+    // 7) ビューリスト対応(@view) – キーを文字列化してから処理
     $final = [];
     foreach ($merged as $tblKey => $ops) {
-        $base = preg_replace('/@multi$/', '', $tblKey);
+        // tblKey が整数の場合も文字列化
+        $tblKeyStr = (string)$tblKey;
+        // @multi を除去
+        if (substr($tblKeyStr, -6) === '@multi') {
+            $base = substr($tblKeyStr, 0, -6);
+        } else {
+            $base = $tblKeyStr;
+        }
         if (in_array($base, $viewList, true)) {
             $final[$base . '@view'] = $ops;
         } else {
-            $final[$tblKey] = $ops;
+            $final[$tblKeyStr] = $ops;
         }
     }
 
