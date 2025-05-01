@@ -1,18 +1,39 @@
 #!/usr/bin/env php
 <?php
+/**
+ * cleanup.php  ─ レガシー PHP ソース一括整形ツール
+ * ----------------------------------------------------------------------
+ *  処理内容
+ *    1. コメントをすべて削除           （//, #, /* */, <!-- -->）
+ *    2. 不要な空白を圧縮               （改行は 1 行残し・連続スペース 1 個）
+ *    3. bareword 配列キーを補完         （未定義定数なら 'KEY' に置換）
+ *    4. 文字コードを UTF-8 に再エンコード（BOM 除去）
+ *
+ *  使い方
+ *    php cleanup.php <file|directory>
+ *      ・整形後のファイルはカレントディレクトリの edited/ 以下に出力されます
+ *      ・実行前に edited/ の内容は再帰的に削除されます
+ *      ・元ファイルは一切上書きしません
+ *
+ *  対応 PHP : 7.4+
+ *  依存     : なし（標準拡張のみで動作）
+ * ----------------------------------------------------------------------
+ * @author  ChatGPT
+ * @license MIT
+ */
 declare(strict_types=1);
 
-/* ───────────── CLI 入口 ───────────── */
+/* ───────────────────────── CLI 入口 ───────────────────────── */
 
 $argv = $_SERVER['argv'];
-array_shift($argv);
+array_shift($argv);                              // スクリプト名を除去
 
 if (empty($argv) || in_array($argv[0], ['-h', '--help'], true)) {
     fwrite(STDERR, <<<HELP
     usage: php cleanup.php <file|directory>
 
       整形後のファイルはカレントディレクトリの edited/ 以下に出力されます。
-      実行前に edited/ の中身はすべて削除されます。
+      実行前に edited/ の内容はすべて削除されます。
 
     HELP);
     exit($argv ? 0 : 1);
@@ -24,13 +45,14 @@ if ($targetPath === false) {
     exit(1);
 }
 
-/* ───────────── 出力フォルダ準備 ───────────── */
+/* ────────────────── 出力フォルダ（edited/）準備 ────────────────── */
 
-$cwd        = getcwd();
+$cwd        = getcwd();                                      // 実行ディレクトリ
 $editedRoot = $cwd . DIRECTORY_SEPARATOR . 'edited';
-prepareEditedDir($editedRoot);    // ← ここで再帰削除＋mkdir
 
-/* ───────────── ファイル収集 ───────────── */
+prepareEditedDir($editedRoot);                               // 中身再帰削除＋mkdir
+
+/* ───────────────────── ファイル収集 ───────────────────── */
 
 $files = collectPhpFiles($targetPath);
 if (!$files) {
@@ -38,46 +60,60 @@ if (!$files) {
     exit(0);
 }
 
+/*
+ * 基準パスを決定
+ *   - ファイル指定時 : その親ディレクトリを基準に相対化
+ *   - ディレクトリ指定時 : そのディレクトリ自体を基準に相対化
+ */
 $basePath = is_file($targetPath)
     ? dirname($targetPath)
     : rtrim($targetPath, DIRECTORY_SEPARATOR);
 
-/* ───────────── 変換＆書き出し ───────────── */
+/* ──────────────────── 変換＆書き出し ──────────────────── */
 
 foreach ($files as $file) {
+    /* 1) ソース取得 ＆ UTF-8 変換 */
     $source = toUtf8(file_get_contents($file));
 
+    /* 2) ユーザー定義定数を抽出（define('FOO', …)） */
     $userConsts = collectUserDefinedConstants($source);
-    $defined    = array_merge(
+
+    /* 3) 既定定数 + ユーザー定数を結合して未定義判定用リストに */
+    $defined = array_merge(
         array_keys(get_defined_constants(true)['Core'] ?? get_defined_constants()),
         $userConsts
     );
 
+    /* 4) コメント削除・空白圧縮・bareword キー補完を実施 */
     $clean = transformSource($source, $defined);
 
+    /* 5) 出力先パス（edited/ 以下に元階層を再現） */
     $relative = ltrim(substr($file, strlen($basePath)), DIRECTORY_SEPARATOR);
     $destPath = $editedRoot . DIRECTORY_SEPARATOR . $relative;
 
+    /* 6) ディレクトリを必要に応じて作成 */
     $dir = dirname($destPath);
     if (!is_dir($dir) && !mkdir($dir, 0777, true) && !is_dir($dir)) {
         fwrite(STDERR, "Error: mkdir failed: {$dir}\n");
         continue;
     }
 
+    /* 7) ファイル出力 */
     file_put_contents($destPath, $clean);
     echo "[OK]  {$destPath}\n";
 }
 
-/* ───────────── 関数定義群 ───────────── */
+/* ────────────────────── 関数定義群 ────────────────────── */
 
 /**
  * edited/ ディレクトリを再作成
- *  - 既に存在する場合は中身を再帰削除
- *  - 不存在なら mkdir
+ *   - 既に存在する場合は中身を再帰削除
+ *   - 無い場合は mkdir
  */
 function prepareEditedDir(string $dir): void
 {
     if (is_dir($dir)) {
+        // CHILD_FIRST で「ファイル→ディレクトリ」の順に削除
         $iter = new RecursiveIteratorIterator(
             new RecursiveDirectoryIterator(
                 $dir,
@@ -97,7 +133,9 @@ function prepareEditedDir(string $dir): void
 
 /**
  * 再帰的に *.php / *.inc ファイルを収集
- * @return string[]
+ *
+ * @param  string   $path  対象パス（ファイルまたはディレクトリ）
+ * @return string[]        収集した絶対パスの配列
  */
 function collectPhpFiles(string $path): array
 {
@@ -122,6 +160,165 @@ function collectPhpFiles(string $path): array
     return $files;
 }
 
-/* …(collectUserDefinedConstants, transformSource, quoteArrayKeys, rebuildSource, toUtf8 は前回と同じなので省略)… */
+/**
+ * ソースコード内の define('CONST', …) を検出して定数名を取得
+ *
+ * @param  string   $code  ソースコード
+ * @return string[]        定数名リスト
+ */
+function collectUserDefinedConstants(string $code): array
+{
+    if (preg_match_all(
+        '/\bdefine\s*\(\s*[\'"]([A-Z_\x80-\xff][A-Z0-9_\x80-\xff]*)[\'"]\s*,/i',
+        $code,
+        $m
+    )) {
+        return $m[1];
+    }
+    return [];
+}
 
-/* === 省略部分は “前回回答の内容” と同一 === */
+/**
+ * コメント削除・空白圧縮・bareword キー補完を 1 パスで実行
+ *
+ * @param  string $code           元ソース
+ * @param  array  $definedConsts  既定＋ユーザー定数
+ * @return string                 変換済みソース
+ */
+function transformSource(string $code, array $definedConsts): string
+{
+    $tokens = token_get_all($code);                 // ① PHP トークン列へ分解
+    $tokens = quoteArrayKeys($tokens, $definedConsts); // ② bareword キー補完
+    return rebuildSource($tokens);                  // ③ コメント除去＆再構築
+}
+
+/**
+ * bareword 配列キー（T_STRING）を 'KEY' に置換
+ *
+ *   pattern: '[' ws* T_STRING ws* (']' | '=>')
+ *
+ * 既定定数 / ユーザー定数 / true,false,null は対象外。
+ *
+ * @param  array $tokens          token_get_all() の戻り値
+ * @param  array $definedConsts   判定用の定数リスト
+ * @return array                  変換後トークン列
+ */
+function quoteArrayKeys(array $tokens, array $definedConsts): array
+{
+    $n = count($tokens);
+
+    for ($i = 0; $i < $n; $i++) {
+        if ($tokens[$i] !== '[') {
+            continue;                                 // '[' 以外は無関係
+        }
+
+        /* 次の実トークン（空白スキップ） */
+        $j = $i + 1;
+        while ($j < $n && is_array($tokens[$j]) && $tokens[$j][0] === T_WHITESPACE) {
+            $j++;
+        }
+        if ($j >= $n || !is_array($tokens[$j]) || $tokens[$j][0] !== T_STRING) {
+            continue;                                 // T_STRING でない
+        }
+
+        $key = $tokens[$j][1];
+
+        /* T_STRING 直後トークン確認（']' または '=>'） */
+        $k = $j + 1;
+        while ($k < $n && is_array($tokens[$k]) && $tokens[$k][0] === T_WHITESPACE) {
+            $k++;
+        }
+        if ($k >= $n || !in_array($tokens[$k], [']', '=>'], true)) {
+            continue;
+        }
+
+        /* true/false/null・定義済み定数はスキップ */
+        if (in_array(strtolower($key), ['true', 'false', 'null'], true)) {
+            continue;
+        }
+        if (in_array($key, $definedConsts, true)) {
+            continue;
+        }
+
+        /* bareword ⇒ 'KEY' へ置換（エスケープ考慮） */
+        $tokens[$j] = [T_CONSTANT_ENCAPSED_STRING, "'" . addcslashes($key, "'\\") . "'"];
+    }
+    return $tokens;
+}
+
+/**
+ * トークン列をコメント除去・空白圧縮しながら文字列に再構築
+ *
+ * ・コメントは完全に削除
+ * ・改行は連続しても 1 行にまとめる
+ * ・連続識別子の衝突を避けるため必要に応じてスペース補完
+ *
+ * @param  array  $tokens  トークン列
+ * @return string          再構築後のソース
+ */
+function rebuildSource(array $tokens): string
+{
+    $out       = '';
+    $prevNL    = false;   // 直前に改行を出力したか
+    $needSpace = false;   // 直前が識別子で次も識別子のときだけ空白を挿入
+
+    foreach ($tokens as $tok) {
+        if (is_array($tok)) {
+            [$id, $text] = $tok;
+
+            switch ($id) {
+                /* コメントは完全スキップ */
+                case T_COMMENT:
+                case T_DOC_COMMENT:
+                    continue 2;           // ← foreach へジャンプ
+
+                /* 空白トークン */
+                case T_WHITESPACE:
+                    if (strpos($text, "\n") !== false) {
+                        if (!$prevNL) {
+                            $out   .= "\n";   // 連続改行を 1 行に
+                            $prevNL = true;
+                        }
+                        $needSpace = false;
+                    } else {
+                        $needSpace = true;    // 後続識別子衝突回避
+                    }
+                    continue 2;           // foreach へジャンプ
+
+                /* コード本体 */
+                default:
+                    if ($needSpace && (ctype_alnum($text[0]) || $text[0] === '_')) {
+                        $out .= ' ';
+                    }
+                    $out      .= $text;
+                    $prevNL    = false;
+                    $needSpace = false;
+            }
+        } else {                            // 1 文字トークン
+            $out      .= $tok;
+            $prevNL   = ($tok === "\n");
+            $needSpace = false;
+        }
+    }
+    return $out;
+}
+
+/**
+ * すべて UTF-8 に統一（BOM も除去）
+ *
+ * @param  string $str  元文字列
+ * @return string       UTF-8 へ変換済み文字列
+ */
+function toUtf8(string $str): string
+{
+    if (function_exists('mb_detect_encoding')) {
+        $enc = mb_detect_encoding(
+            $str,
+            ['UTF-8', 'SJIS', 'EUC-JP', 'ISO-8859-1'],
+            true
+        ) ?: 'UTF-8';
+        $str = mb_convert_encoding($str, 'UTF-8', $enc);
+    }
+    /* UTF-8 BOM を除去 */
+    return ltrim($str, "\xEF\xBB\xBF");
+}
