@@ -1,0 +1,272 @@
+#!/usr/bin/env php
+<?php
+declare(strict_types=1);
+
+require __DIR__ . '/vendor/autoload.php';
+
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+
+/**
+ * ファイル内容から定数・変数のテーブル名マップを構築
+ *
+ * @param string $content
+ * @return array  ['CONST' => 'tbl', '$VAR' => ['a','b'], …]
+ */
+function buildLiteralMap(string $content): array
+{
+    $map = [];
+
+    // define('CONST','table');
+    if (preg_match_all(
+        "/define\s*\(\s*['\"](\w+)['\"]\s*,\s*['\"]([A-Za-z0-9_]+)['\"]\s*\)/",
+        $content, $m
+    )) {
+        foreach ($m[1] as $i => $const) {
+            $tbl = $m[2][$i];
+            if (!isset($map[$const])) {
+                $map[$const] = $tbl;
+            } elseif (is_string($map[$const]) && $map[$const] !== $tbl) {
+                $map[$const] = [$map[$const], $tbl];
+            } elseif (is_array($map[$const]) && !in_array($tbl, $map[$const], true)) {
+                $map[$const][] = $tbl;
+            }
+        }
+    }
+
+    // $VAR = 'table';
+    if (preg_match_all(
+        '/\$(\w+)\s*=\s*[\'"]([A-Za-z0-9_]+)[\'"]\s*;/',
+        $content, $m2
+    )) {
+        foreach ($m2[1] as $i => $var) {
+            $lit = '$' . $var;
+            $tbl = $m2[2][$i];
+            if (!isset($map[$lit])) {
+                $map[$lit] = $tbl;
+            } elseif (is_string($map[$lit]) && $map[$lit] !== $tbl) {
+                $map[$lit] = [$map[$lit], $tbl];
+            } elseif (is_array($map[$lit]) && !in_array($tbl, $map[$lit], true)) {
+                $map[$lit][] = $tbl;
+            }
+        }
+    }
+
+    return $map;
+}
+
+/**
+ * SQL文字列から CRUD を抽出（単一、多候補、ビュー注釈対応）
+ *
+ * @param string $sql
+ * @param array  $literalMap  // define/$VAR マップ
+ * @param array  $viewList    // ビュー名リスト
+ * @return array              // ['tbl'=>['C','R'], 'X@multi'=>['D'], 'vw@view'=>['R'], …]
+ */
+function extractCrudOperations(
+    string $sql,
+    array  $literalMap = [],
+    array  $viewList   = []
+): array {
+    // 1) マップを単一／多候補に振り分け
+    $single = $multi = [];
+    foreach ($literalMap as $lit => $val) {
+        if (is_array($val) && count($val) > 1) {
+            $multi[$lit] = $val;
+        } elseif (is_array($val)) {
+            $single[$lit] = $val[0];
+        } else {
+            $single[$lit] = $val;
+        }
+    }
+
+    // 2) 単一リテラルを置換
+    $resolved = $sql;
+    foreach ($single as $lit => $tbl) {
+        $resolved = preg_replace(
+            '/\b' . preg_quote($lit, '/') . '\b/i',
+            $tbl,
+            $resolved
+        );
+    }
+
+    // 3) 正規化
+    $norm = mb_strtolower(preg_replace('/\s+/', ' ', $resolved));
+
+    // 4) 単一パターン抽出
+    $patterns = [
+        '/insert\s+into\s+([a-z0-9_]+)/'               => 'C',
+        '/delete\s+from\s+([a-z0-9_]+)/'               => 'D',
+        '/update\s+([a-z0-9_]+)/'                      => 'U',
+        '/into\s+temp(?:orary)?\s+table\s+([a-z0-9_]+)/'=> 'C@temp',
+        '/with\s+([a-z0-9_]+)/'                        => 'C@temp',
+        '/create\s+temp(?:orary)?\s+table\s+([a-z0-9_]+)/'=> 'C@temp',
+        '/drop\s+table\s+([a-z0-9_]+)/'                 => 'D',
+        '/truncate\s+table\s+([a-z0-9_]+)/'            => 'D',
+        '/join\s+([a-z0-9_]+)/'                        => 'R',
+    ];
+    $real = [];
+    foreach ($patterns as $rx => $op) {
+        if (preg_match_all($rx, $norm, $m)) {
+            foreach ($m[1] as $tbl) {
+                $real[$tbl][] = $op;
+            }
+        }
+    }
+    // FROM (DELETE FROMを除く)
+    $tmpClean = preg_replace('/delete\s+from\s+[a-z0-9_]+/', '', $norm);
+    if (preg_match_all('/\bfrom\s+([a-z0-9_]+)/', $tmpClean, $m3)) {
+        foreach ($m3[1] as $tbl) {
+            $real[$tbl][] = 'R';
+        }
+    }
+    // 重複排除
+    foreach ($real as $tbl => $ops) {
+        $real[$tbl] = array_values(array_unique($ops));
+    }
+
+    // 5) 多候補(@multi)抽出
+    $multiRes = [];
+    foreach ($multi as $lit => $cands) {
+        $l = mb_strtolower($lit);
+        $opsMap = [
+            "/insert\s+into\s+" . preg_quote($l, '/') . "/"  => 'C',
+            "/delete\s+from\s+" . preg_quote($l, '/') . "/"  => 'D',
+            "/update\s+" . preg_quote($l, '/') . "/"         => 'U',
+            "/into\s+temp(?:orary)?\s+" . preg_quote($l, '/') . "/" => 'C@temp',
+            "/with\s+" . preg_quote($l, '/') . "/"            => 'C@temp',
+            "/create\s+temp(?:orary)?\s+" . preg_quote($l, '/') . "/" => 'C@temp',
+            "/drop\s+table\s+" . preg_quote($l, '/') . "/"     => 'D',
+            "/truncate\s+table\s+" . preg_quote($l, '/') . "/"=> 'D',
+            "/join\s+" . preg_quote($l, '/') . "/"            => 'R',
+            "/\bfrom\s+" . preg_quote($l, '/') . "/"          => 'R',
+        ];
+        foreach ($opsMap as $rx => $op) {
+            if (preg_match($rx, $norm)) {
+                foreach ($cands as $tbl) {
+                    $key = $tbl . '@multi';
+                    $multiRes[$key][] = $op;
+                }
+            }
+        }
+    }
+    foreach ($multiRes as $tbl => $ops) {
+        $multiRes[$tbl] = array_values(array_unique($ops));
+    }
+
+    // 6) 単一＋多候補マージ
+    $merged = $real + $multiRes;
+
+    // 7) ビューリスト対応(@view)
+    $final = [];
+    foreach ($merged as $tblKey => $ops) {
+        $base = preg_replace('/@multi$/', '', $tblKey);
+        if (in_array($base, $viewList, true)) {
+            $final[$base . '@view'] = $ops;
+        } else {
+            $final[$tblKey] = $ops;
+        }
+    }
+
+    return $final;
+}
+
+/**
+ * 再帰的に PHP/.inc ファイルを収集
+ */
+function scanPhpFiles(string $dir): array
+{
+    $rii = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($dir, RecursiveDirectoryIterator::SKIP_DOTS)
+    );
+    $files = [];
+    foreach ($rii as $f) {
+        if (!$f->isFile()) continue;
+        if (preg_match('/\.(php|inc)$/i', $f->getFilename())) {
+            $files[] = $f->getPathname();
+        }
+    }
+    return $files;
+}
+
+/**
+ * エントリポイント
+ */
+function main(array $argv): void
+{
+    if (count($argv) < 2) {
+        fwrite(STDERR, "Usage: php {$argv[0]} <TARGET_DIR> [VIEW_LIST_FILE] [OUTPUT.xlsx]\n");
+        exit(1);
+    }
+
+    $target   = $argv[1];
+    $viewFile = $argv[2] ?? 'view_list.txt';
+    $outFile  = $argv[3] ?? 'crud_output.xlsx';
+
+    if (!is_dir($target)) {
+        fwrite(STDERR, "Error: '{$target}' is not a directory.\n");
+        exit(1);
+    }
+
+    // ビューリスト読み込み
+    $viewList = is_file($viewFile)
+        ? file($viewFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES)
+        : [];
+
+    // 全レコードを収集
+    $all = [];
+    foreach (scanPhpFiles($target) as $path) {
+        $rel        = ltrim(str_replace(realpath($target), '', realpath($path)), DIRECTORY_SEPARATOR);
+        $content    = file_get_contents($path);
+        $literalMap = buildLiteralMap($content);
+        $opsMap     = extractCrudOperations($content, $literalMap, $viewList);
+        foreach ($opsMap as $tbl => $ops) {
+            $all[] = [
+                'file'       => $rel,
+                'table'      => $tbl,
+                'operations' => implode(',', $ops),
+            ];
+        }
+    }
+
+    // ファイル順 → テーブル順でソート
+    usort($all, function($a, $b){
+        $c = strcmp($a['file'], $b['file']);
+        return $c !== 0 ? $c : strcmp($a['table'], $b['table']);
+    });
+
+    // Excel 出力準備
+    $spreadsheet = new Spreadsheet();
+    $sheet       = $spreadsheet->getActiveSheet();
+    $sheet->setTitle('CRUD');
+
+    // ヘッダー
+    $sheet->fromArray(['File','Table','Operations'], null, 'A1');
+
+    // データ出力
+    $row      = 2;
+    $lastFile = null;
+    foreach ($all as $rec) {
+        // ファイルが変わったら空行を１行入れる
+        if ($lastFile !== null && $rec['file'] !== $lastFile) {
+            $row++;
+        }
+        // File 列は最初の1行だけ表示
+        if ($rec['file'] !== $lastFile) {
+            $sheet->setCellValue("A{$row}", $rec['file']);
+            $lastFile = $rec['file'];
+        }
+        // Table, Operations は毎行出力
+        $sheet->setCellValue("B{$row}", $rec['table']);
+        $sheet->setCellValue("C{$row}", $rec['operations']);
+
+        $row++;
+    }
+
+    // 保存
+    $writer = new Xlsx($spreadsheet);
+    $writer->save($outFile);
+    echo "Excel file written to {$outFile}\n";
+}
+
+main($argv);
