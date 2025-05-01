@@ -205,8 +205,8 @@ function quoteArrayKeys(array $tokens, array $definedConsts): array
 function rebuildSource(array $tokens): string
 {
     $out        = '';
-    $prevNL     = false;      // 直前に改行を出力したか
-    $needSpace  = false;      // 識別子衝突回避用スペース
+    $prevNL     = false;   // 直前に改行を出力したか
+    $needSpace  = false;   // 識別子衝突回避用スペース
 
     foreach ($tokens as $tok) {
         if (is_array($tok)) {
@@ -216,20 +216,20 @@ function rebuildSource(array $tokens): string
                 // ── コメントは完全削除 ──────────────────────
                 case T_COMMENT:
                 case T_DOC_COMMENT:
-                    continue;
+                    continue 2;          // foreach へ
 
                 // ── 空白トークン ───────────────────────────
                 case T_WHITESPACE:
                     if (strpos($text, "\n") !== false) {
                         if (!$prevNL) {
-                            $out   .= "\n";   // 連続改行は 1 行に圧縮
+                            $out   .= "\n";   // 連続改行を 1 行に圧縮
                             $prevNL = true;
                         }
                         $needSpace = false;
                     } else {
                         $needSpace = true;    // 連続識別子の衝突を避ける
                     }
-                    continue;
+                    continue 2;          // foreach へ
 
                 // ── それ以外（実コード）────────────────────
                 default:
@@ -237,10 +237,10 @@ function rebuildSource(array $tokens): string
                         $out .= ' ';
                     }
                     $out      .= $text;
-                    $prevNL   = false;
+                    $prevNL    = false;
                     $needSpace = false;
             }
-        } else {                                // 1 文字トークン
+        } else {                        // 1 文字トークン
             $out      .= $tok;
             $prevNL   = ($tok === "\n");
             $needSpace = false;
