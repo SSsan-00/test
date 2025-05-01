@@ -10,197 +10,201 @@ use PhpParser\NodeTraverser;
 use PhpParser\NodeVisitorAbstract;
 use PhpOffice\PhpSpreadsheet\Spreadsheet;
 use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+use PhpOffice\PhpSpreadsheet\Settings;
 
-/** 対象拡張子 */
+/*────────────────────────── メモリ節約設定 ──────────────────────────*/
+// 16 MB ずつ RAM に保持し、あふれたセルは sys_temp_dir() に退避
+Settings::setCache(
+    Settings::CACHE_TO_PHP_TEMP,
+    ['memoryCacheSize' => '16MB']
+);
+// 列幅自動計算を簡易モードに（高速 & 低メモリ）
+Settings::setAutoSizeMethod(Settings::AUTOSIZE_METHOD_APPROX);
+
+/*────────────────────────── 定数など ─────────────────────────────*/
 const ALLOWED_EXT = ['php', 'inc'];
 
-/** ─────────────────────  AST 訪問クラス ―───────────────────── */
+/*────────────────────────── AST Visitor ──────────────────────────*/
 class IncludeVisitor extends NodeVisitorAbstract
 {
-    /** @var string[] */
     public array $includes = [];
-
     public function enterNode(Node $node)
     {
-        if ($node instanceof Node\Expr\Include_) {
-            $expr = $node->expr;
-            if ($expr instanceof Node\Scalar\String_) {
-                $this->includes[] = $expr->value;
-            }
+        if ($node instanceof Node\Expr\Include_
+            && $node->expr instanceof Node\Scalar\String_) {
+            $this->includes[] = $node->expr->value;
         }
     }
 }
 
-/** ディレクトリ再帰走査で *.php / *.inc を取得 */
-function collectSourceFiles(string $dir): array
+/*────────────────────────── ヘルパ関数群 ──────────────────────────*/
+/** ディレクトリをジェネレータで再帰走査（メモリ節約） */
+function iterateSourceFiles(string $dir): Generator
 {
-    $files = [];
-    $it    = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($dir));
+    $it = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS)
+    );
     foreach ($it as $f) {
-        if ($f->isFile() && in_array(strtolower($f->getExtension()), ALLOWED_EXT, true)) {
-            $files[] = $f->getPathname();
+        if ($f->isFile()
+            && in_array(strtolower($f->getExtension()), ALLOWED_EXT, true)) {
+            yield $f->getPathname();
         }
     }
-    return $files;
 }
 
-/** ─────────── フォールバック: 文字列リテラル include / require 抽出 ─────────── */
+/** フォールバック: 文字列リテラルの include/require 抽出 */
 function fallbackIncludes(string $code, string $baseDir): array
 {
-    $includes = [];
-    if (
-        preg_match_all(
-            // include 'path.php'  /  include_once("path.inc")
-            '#\b(include|include_once|require|require_once)\s*(?:\(\s*)?[\'"]([^\'"]+)[\'"]#i',
-            $code,
-            $m
-        )
-    ) {
-        foreach ($m[2] as $raw) {
-            $path       = preg_match('#^(/|[A-Za-z]:[\\/])#', $raw)
-                ? $raw
-                : $baseDir . DIRECTORY_SEPARATOR . $raw;
-            $includes[] = realpath($path) ?: $path;
-        }
+    preg_match_all(
+        '#\b(include|include_once|require|require_once)\s*(?:\(\s*)?[\'"]([^\'"]+)[\'"]#i',
+        $code,
+        $m
+    );
+    $paths = [];
+    foreach ($m[2] ?? [] as $raw) {
+        $paths[] = resolvePath($raw, $baseDir);
     }
-    return array_unique($includes);
+    return array_unique($paths);
 }
 
-/** ファイル中の include/require を抽出（AST+フォールバック） */
+/** 相対パスを呼び出し元基準で解決 */
+function resolvePath(string $raw, string $baseDir): string
+{
+    $path = preg_match('#^([A-Za-z]:[\\/]|/)#', $raw)
+        ? $raw
+        : $baseDir . DIRECTORY_SEPARATOR . $raw;
+    return realpath($path) ?: $path;
+}
+
+/** 1 ファイルの include を抽出（AST + フォールバック） */
 function extractIncludes(string $file, \PhpParser\Parser $parser): array
 {
-    $code = file_get_contents($file);
+    $code    = file_get_contents($file);
     if ($code === false) return [];
 
-    $baseDir   = dirname($file);
-    $includes  = [];
+    $baseDir = dirname($file);
+    $includes = [];
 
     try {
-        $ast       = $parser->parse($code);
-        $vis       = new IncludeVisitor();
-        $trav      = new NodeTraverser();
+        $ast  = $parser->parse($code);
+        $vis  = new IncludeVisitor();
+        $trav = new NodeTraverser();
         $trav->addVisitor($vis);
         $trav->traverse($ast);
-        $includes  = $vis->includes;
-    } catch (\PhpParser\Error) {
-        // AST 解析失敗 → フォールバックへ
+        foreach ($vis->includes as $raw) {
+            $includes[] = resolvePath($raw, $baseDir);
+        }
+    } catch (\Throwable) {
+        // AST 失敗時は無視してフォールバックへ
     }
 
-    /* フォールバック判定
-       - AST 失敗時
-       - もしくは AST 成功でも include が 0 件なら念のため補完 */
+    // 足りなければ正規表現で補完
     if (!$includes) {
         $includes = fallbackIncludes($code, $baseDir);
     } else {
-        // AST で得た結果にフォールバック結果（重複除去）をマージして精度補完
         $includes = array_unique(array_merge(
-            array_map(
-                // AST は生文字列 (相対) のままなので同じ realpath 解決を行う
-                fn(string $raw) =>
-                    (preg_match('#^(/|[A-Za-z]:[\\/])#', $raw)
-                        ? $raw
-                        : $baseDir . DIRECTORY_SEPARATOR . $raw),
-                $includes
-            ),
+            $includes,
             fallbackIncludes($code, $baseDir)
         ));
-        $includes = array_values($includes);
     }
-
     return $includes;
 }
 
-/** ルート→再帰的 include 一覧（深さ付き）を構築 */
-function buildTransitive(string $root, array $direct): array
-{
-    $queue   = [];
+/** transitive include を逐次的に列挙しながらコールバックで処理 */
+function walkTransitive(
+    string $root,
+    callable $directFetcher,   // fn(string $file): array
+    callable $onEdge          // fn(int $depth, string $path): void
+): void {
+    $queue   = new SplQueue();
     $visited = [];
-    $out     = [];
-
-    foreach ($direct[$root] ?? [] as $inc) {
-        $queue[] = [$inc, 1];
+    foreach ($directFetcher($root) as $inc) {
+        $queue->enqueue([$inc, 1]);
     }
-
-    while ($queue) {
-        [$cur, $depth] = array_shift($queue);
+    while (!$queue->isEmpty()) {
+        [$cur, $depth] = $queue->dequeue();
         if (isset($visited[$cur])) continue;
-
         $visited[$cur] = true;
-        $out[]         = ['depth' => $depth, 'path' => $cur];
 
-        foreach ($direct[$cur] ?? [] as $child) {
-            $queue[] = [$child, $depth + 1];
+        $onEdge($depth, $cur);
+
+        foreach ($directFetcher($cur) as $child) {
+            $queue->enqueue([$child, $depth + 1]);
         }
     }
-    return $out;
 }
 
-/** 使い方 */
-function usage(): never
-{
+/*────────────────────────── Main Entry ───────────────────────────*/
+if ($argc < 2) {
     fwrite(STDERR, "Usage: php include_analyzer.php <project_root> [output.xlsx]\n");
     exit(1);
 }
-
-/** ─────────────────────  エントリーポイント ―──────────────────── */
-if ($argc < 2) usage();
-
 $rootDir = realpath($argv[1]);
 if (!$rootDir || !is_dir($rootDir)) {
-    fwrite(STDERR, "Invalid directory: {$argv[1]}\n");
-    exit(1);
+    fwrite(STDERR, "Invalid directory: {$argv[1]}\n"); exit(1);
 }
 $outFile = $argv[2] ?? 'include_analysis.xlsx';
 
-$parser      = (new ParserFactory())->createForNewestSupportedVersion();
-$directGraph = [];
+/* パーサ準備 */
+$parser = (new ParserFactory())->createForNewestSupportedVersion();
 
-/* 1) 直接 include グラフ構築 */
-foreach (collectSourceFiles($rootDir) as $file) {
-    $directGraph[$file] = extractIncludes($file, $parser);
+/* Excel 初期化（2 シート、行追加は都度書き込み）*/
+$book         = new Spreadsheet();
+$directSheet  = $book->getActiveSheet();
+$directSheet->setTitle('Include-Direct')
+            ->fromArray(['File', 'Included (direct)'], null, 'A1');
+$allSheet     = $book->createSheet()->setTitle('Include-All');
+$allSheet     ->fromArray(['Root File', 'Depth', 'Included (transitive)'], null, 'A1');
+$directRow    = 2;
+$allRow       = 2;
+
+/* ファイル → include マッピングをキャッシュしつつ逐次処理 */
+$includeCache = [];          // なるべく小さく保つ
+$fetchDirect  = function(string $file) use (&$includeCache): array {
+    return $includeCache[$file] ?? [];
+};
+
+/* ────────────────── 走査開始 ──────────────────*/
+foreach (iterateSourceFiles($rootDir) as $file) {
+    // ① 直接 include を解析・キャッシュ
+    $includeCache[$file] = extractIncludes($file, $parser);
+
+    // ①-a Excel (Include-Direct) へ即時書き込み
+    if (!$includeCache[$file]) {
+        $directSheet->setCellValue("A{$directRow}", $file);
+        $directRow++;
+    } else {
+        foreach ($includeCache[$file] as $i => $inc) {
+            $colA = ($i === 0) ? $file : '';
+            $directSheet->fromArray([$colA, $inc], null, "A{$directRow}");
+            $directRow++;
+        }
+    }
+
+    // ② transitive を逐次列挙 → その場で Excel へ書き込み
+    walkTransitive(
+        $file,
+        $fetchDirect,
+        function (int $depth, string $path) use (&$allSheet, &$allRow, $file) {
+            $allSheet->fromArray([$file, $depth, $path], null, "A{$allRow}");
+            $allRow++;
+        }
+    );
+
+    /* キャッシュ肥大化を防ぐ:
+       ─ include 先が「まだ root として未処理」の場合は保持
+       ─ 処理済み root はキャッシュから削除（メモリ解放）       */
+    unset($includeCache[$file]);
+    gc_collect_cycles();   // 長いループなので定期的に GC
 }
 
-/* 2) Excel 生成 */
-$book        = new Spreadsheet();
-/* ─ Include-Direct ─ */
-$directSheet = $book->getActiveSheet();
-$directSheet->setTitle('Include-Direct');
-$directSheet->fromArray(['File', 'Included (direct)'], null, 'A1');
-
-$r = 2;
-foreach ($directGraph as $file => $incs) {
-    if (!$incs) {
-        $directSheet->setCellValue("A{$r}", $file);
-        $r++;
-        continue;
-    }
-    foreach ($incs as $i => $inc) {
-        if ($i === 0) $directSheet->setCellValue("A{$r}", $file);
-        $directSheet->setCellValue("B{$r}", $inc);
-        $r++;
-    }
-}
-/* ─ Include-All ─ */
-$allSheet = $book->createSheet();
-$allSheet->setTitle('Include-All');
-$allSheet->fromArray(['Root File', 'Depth', 'Included (transitive)'], null, 'A1');
-
-$r = 2;
-foreach (array_keys($directGraph) as $file) {
-    foreach (buildTransitive($file, $directGraph) as $rec) {
-        $allSheet->setCellValue("A{$r}", $file);
-        $allSheet->setCellValue("B{$r}", (string)$rec['depth']);
-        $allSheet->setCellValue("C{$r}", $rec['path']);
-        $r++;
-    }
-}
-
-/* オートサイズ */
+/* 列幅簡易オートサイズ (Approx) */
 foreach ([$directSheet, $allSheet] as $sh) {
     foreach (range('A', 'C') as $col) {
         $sh->getColumnDimension($col)->setAutoSize(true);
     }
 }
 
+/* 書き出し */
 (new Xlsx($book))->save($outFile);
-echo "✓ Include analysis written → {$outFile}\n";
+echo "✓ Low-memory include analysis written → {$outFile}\n";
