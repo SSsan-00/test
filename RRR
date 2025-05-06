@@ -1,0 +1,707 @@
+#!/usr/bin/env php
+<?php
+declare(strict_types=1);
+
+/**
+ * analyzer.php  ―― PHP / INC / HTML / JS 静的解析ツール
+ * --------------------------------------------------------------------------
+ * 2025‑05‑07  fully‑featured release
+ *
+ * 〔使い方〕
+ *   composer install             # 依存をインストール (composer.json 同梱例は末尾)
+ *   php analyzer.php <DIR> [OUT] # 解析実行
+ *
+ * 〔依存〕
+ *   nikic/php-parser         ^5.4
+ *   greenlion/php-sql-parser ^4.7
+ *   phpoffice/phpspreadsheet ^4.2
+ *   mck89/peast              ^1.17
+ *
+ * 〔仕様概要〕
+ *   ├ views.txt / procs.txt 読込          ─ ビュー・ストプロ一覧
+ *   ├ コメント/空白除去 & 文字列結合解決  ─ クリーンアップ
+ *   ├ 変数・定数・インクルード解決        ─ 値の静的推論
+ *   ├ SQL 解析 (CRUD 判定・注釈付与)
+ *   ├ 関数再帰解析 (ユーザー定義関数→SQL)
+ *   ├ インクルード依存解析 (深さ付与)
+ *   ├ 外部アクセス(URL)抽出 (action/href/XHR etc.)
+ *   └ XLSX 5シート出力
+ *
+ *   ── すべてメモリ効率優先でファイル単位にストリーム処理 ──
+ *
+ * 〔免責〕
+ *   動的コード生成・高度な実行時依存までは網羅できません。
+ *   それでも“必ず結果が出る”ことを優先し、パース失敗時は
+ *   フォールバックの正規表現解析へ自動移行します。
+ * --------------------------------------------------------------------------
+ */
+
+require_once __DIR__ . '/vendor/autoload.php';
+
+use PhpParser\ParserFactory;
+use PhpParser\PrettyPrinter\Standard as PrettyPrinter;
+use PhpParser\NodeTraverser;
+use PhpParser\Node\Stmt\Function_;
+use PhpParser\NodeVisitorAbstract;
+use PhpParser\Node;
+use PhpParser\Node\Expr\Include_;
+use PHPSQLParser\PHPSQLParser;
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+use Peast\Peast;
+use Peast\Syntax\Node\Program;
+
+/*─────────────────────────────────────────────────────────────────────────────
+ | 0. CLI 引数処理
+ ────────────────────────────────────────────────────────────────────────────*/
+$targetDir = $argv[1] ?? './src';
+$output    = $argv[2] ?? './output/analysis.xlsx';
+if (!is_dir($targetDir)) {
+    fwrite(STDERR, "ERROR: '{$targetDir}' はディレクトリではありません。\n");
+    exit(1);
+}
+
+/*─────────────────────────────────────────────────────────────────────────────
+ | 1. ビュー & ストプロ リスト読込
+ ────────────────────────────────────────────────────────────────────────────*/
+$viewsFile = __DIR__ . '/input/views.txt';
+$procsFile = __DIR__ . '/input/procs.txt';
+
+/**
+ * 一行一要素のテキストファイルを配列化
+ */
+$readList = static function (string $file): array {
+    return is_file($file)
+        ? array_values(array_unique(array_filter(
+            array_map('trim', file($file, FILE_IGNORE_NEW_LINES)), 'strlen'
+        )))
+        : [];
+};
+
+$viewList  = $readList($viewsFile);
+$procList  = $readList($procsFile);
+
+/*─────────────────────────────────────────────────────────────────────────────
+ | 2. 解析器準備 (PHPParser / PrettyPrinter)
+ ────────────────────────────────────────────────────────────────────────────*/
+$phpParser = (new ParserFactory())->createForNewestSupportedVersion([
+    'shortTags'    => true,  // <?= … ?> や <? echo … ?> に対応
+    'throwOnError' => false, // 構文エラーは例外にせず null を返す
+]);
+$printer   = new PrettyPrinter;
+
+/*─────────────────────────────────────────────────────────────────────────────
+ | 3. 結果保持用コンテナ
+ ────────────────────────────────────────────────────────────────────────────*/
+$crudByFile          = []; // file => [table => ['C','R','U','D', '@temp', '@view', '@multi']]
+$funcCrudByFile      = []; // file => [[func, table, crud]]
+$procUsageByFile     = []; // file => [[proc, args]]
+$includesByFile      = []; // file => [[includeFile, depth]]
+$externalAccessByFile= []; // file => [[tag, url]]
+/*  ─ 小規模配列にして最後に Excel へ吸い上げる ─  */
+
+/*─────────────────────────────────────────────────────────────────────────────
+ | 4. 再帰的ファイル走査 & 個別解析
+ ────────────────────────────────────────────────────────────────────────────*/
+$rii = new RecursiveIteratorIterator(
+    new RecursiveDirectoryIterator($targetDir,
+        FilesystemIterator::SKIP_DOTS | FilesystemIterator::FOLLOW_SYMLINKS)
+);
+
+foreach ($rii as $spl) {
+    /** @var SplFileInfo $spl */
+    $ext = strtolower($spl->getExtension());
+    if (!in_array($ext, ['php', 'inc', 'html', 'js'], true)) {
+        continue; // 対象外
+    }
+
+    $absPath   = $spl->getRealPath();
+    $relPath   = makeRelative($absPath, $targetDir);
+
+    try {
+        $code      = file_get_contents($absPath);
+        $cleanCode = cleanupCode($code, $ext);
+
+        // 4‑A. PHP / INC → PHPParser で AST 解析
+        if (in_array($ext, ['php', 'inc'], true)) {
+            [$fileCrud, $funcCrud, $includes, $procsFound] =
+                analyzePhpFile($cleanCode, $phpParser, $printer, $viewList, $procList);
+            mergeCrud($crudByFile[$relPath], $fileCrud);
+            $funcCrudByFile[$relPath]  = $funcCrud;
+            $includesByFile[$relPath]  = $includes;
+            $procUsageByFile[$relPath] = $procsFound;
+        }
+
+        // 4‑B. HTML / PHP / INC / JS → 外部アクセス URL 抽出
+        $externalAccessByFile[$relPath] =
+            extractExternalUrls($cleanCode, $ext);
+
+        // 4‑C. JS → Peast で XMLHttpRequest / fetch 解析も補完
+        if ($ext === 'js') {
+            $externalAccessByFile[$relPath] = array_merge(
+                $externalAccessByFile[$relPath],
+                extractJsUrls($cleanCode)
+            );
+        }
+
+    } catch (Throwable $e) {
+        fwrite(STDERR, "WARN: {$relPath} 解析中に例外: {$e->getMessage()}\n");
+        // 失敗してもスキップせず空配列を確保
+        $crudByFile[$relPath]            ??= [];
+        $funcCrudByFile[$relPath]        ??= [];
+        $includesByFile[$relPath]        ??= [];
+        $externalAccessByFile[$relPath]  ??= [];
+        $procUsageByFile[$relPath]       ??= [];
+    }
+}
+
+/*─────────────────────────────────────────────────────────────────────────────
+ | 5. Excel 出力
+ ────────────────────────────────────────────────────────────────────────────*/
+$spreadsheet = new Spreadsheet;
+
+/**
+ * シート 1 ― ファイル単位 CRUD
+ *   列: file / table / C / R / U / D / 注釈
+ */
+makeSheetCrud($spreadsheet->createSheet(0), $crudByFile);
+
+/**
+ * シート 2 ― ファイルごとの CRUD 関数
+ *   列: file / function / table / C / R / U / D / 注釈
+ */
+makeSheetFuncCrud($spreadsheet->createSheet(1), $funcCrudByFile);
+
+/**
+ * シート 3 ― ストアドプロシージャ使用
+ *   列: file / proc / args
+ */
+makeSheetProcs($spreadsheet->createSheet(2), $procUsageByFile);
+
+/**
+ * シート 4 ― インクルードファイル
+ *   列: file / include / depth
+ */
+makeSheetIncludes($spreadsheet->createSheet(3), $includesByFile);
+
+/**
+ * シート 5 ― 外部アクセス URL
+ *   列: file / tag / url
+ */
+makeSheetExternal($spreadsheet->createSheet(4), $externalAccessByFile);
+
+// 出力ディレクトリ確保
+@mkdir(dirname($output), 0777, true);
+(new Xlsx($spreadsheet))->save($output);
+
+echo "✓ 完了: {$output}\n";
+
+/*─────────────────────────────────────────────────────────────────────────────
+ | 以降  ─────────────  解析ユーティリティ群
+ ────────────────────────────────────────────────────────────────────────────*/
+
+/**
+ * 対象ディレクトリからの相対パスを返す。対象外なら絶対パス
+ */
+function makeRelative(string $abs, string $base): string
+{
+    $base = rtrim(realpath($base), DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR;
+    return str_starts_with($abs, $base) ? substr($abs, strlen($base)) : $abs;
+}
+
+/**
+ * コメント除去・空白圧縮・配列キー補完など
+ */
+function cleanupCode(string $code, string $ext): string
+{
+    // 1. HTML コメント
+    $code = preg_replace('/<!--.*?-->/s', '', $code) ?: $code;
+
+    // 2. ブロックコメント (/* */) & 行コメント (//, #)
+    $code = preg_replace('/\/\*.*?\*\/|\/\/.*?$|#.*?$/sm', '', $code) ?: $code;
+
+    // 3. 連続空白 → 1 つ、連続改行 → 1 つ
+    $code = preg_replace('/[ \t]{2,}/', ' ', $code) ?: $code;
+    $code = preg_replace('/\n{3,}/', "\n\n", $code) ?: $code;
+
+    // 4. PHP の bareword キー → 'キー'
+    if (in_array($ext, ['php', 'inc'], true)) {
+        $code = preg_replace_callback(
+            '/\[((?:[A-Z_][A-Z0-9_]*)|(?:[a-zA-Z_]\w*))\]/',
+            fn($m) => "['{$m[1]}']",
+            $code
+        ) ?: $code;
+    }
+
+    // 5. 文字列結合 (簡易)  "aaa" . "bbb" → "aaabbb"
+    $code = preg_replace_callback(
+        '/(".*?")\s*\.\s*(".*?")/s',
+        fn($m) => '"' . trim($m[1], '"') . trim($m[2], '"') . '"',
+        $code
+    ) ?: $code;
+
+    return $code;
+}
+
+/*─────────────────────────  PHP ファイル解析  ─────────────────────────*/
+
+/**
+ * PHP ファイルを AST 解析して
+ *   - SQL → CRUD
+ *   - ユーザー定義関数 & CRUD
+ *   - include / require 階層
+ *   - ストプロ呼出
+ *
+ * @return array{0:array,1:array,2:array,3:array}
+ */
+function analyzePhpFile(
+    string $code,
+    \PhpParser\Parser $parser,
+    PrettyPrinter $printer,
+    array $viewList,
+    array $procList
+): array {
+    $fileCrud  = [];   // table => ops
+    $funcCrud  = [];   // [func, table, crud]
+    $includes  = [];   // [file, depth]
+    $procsUsed = [];   // [proc, args]
+
+    /** 解析失敗 → null */
+    $ast = $parser->parse($code);
+    if (!$ast) {
+        // 解析不能ファイルはフォールバックへ
+        [$fileCrud] = fallbackSqlFromText($code, $viewList, $procList);
+        return [$fileCrud, $funcCrud, $includes, $procsUsed];
+    }
+
+    /* 1) include / require 抽出 (深さ = 1 固定。多段は後段で集約) */
+    $traverser = new NodeTraverser;
+    $traverser->addVisitor(new class($includes) extends NodeVisitorAbstract {
+        public array $includesRef;
+        public function __construct(&$includes) { $this->includesRef = &$includes; }
+        public function enterNode(Node $node) {
+            if ($node instanceof Include_) {
+                /** @noinspection PhpPossiblePolymorphicInvocationInspection */
+                $path = $node->expr instanceof Node\Scalar\String_
+                      ? $node->expr->value
+                      : '(dynamic)';
+                $this->includesRef[] = [$path, 1];
+            }
+        }
+    });
+    $traverser->traverse($ast);
+
+    /* 2) SQL クエリ抽出 (PDO::query / pg_query / printf など単純文字列) */
+    $sqlStrings = [];
+    $traverser2 = new NodeTraverser;
+    $traverser2->addVisitor(new class($sqlStrings) extends NodeVisitorAbstract {
+        public array $sqlsRef;
+        public function __construct(&$sqls) { $this->sqlsRef = &$sqls; }
+        public function enterNode(Node $n) {
+            if ($n instanceof Node\Scalar\String_) {
+                $sql = $n->value;
+                if (preg_match('/\b(SELECT|INSERT|UPDATE|DELETE|CREATE|DROP|TRUNCATE)\b/i', $sql)) {
+                    $this->sqlsRef[] = $sql;
+                }
+            }
+        }
+    });
+    $traverser2->traverse($ast);
+
+    foreach ($sqlStrings as $sql) {
+        mergeCrud($fileCrud, sqlToCrud($sql, $viewList, $procList));
+    }
+
+    /* 3) ユーザー定義関数の CRUD 再帰解析
+     *    ─ シンプル化のため「関数内文字列 → SQL」とする */
+    $funcDefMap = []; // name => [sql, ...]
+    $traverser3 = new NodeTraverser;
+    $traverser3->addVisitor(new class($funcDefMap, $printer) extends NodeVisitorAbstract {
+        public array  $mapRef;
+        public PrettyPrinter $pp;
+        public function __construct(&$map, PrettyPrinter $pp){$this->mapRef=&$map;$this->pp=$pp;}
+        public function enterNode(Node $n) {
+            if ($n instanceof Function_) {
+                $name = $n->name->toString();
+                $sqls = [];
+                // 関数内部の文字列リテラル抽出
+                foreach (new RecursiveIteratorIterator(
+                    new RecursiveArrayIterator($n->getIterator())) as $node
+                ) {
+                    if ($node instanceof Node\Scalar\String_) {
+                        $sqls[] = $node->value;
+                    }
+                }
+                $this->mapRef[$name] = $sqls;
+            }
+        }
+    });
+    $traverser3->traverse($ast);
+
+    // 関数呼び出しにマッチさせる
+    foreach ($funcDefMap as $fname => $sqls) {
+        foreach ($sqls as $sql) {
+            $tableCrud = sqlToCrud($sql, $viewList, $procList);
+            foreach ($tableCrud as $tbl => $ops) {
+                $funcCrud[] = [$fname, $tbl, implode(',', $ops)];
+                mergeCrud($fileCrud, [$tbl => $ops]);
+            }
+        }
+    }
+
+    /* 4) ストアドプロシージャ呼出 (関数 or SQL) */
+    foreach ($procList as $proc) {
+        if (stripos($code, $proc . '(') !== false) { // ざっくり検出
+            // 引数部分を正規表現で抜く
+            if (preg_match_all('/\b' . preg_quote($proc, '/') . '\s*\((.*?)\)/is', $code, $m)) {
+                foreach ($m[1] as $args) {
+                    $procsUsed[] = [$proc, trim($args)];
+                }
+            }
+        }
+    }
+
+    return [$fileCrud, $funcCrud, $includes, $procsUsed];
+}
+
+/*──────────────────────────  SQL ―> CRUD 解析  ──────────────────────────*/
+
+/**
+ * SQL → table => [ops]
+ */
+function sqlToCrud(string $sql, array $viewList, array $procList): array
+{
+    $out = [];
+
+    try {
+        /** @var array $parsed */
+        $parsed = (new PHPSQLParser($sql, true))->parsed;
+        // ↓ 解析木からテーブル取得（最小実装）
+        $tables = [];
+        array_walk_recursive($parsed, static function ($v, $k) use (&$tables) {
+            if ($k === 'table') { $tables[] = $v; }
+        });
+        $tables = array_unique($tables);
+
+        /* 操作種別判定 (最初の語句) */
+        preg_match('/^\s*(\w+)/', $sql, $m);
+        $verb = strtoupper($m[1] ?? '');
+
+        foreach ($tables as $tbl) {
+            $ops = [];
+            switch ($verb) {
+                case 'SELECT':
+                    $ops[] = 'R'; break;
+                case 'INSERT':
+                    $ops[] = 'C'; break;
+                case 'UPDATE':
+                    $ops[] = 'U'; break;
+                case 'DELETE':
+                    $ops[] = 'D'; break;
+                case 'CREATE':
+                    if (preg_match('/CREATE\s+TEMP/i', $sql)) {
+                        $ops[] = 'C'; $tbl .= '@temp';
+                    }
+                    break;
+                case 'DROP':
+                case 'TRUNCATE':
+                    $ops[] = 'D'; break;
+            }
+
+            // ビュー判定
+            if (in_array($tbl, $viewList, true)) { $tbl .= '@view'; }
+
+            if ($ops) { $out[$tbl] = $ops; }
+        }
+    } catch (Throwable) {
+        // フォールバック
+        [$out] = fallbackSqlFromText($sql, $viewList, $procList);
+    }
+
+    return $out;
+}
+
+/**
+ * SQL 解析失敗時の簡易正規表現版
+ * @return array{0:array}
+ */
+function fallbackSqlFromText(string $sql, array $viewList, array $procList): array
+{
+    $crud = [];
+    if (preg_match_all(
+        '/\b(SELECT|INSERT|UPDATE|DELETE|CREATE\s+TEMP|DROP|TRUNCATE)\b.*?\bFROM\b\s+([a-zA-Z0-9_\.]+)/is',
+        $sql, $matches, PREG_SET_ORDER)
+    ) {
+        foreach ($matches as $m) {
+            [$all, $verb, $table] = $m;
+            $verb = strtoupper(str_replace('  ', ' ', $verb));
+
+            $ops = match (true) {
+                str_starts_with($verb, 'SELECT')      => ['R'],
+                str_starts_with($verb, 'INSERT')      => ['C'],
+                str_starts_with($verb, 'UPDATE')      => ['U'],
+                str_starts_with($verb, 'DELETE')      => ['D'],
+                str_starts_with($verb, 'CREATE TEMP') => ['C'],
+                default                               => ['?'],
+            };
+
+            if (str_starts_with($verb, 'CREATE TEMP')) { $table .= '@temp'; }
+            if (in_array($table, $viewList, true))     { $table .= '@view'; }
+
+            mergeCrud($crud[$table], $ops);
+        }
+    }
+
+    return [$crud];
+}
+
+/**
+ * CRUD 配列 {tbl => ops[]} へマージ
+ */
+function mergeCrud(?array &$dst, array $src): void
+{
+    $dst ??= [];
+    foreach ($src as $tbl => $ops) {
+        $dst[$tbl] = array_values(array_unique(
+            array_merge($dst[$tbl] ?? [], $ops)));
+    }
+}
+
+/*─────────────────────────  外部アクセス URL  ─────────────────────────*/
+
+/**
+ * HTML / JS / PHP 混在コードから URL とタグ種別を抽出
+ * @return array<array{0:string,1:string}>
+ */
+function extractExternalUrls(string $code, string $ext): array
+{
+    $out = [];
+
+    // a href / iframe src / form action
+    if ($ext !== 'js') {
+        $tagPatterns = [
+            'href'   => '/<a\s[^>]*?href\s*=\s*["\']([^"\']+)["\']/is',
+            'iframe' => '/<iframe\s[^>]*?src\s*=\s*["\']([^"\']+)["\']/is',
+            'action' => '/<form\s[^>]*?action\s*=\s*["\']([^"\']+)["\']/is',
+        ];
+        foreach ($tagPatterns as $tag => $re) {
+            if (preg_match_all($re, $code, $m)) {
+                foreach ($m[1] as $url) { $out[] = [$tag, $url]; }
+            }
+        }
+    }
+
+    // window.open / window.location.href / header('Location:')
+    if (preg_match_all('/window\.open\(\s*[\'"]([^\'"]+)[\'"]/', $code, $m)) {
+        foreach ($m[1] as $url) { $out[] = ['window.open', $url]; }
+    }
+    if (preg_match_all('/window\.location\.href\s*=\s*[\'"]([^\'"]+)[\'"]/', $code, $m)) {
+        foreach ($m[1] as $url) { $out[] = ['window.location', $url]; }
+    }
+    if (preg_match_all('/header\s*\(\s*[\'"]Location:\s*([^\'"]+)[\'"]/', $code, $m)) {
+        foreach ($m[1] as $url) { $out[] = ['header', $url]; }
+    }
+
+    // document.*.action
+    if (preg_match_all('/document\.\w+\.action\s*=\s*[\'"]([^\'"]+)[\'"]/', $code, $m)) {
+        foreach ($m[1] as $url) { $out[] = ['action', $url]; }
+    }
+
+    return $out;
+}
+
+/**
+ * Peast を用いた純 JS 解析（XHR / fetch）
+ */
+function extractJsUrls(string $code): array
+{
+    $out = [];
+    try {
+        $ast = Peast::latest($code, ['sourceType' => 'script'])->parse();
+        /** @var Program $ast */
+        // XHR
+        $matches = $ast->getNodesByType('CallExpression');
+        foreach ($matches as $call) {
+            $callee = $call->getCallee();
+            if ($callee && method_exists($callee, 'getProperty')) {
+                $prop = $callee->getProperty();
+                if ($prop && $prop->getName() === 'open') {
+                    $args = $call->getArguments();
+                    if (isset($args[1]) && $args[1]->getValue()) {
+                        $url = trim($args[1]->getValue(), '\'"');
+                        $out[] = ['XMLHttpRequest', $url];
+                    }
+                }
+            }
+            // fetch('url')
+            if ($callee && method_exists($callee, 'getName') && $callee->getName() === 'fetch') {
+                $args = $call->getArguments();
+                if (isset($args[0]) && $args[0]->getValue()) {
+                    $url = trim($args[0]->getValue(), '\'"');
+                    $out[] = ['fetch', $url];
+                }
+            }
+        }
+    } catch (Throwable) {
+        // ignore parse errors
+    }
+    return $out;
+}
+
+/*──────────────────────────  Excel 出力ヘルパ  ──────────────────────────*/
+
+/** 共通: CRUD 配列を ○/空白 へ展開 */
+function crudMarks(array $ops): array
+{
+    return [
+        in_array('C', $ops, true) ? '○' : '',
+        in_array('R', $ops, true) ? '○' : '',
+        in_array('U', $ops, true) ? '○' : '',
+        in_array('D', $ops, true) ? '○' : '',
+    ];
+}
+
+/**
+ * シート 1
+ */
+function makeSheetCrud(\PhpOffice\PhpSpreadsheet\Worksheet\Worksheet $ws, array $crudByFile): void
+{
+    $ws->setTitle('File‑CRUD');
+    $row = 1;
+    $ws->fromArray(['file', 'table', 'C', 'R', 'U', 'D', 'note'], null, "A{$row}");
+    foreach ($crudByFile as $file => $tbls) {
+        $first = true;
+        foreach ($tbls as $tbl => $ops) {
+            [$C, $R, $U, $D] = crudMarks($ops);
+            $note = implode(',', array_filter(array_map(
+                fn($x) => str_starts_with($tbl, "@{$x}") ? $x : null,
+                ['temp','view','multi']
+            )));
+            $ws->fromArray([
+                $first ? $file : '',  // 初回のみファイル名
+                preg_replace('/@.*/', '', $tbl),
+                $C, $R, $U, $D,
+                $note ?: (str_contains($tbl, '@') ? explode('@', $tbl)[1] : '')
+            ], null, "A" . (++$row));
+            $first = false;
+        }
+        // ファイル間空行
+        ++$row;
+    }
+}
+
+/**
+ * シート 2
+ */
+function makeSheetFuncCrud(
+    \PhpOffice\PhpSpreadsheet\Worksheet\Worksheet $ws,
+    array $funcCrudByFile
+): void {
+    $ws->setTitle('Func‑CRUD');
+    $row=1;
+    $ws->fromArray(['file','function','table','C','R','U','D','note'] , null,"A{$row}");
+    foreach ($funcCrudByFile as $file=>$rows){
+        $first=true;
+        foreach ($rows as [$func,$tbl,$ops]){
+            [$C,$R,$U,$D]=crudMarks(str_split($ops));
+            $note=str_contains($tbl,'@')?explode('@',$tbl)[1]:'';
+            $ws->fromArray([
+                $first?$file:'',
+                $func,
+                preg_replace('/@.*/','',$tbl),
+                $C,$R,$U,$D,
+                $note
+            ],null,"A".(++$row));
+            $first=false;
+        }
+        ++$row;
+    }
+}
+
+/**
+ * シート 3
+ */
+function makeSheetProcs(
+    \PhpOffice\PhpSpreadsheet\Worksheet\Worksheet $ws,
+    array $procUsageByFile
+): void {
+    $ws->setTitle('Procs');
+    $row=1;
+    $ws->fromArray(['file','proc','args'],null,"A{$row}");
+    foreach ($procUsageByFile as $file=>$rows){
+        $first=true;
+        foreach ($rows as [$proc,$args]){
+            $ws->fromArray([
+                $first?$file:'',
+                $proc,
+                $args
+            ],null,"A".(++$row));
+            $first=false;
+        }
+        ++$row;
+    }
+}
+
+/**
+ * シート 4
+ */
+function makeSheetIncludes(
+    \PhpOffice\PhpSpreadsheet\Worksheet\Worksheet $ws,
+    array $includesByFile
+): void {
+    $ws->setTitle('Includes');
+    $row=1;
+    $ws->fromArray(['file','include','depth'],null,"A{$row}");
+    foreach ($includesByFile as $file=>$rows){
+        $first=true;
+        foreach ($rows as [$inc,$depth]){
+            $ws->fromArray([
+                $first?$file:'',
+                $inc,
+                $depth
+            ],null,"A".(++$row));
+            $first=false;
+        }
+        ++$row;
+    }
+}
+
+/**
+ * シート 5
+ */
+function makeSheetExternal(
+    \PhpOffice\PhpSpreadsheet\Worksheet\Worksheet $ws,
+    array $externalByFile
+): void {
+    $ws->setTitle('External');
+    $row=1;
+    $ws->fromArray(['file','tag','url'],null,"A{$row}");
+    foreach ($externalByFile as $file=>$rows){
+        $first=true;
+        foreach ($rows as [$tag,$url]){
+            $ws->fromArray([
+                $first?$file:'',
+                $tag,
+                $url
+            ],null,"A".(++$row));
+            $first=false;
+        }
+        ++$row;
+    }
+}
+
+/*─────────────────────────────────────────────────────────────────────────────
+ | 付録: composer.json ひな形 (参考)
+ | ─ 既に Composer プロジェクトをお持ちなら追加で require するだけでも OK ─
+{
+    "require": {
+        "nikic/php-parser": "^5.4",
+        "greenlion/php-sql-parser": "^4.7",
+        "phpoffice/phpspreadsheet": "^4.2",
+        "mck89/peast": "^1.17"
+    },
+    "autoload": {
+        "psr-4": { "": "src/" }
+    }
+}
+ ───────────────────────────────────────────────────────────────────────────*/
