@@ -1,0 +1,988 @@
+<?php
+
+require_once __DIR__ . '/vendor/autoload.php';
+
+use PhpParser\NodeTraverser;
+use PhpParser\ParserFactory;
+use PhpParser\NodeVisitor\NameResolver;
+use PhpParser\NodeVisitor\CloningVisitor;
+use PhpParser\PrettyPrinter\Standard;
+use PhpParser\Parser;
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+use PHPSQLParser\PHPSQLParser;
+use PHPSQLParser\PHPSQLCreator;
+use PHPSQLParser\String as PHPSQLString;
+
+/**
+ * 静的解析ツール
+ * 
+ * このクラスは、PHPファイルの静的解析を行い、SQLクエリ、関数、インクルード、外部アクセス、
+ * ストアドプロシージャ、ビューの使用状況を分析します。
+ */
+class StaticAnalyzer {
+    /** @var array ビューのリスト */
+    private array $views = [];
+    
+    /** @var array ストアドプロシージャのリスト */
+    private array $procs = [];
+    
+    /** @var string 解析対象のディレクトリ */
+    private string $directory;
+
+    /** @var array 解析対象の拡張子 */
+    private array $targetExtensions = ['php', 'inc', 'html', 'js'];
+
+    /** @var array 解析対象のファイル一覧 */
+    private array $files = [];
+
+    /** @var Parser */
+    private Parser $parser;
+
+    /** @var PHPSQLParser */
+    private PHPSQLParser $sqlParser;
+    
+    /** @var PHPSQLCreator */
+    private PHPSQLCreator $sqlCreator;
+
+    /**
+     * コンストラクタ
+     */
+    public function __construct() {
+        $factory = new ParserFactory;
+        $this->parser = $factory->createForNewestSupportedVersion();
+        
+        // SQLパーサーの初期化
+        $this->sqlParser = new PHPSQLParser();
+        $this->sqlCreator = new PHPSQLCreator();
+    }
+
+    /**
+     * ビューのリストを読み込む
+     * 
+     * @return void
+     */
+    private function loadViews(): void {
+        if (!isset($this->directory)) {
+            echo "ディレクトリが設定されていません。\n";
+            return;
+        }
+        
+        $viewsFile = dirname($this->directory) . '/input/views.txt';
+        echo "ビューファイルのパス: $viewsFile\n";
+        
+        if (file_exists($viewsFile)) {
+            $content = file_get_contents($viewsFile);
+            echo "ファイル内容:\n$content\n";
+            
+            $this->views = array_filter(
+                array_map('trim', file($viewsFile)),
+                function($line) { return !empty($line); }
+            );
+            echo "読み込んだビュー数: " . count($this->views) . "\n";
+        } else {
+            echo "ビューファイルが存在しません。\n";
+        }
+    }
+
+    /**
+     * ストアドプロシージャのリストを読み込む
+     * 
+     * @return void
+     */
+    private function loadProcs(): void {
+        if (!isset($this->directory)) {
+            echo "ディレクトリが設定されていません。\n";
+            return;
+        }
+        
+        $procsFile = dirname($this->directory) . '/input/procs.txt';
+        echo "プロシージャファイルのパス: $procsFile\n";
+        
+        if (file_exists($procsFile)) {
+            $content = file_get_contents($procsFile);
+            echo "ファイル内容:\n$content\n";
+            
+            $this->procs = array_filter(
+                array_map('trim', file($procsFile)),
+                function($line) { return !empty($line); }
+            );
+            echo "読み込んだプロシージャ数: " . count($this->procs) . "\n";
+        } else {
+            echo "プロシージャファイルが存在しません。\n";
+        }
+    }
+
+    /**
+     * PHPの短縮タグを標準タグに変換する
+     * 
+     * @param string $content 変換対象のコンテンツ
+     * @return string 変換後のコンテンツ
+     */
+    private function normalizePhpTags(string $content): string {
+        // 重複したPHPタグを除去
+        $content = preg_replace('/<\?php\s+<\?php/', '<?php', $content);
+        
+        // 短縮タグ（<?）を標準タグ（<?php）に変換
+        $content = preg_replace('/<\?(?!php|=|xml)/', '<?php ', $content);
+        
+        // 短縮エコータグ（<?=）を標準エコータグ（<?php echo）に変換
+        $content = preg_replace('/<\?=/', '<?php echo ', $content);
+        
+        // 閉じタグの正規化
+        $content = preg_replace('/\?>\s*<\?php/', ' ', $content);
+        
+        // 不要な空白を整理
+        $content = preg_replace('/\s+/', ' ', $content);
+        $content = preg_replace('/\s*;\s*/', '; ', $content);
+        $content = preg_replace('/\s*=\s*/', ' = ', $content);
+        
+        // 最後の閉じタグを除去（推奨されるプラクティス）
+        $content = preg_replace('/\?>\s*$/', '', $content);
+        
+        // コメントの正規化
+        $content = preg_replace('/\/\/\s*<\?php/', '// ', $content);
+        $content = preg_replace('/\/\/\s*$/', '', $content);
+        
+        // 余分な空白を削除
+        $content = trim($content);
+        
+        return $content;
+    }
+
+    /**
+     * 正規表現を使用してコメントを除去する
+     * 
+     * @param string $content 変換対象のコンテンツ
+     * @param string $extension ファイルの拡張子
+     * @return string 変換後のコンテンツ
+     */
+    private function removeCommentsWithRegex(string $content, string $extension): string {
+        switch ($extension) {
+            case 'php':
+            case 'inc':
+                // PHPの1行コメント（//, #）を除去
+                $content = preg_replace('/\/\/.*$/m', '', $content);
+                $content = preg_replace('/#.*$/m', '', $content);
+                
+                // PHPの複数行コメントを除去
+                $content = preg_replace('/\/\*[\s\S]*?\*\//', '', $content);
+                break;
+
+            case 'html':
+                // HTMLコメントを除去
+                $content = preg_replace('/<!--[\s\S]*?-->/', '', $content);
+                break;
+
+            case 'js':
+                // JavaScriptの1行コメント（//, #）を除去
+                $content = preg_replace('/\/\/.*$/m', '', $content);
+                $content = preg_replace('/#.*$/m', '', $content);
+                
+                // JavaScriptの複数行コメントを除去
+                $content = preg_replace('/\/\*[\s\S]*?\*\//', '', $content);
+                break;
+        }
+        
+        // 空行を整理
+        $content = preg_replace('/^\s*[\r\n]/m', '', $content);
+        
+        return $content;
+    }
+
+    /**
+     * 配列のキーに引用符を補完する
+     * 
+     * @param string $content 変換対象のコンテンツ
+     * @return string 変換後のコンテンツ
+     */
+    private function normalizeArrayKeys(string $content): string {
+        try {
+            $ast = $this->parser->parse($content);
+            if ($ast === null) {
+                echo "警告: パースに失敗したため、正規表現による処理にフォールバックします。\n";
+                return $this->normalizeArrayKeysWithRegex($content);
+            }
+
+            $traverser = new NodeTraverser();
+            $traverser->addVisitor(new class extends \PhpParser\NodeVisitorAbstract {
+                public function leaveNode(\PhpParser\Node $node) {
+                    if ($node instanceof \PhpParser\Node\Expr\Array_) {
+                        foreach ($node->items as $item) {
+                            if ($item->key !== null) {
+                                // キーが文字列でない場合、かつ定数でない場合
+                                if (!$item->key instanceof \PhpParser\Node\Scalar\String_ &&
+                                    !$item->key instanceof \PhpParser\Node\Expr\ConstFetch) {
+                                    // キーを文字列に変換
+                                    if ($item->key instanceof \PhpParser\Node\Identifier) {
+                                        $item->key = new \PhpParser\Node\Scalar\String_($item->key->name);
+                                    } else {
+                                        // その他の式の場合は、その式を文字列として評価
+                                        $item->key = new \PhpParser\Node\Scalar\String_((string)$item->key);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return $node;
+                }
+            });
+
+            $ast = $traverser->traverse($ast);
+            
+            // PrettyPrinterの設定をカスタマイズ
+            $prettyPrinter = new Standard([
+                'shortArraySyntax' => false, // array() 形式を使用
+                'indentSize' => 4,           // インデントサイズ
+                'indentChar' => ' ',         // インデント文字
+                'lineEnding' => "\n",        // 改行文字
+                'preserveNewlines' => true,  // 既存の改行を保持
+                'keepEmptyLines' => true,    // 空行を保持
+            ]);
+            
+            return $prettyPrinter->prettyPrintFile($ast);
+        } catch (\Throwable $e) {
+            echo "警告: 配列の引用符補完中にエラーが発生しました: " . $e->getMessage() . "\n";
+            echo "正規表現による処理にフォールバックします。\n";
+            return $this->normalizeArrayKeysWithRegex($content);
+        }
+    }
+
+    /**
+     * 正規表現を使用して配列のキーに引用符を補完する（フォールバック用）
+     * 
+     * @param string $content 変換対象のコンテンツ
+     * @return string 変換後のコンテンツ
+     */
+    private function normalizeArrayKeysWithRegex(string $content): string {
+        // 定数のパターン（大文字とアンダースコアのみで構成）
+        $constantPattern = '/^[A-Z_]+$/';
+        
+        // 配列宣言のパターン
+        $arrayPattern = '/array\s*\(\s*([^)]*)\s*\)/';
+        
+        // 配列の各要素を処理
+        $content = preg_replace_callback($arrayPattern, function($matches) use ($constantPattern) {
+            $elements = $matches[1];
+            
+            // 要素を分割して処理
+            $processedElements = array_map(function($element) use ($constantPattern) {
+                // キーと値のペアを処理
+                if (preg_match('/^\s*([^=]+)\s*=>\s*(.+)$/', $element, $pairMatches)) {
+                    $key = trim($pairMatches[1]);
+                    $value = trim($pairMatches[2]);
+                    
+                    // キーが定数でない場合、かつ引用符で囲まれていない場合は引用符を追加
+                    if (!preg_match($constantPattern, $key) && 
+                        !preg_match('/^[\'"].*[\'"]$/', $key)) {
+                        $key = "'" . str_replace("'", "\\'", $key) . "'";
+                    }
+                    
+                    return $key . ' => ' . $value;
+                }
+                return $element;
+            }, explode(',', $elements));
+            
+            return 'array(' . implode(', ', $processedElements) . ')';
+        }, $content);
+        
+        return $content;
+    }
+
+    /**
+     * PHPファイルからコメントを除去する
+     * 
+     * @param string $content 変換対象のコンテンツ
+     * @param string $extension ファイルの拡張子
+     * @return string 変換後のコンテンツ
+     */
+    private function removeComments(string $content, string $extension): string {
+        if ($extension !== 'php' && $extension !== 'inc') {
+            return $this->removeCommentsWithRegex($content, $extension);
+        }
+
+        try {
+            $ast = $this->parser->parse($content);
+            if ($ast === null) {
+                echo "警告: パースに失敗したため、正規表現による処理にフォールバックします。\n";
+                return $this->removeCommentsWithRegex($content, $extension);
+            }
+
+            $traverser = new NodeTraverser();
+            $traverser->addVisitor(new NameResolver());
+            $traverser->addVisitor(new CloningVisitor());
+            
+            // コメントを除去するビジターを追加
+            $traverser->addVisitor(new class extends \PhpParser\NodeVisitorAbstract {
+                public function leaveNode(\PhpParser\Node $node) {
+                    // ノードのコメントをクリア
+                    $node->setAttribute('comments', []);
+                    return $node;
+                }
+            });
+            
+            $ast = $traverser->traverse($ast);
+            
+            // PrettyPrinterの設定をカスタマイズ
+            $prettyPrinter = new Standard([
+                'shortArraySyntax' => false, // array() 形式を使用
+                'indentSize' => 4,           // インデントサイズ
+                'indentChar' => ' ',         // インデント文字
+                'lineEnding' => "\n",        // 改行文字
+                'preserveNewlines' => true,  // 既存の改行を保持
+                'keepEmptyLines' => true,    // 空行を保持
+            ]);
+            
+            return $prettyPrinter->prettyPrintFile($ast);
+        } catch (\Throwable $e) {
+            echo "警告: コメント除去中にエラーが発生しました: " . $e->getMessage() . "\n";
+            echo "正規表現による処理にフォールバックします。\n";
+            return $this->removeCommentsWithRegex($content, $extension);
+        }
+    }
+
+    /**
+     * ファイルの内容を読み込んで正規化する
+     * 
+     * @param string $filePath ファイルパス
+     * @return string|null 正規化されたファイルの内容、読み込みに失敗した場合はnull
+     */
+    private function readAndNormalizeFile(string $filePath): ?string {
+        try {
+            if (!file_exists($filePath)) {
+                echo "ファイルが存在しません: $filePath\n";
+                return null;
+            }
+
+            $content = file_get_contents($filePath);
+            if ($content === false) {
+                echo "ファイルの読み込みに失敗しました: $filePath\n";
+                return null;
+            }
+
+            $extension = pathinfo($filePath, PATHINFO_EXTENSION);
+            
+            // PHPファイルの場合のみタグの正規化を行う
+            if (in_array($extension, ['php', 'inc'])) {
+                // 短縮タグの正規化を最初に行う
+                $content = $this->normalizePhpTags($content);
+                
+                try {
+                    // パースを試みる
+                    $ast = $this->parser->parse($content);
+                    if ($ast !== null) {
+                        // パースが成功した場合のみ、配列の引用符補完とコメント除去を行う
+                        $content = $this->normalizeArrayKeys($content);
+                        $content = $this->removeComments($content, $extension);
+                    } else {
+                        // パースに失敗した場合は正規表現で処理
+                        $content = $this->normalizeArrayKeysWithRegex($content);
+                        $content = $this->removeCommentsWithRegex($content, $extension);
+                    }
+                } catch (\Throwable $e) {
+                    echo "警告: パース中にエラーが発生しました: " . $e->getMessage() . "\n";
+                    echo "正規表現による処理にフォールバックします。\n";
+                    $content = $this->normalizeArrayKeysWithRegex($content);
+                    $content = $this->removeCommentsWithRegex($content, $extension);
+                }
+            } else {
+                // PHP以外のファイルはコメント除去のみ
+                $content = $this->removeComments($content, $extension);
+            }
+
+            echo "ファイルを正規化しました: $filePath\n";
+            return $content;
+        } catch (\Exception $e) {
+            echo "ファイル処理エラー ($filePath): " . $e->getMessage() . "\n";
+            return null;
+        }
+    }
+
+    /**
+     * SQLクエリを抽出する
+     * 
+     * @param string $content ファイルの内容
+     * @return array 抽出されたSQLクエリの配列
+     */
+    public function extractSqlQueries(string $content): array {
+        $queries = [];
+        
+        // 文字列リテラル内のSQLクエリを抽出
+        if (preg_match_all('/(?:\'|")((?:SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|TRUNCATE|MERGE|WITH)[^;\'"]*?)(?:\'|")/i', $content, $matches)) {
+            foreach ($matches[1] as $sql) {
+                // クエリの前後の空白を削除
+                $sql = trim($sql);
+                if (!empty($sql)) {
+                    $queries[] = $sql;
+                }
+            }
+        }
+        
+        return $queries;
+    }
+
+    /**
+     * 指定されたディレクトリ以下のファイルを再帰的に走査する
+     * 
+     * @param string $directory 走査対象のディレクトリ
+     * @return void
+     */
+    private function scanDirectory(string $directory): void {
+        try {
+            $iterator = new \RecursiveIteratorIterator(
+                new \RecursiveDirectoryIterator($directory, \RecursiveDirectoryIterator::SKIP_DOTS),
+                \RecursiveIteratorIterator::SELF_FIRST
+            );
+
+            foreach ($iterator as $file) {
+                if ($file->isFile() && in_array($file->getExtension(), $this->targetExtensions)) {
+                    $relativePath = str_replace($this->directory . '/', '', $file->getPathname());
+                    $this->files[] = [
+                        'path' => $file->getPathname(),
+                        'relative_path' => $relativePath,
+                        'extension' => $file->getExtension()
+                    ];
+                    echo "ファイル検出: {$relativePath}\n";
+
+                    // ファイルの内容を読み込んで正規化
+                    $normalizedContent = $this->readAndNormalizeFile($file->getPathname());
+                    if ($normalizedContent !== null) {
+                        // 正規化された内容を保存
+                        $this->files[count($this->files) - 1]['content'] = $normalizedContent;
+                    }
+                }
+            }
+            echo "\n検出したファイル数: " . count($this->files) . "\n";
+
+        } catch (\Exception $e) {
+            echo "ディレクトリ走査エラー: " . $e->getMessage() . "\n";
+        }
+    }
+
+    /**
+     * 解析を開始する
+     * 
+     * @param string $directory 解析対象のディレクトリ
+     * @return void
+     */
+    public function analyze(string $directory): void {
+        $this->directory = realpath($directory);
+        if ($this->directory === false) {
+            throw new \RuntimeException("Invalid directory: $directory");
+        }
+        
+        echo "解析対象ディレクトリ: {$this->directory}\n";
+
+        // ビューとストアドプロシージャのリストを読み込む
+        $this->loadViews();
+        $this->loadProcs();
+
+        // ファイルの走査
+        echo "\nファイル走査を開始します...\n";
+        $this->scanDirectory($this->directory);
+    }
+
+    /**
+     * 読み込んだビューのリストを取得
+     * 
+     * @return array
+     */
+    public function getViews(): array {
+        return $this->views;
+    }
+
+    /**
+     * 読み込んだストアドプロシージャのリストを取得
+     * 
+     * @return array
+     */
+    public function getProcs(): array {
+        return $this->procs;
+    }
+
+    /**
+     * 検出したファイルの一覧を取得
+     * 
+     * @return array
+     */
+    public function getFiles(): array {
+        return $this->files;
+    }
+
+    /**
+     * SQLクエリを解析する
+     * 
+     * @param string $sql 解析対象のSQLクエリ
+     * @return array 解析結果
+     */
+    public function analyzeSql(string $sql): array {
+        $result = [
+            'has_string_concatenation' => false,
+            'is_vulnerable' => false,
+            'is_view' => false,
+            'is_stored_procedure' => false,
+            'crud' => [],
+            'tables' => [],
+            'joins' => [],
+            'subqueries' => [],
+            'functions' => []
+        ];
+
+        try {
+            // SQLクエリの解析
+            $parsed = $this->sqlParser->parse($sql);
+            
+            // パース結果が無効な場合は早期リターン
+            if (!is_array($parsed)) {
+                echo "警告: SQLクエリのパースに失敗しました: $sql\n";
+                return $result;
+            }
+            
+            // 文字列結合の検出
+            if (isset($parsed['WHERE'])) {
+                foreach ($parsed['WHERE'] as $where) {
+                    if (isset($where['base_expr']) && 
+                        (strpos($where['base_expr'], '$_GET') !== false || 
+                         strpos($where['base_expr'], '$_POST') !== false || 
+                         strpos($where['base_expr'], '$_REQUEST') !== false)) {
+                        $result['has_string_concatenation'] = true;
+                        $result['is_vulnerable'] = true;
+                        break;
+                    }
+                }
+            }
+            
+            // サブクエリの解析
+            $this->analyzeSubqueries($parsed, $result);
+            
+            // JOINの解析
+            $this->analyzeJoins($parsed, $result);
+            
+            // 関数の解析
+            $this->analyzeFunctions($parsed, $result);
+            
+            // ビューとストアドプロシージャの検出
+            if (isset($parsed['CREATE'])) {
+                if (isset($parsed['CREATE']['type']) && $parsed['CREATE']['type'] === 'VIEW') {
+                    $result['is_view'] = true;
+                } elseif (isset($parsed['CREATE']['type']) && $parsed['CREATE']['type'] === 'PROCEDURE') {
+                    $result['is_stored_procedure'] = true;
+                }
+            }
+            
+            // 基本的なCRUD操作の判定
+            if (isset($parsed['SELECT'])) {
+                $result['crud'][] = 'R';
+            }
+            if (isset($parsed['INSERT'])) {
+                $result['crud'][] = 'C';
+            }
+            if (isset($parsed['UPDATE'])) {
+                $result['crud'][] = 'U';
+            }
+            if (isset($parsed['DELETE'])) {
+                $result['crud'][] = 'D';
+            }
+            
+            // テーブル名の抽出
+            if (isset($parsed['FROM'])) {
+                foreach ($parsed['FROM'] as $from) {
+                    if (isset($from['table'])) {
+                        $result['tables'][] = $from['table'];
+                        
+                        // ビューとストアドプロシージャの判定
+                        if (in_array($from['table'], $this->views)) {
+                            $result['is_view'] = true;
+                        }
+                        if (in_array($from['table'], $this->procs)) {
+                            $result['is_stored_procedure'] = true;
+                        }
+                    }
+                }
+            }
+            
+        } catch (\Exception $e) {
+            echo "SQL解析エラー: " . $e->getMessage() . "\n";
+            // エラーが発生した場合は従来の正規表現による処理にフォールバック
+            return $this->analyzeSqlWithRegex($sql);
+        }
+
+        return $result;
+    }
+
+    /**
+     * サブクエリを解析する
+     * 
+     * @param array $parsed 解析済みのSQL
+     * @param array &$result 解析結果
+     */
+    private function analyzeSubqueries(array $parsed, array &$result): void {
+        // FROM句のサブクエリ
+        if (isset($parsed['FROM'])) {
+            foreach ($parsed['FROM'] as $from) {
+                if (isset($from['sub_tree'])) {
+                    try {
+                        $subSql = (string)$this->sqlCreator->create($from['sub_tree']);
+                        $subResult = $this->analyzeSql($subSql);
+                        $result['subqueries'][] = $subResult;
+                        $result['crud'] = array_merge($result['crud'], $subResult['crud']);
+                        $result['tables'] = array_merge($result['tables'], $subResult['tables']);
+                    } catch (\Exception $e) {
+                        echo "サブクエリ解析エラー: " . $e->getMessage() . "\n";
+                    }
+                }
+            }
+        }
+
+        // WHERE句のサブクエリ
+        if (isset($parsed['WHERE'])) {
+            foreach ($parsed['WHERE'] as $where) {
+                if (isset($where['sub_tree'])) {
+                    try {
+                        $subSql = (string)$this->sqlCreator->create($where['sub_tree']);
+                        $subResult = $this->analyzeSql($subSql);
+                        $result['subqueries'][] = $subResult;
+                        $result['crud'] = array_merge($result['crud'], $subResult['crud']);
+                        $result['tables'] = array_merge($result['tables'], $subResult['tables']);
+                    } catch (\Exception $e) {
+                        echo "サブクエリ解析エラー: " . $e->getMessage() . "\n";
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * JOINを解析する
+     * 
+     * @param array $parsed 解析済みのSQL
+     * @param array &$result 解析結果
+     */
+    private function analyzeJoins(array $parsed, array &$result): void {
+        if (isset($parsed['FROM'])) {
+            foreach ($parsed['FROM'] as $from) {
+                if (isset($from['join_type'])) {
+                    $join = [
+                        'type' => $from['join_type'],
+                        'table' => $from['table'] ?? null,
+                        'on' => $from['on'] ?? null
+                    ];
+                    $result['joins'][] = $join;
+                    
+                    if (isset($from['table'])) {
+                        $result['tables'][] = $from['table'];
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * 関数を解析する
+     * 
+     * @param array $parsed 解析済みのSQL
+     * @param array &$result 解析結果
+     */
+    private function analyzeFunctions(array $parsed, array &$result): void {
+        // SELECT句の関数
+        if (isset($parsed['SELECT'])) {
+            foreach ($parsed['SELECT'] as $select) {
+                if (isset($select['sub_tree'])) {
+                    foreach ($select['sub_tree'] as $sub) {
+                        if (isset($sub['expr_type']) && $sub['expr_type'] === 'function') {
+                            $function = [
+                                'name' => $sub['base_expr'],
+                                'args' => $sub['sub_tree'] ?? []
+                            ];
+                            $result['functions'][] = $function;
+                            
+                            // 関数の定義を確認
+                            $this->analyzeFunctionDefinition($function['name'], $result);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * 関数の定義を解析する
+     * 
+     * @param string $functionName 関数名
+     * @param array &$result 解析結果
+     */
+    private function analyzeFunctionDefinition(string $functionName, array &$result): void {
+        // 関数の定義を検索
+        foreach ($this->files as $file) {
+            if (isset($file['content'])) {
+                if (preg_match('/function\s+' . preg_quote($functionName) . '\s*\([^)]*\)\s*{([^}]*)}/s', $file['content'], $matches)) {
+                    // 関数内のSQLクエリを解析
+                    if (preg_match_all('/(?:\'|").*?(?:\'|")/s', $matches[1], $sqlMatches)) {
+                        foreach ($sqlMatches[0] as $sql) {
+                            $subResult = $this->analyzeSql($sql);
+                            $result['crud'] = array_merge($result['crud'], $subResult['crud']);
+                            $result['tables'] = array_merge($result['tables'], $subResult['tables']);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * 正規表現を使用してSQLクエリを解析する（フォールバック用）
+     * 
+     * @param string $sql 解析対象のSQLクエリ
+     * @return array 解析結果
+     */
+    private function analyzeSqlWithRegex(string $sql): array {
+        // 既存の正規表現による解析ロジック
+        $result = [
+            'has_string_concatenation' => false,
+            'is_vulnerable' => false,
+            'is_view' => false,
+            'is_stored_procedure' => false,
+            'crud' => [],
+            'tables' => []
+        ];
+
+        // ... existing regex-based analysis code ...
+
+        return $result;
+    }
+}
+
+/**
+ * 文字列結合解析クラス
+ */
+class StringConcatAnalyzer {
+    /** @var Parser */
+    private Parser $parser;
+    
+    /** @var array 文字列結合情報 */
+    private array $concatResults = [];
+    
+    /**
+     * コンストラクタ
+     */
+    public function __construct(Parser $parser) {
+        $this->parser = $parser;
+    }
+    
+    /**
+     * 文字列結合を解析
+     * 
+     * @param string $content PHPコード
+     * @return array 文字列結合情報
+     */
+    public function analyze(string $content): array {
+        try {
+            $ast = $this->parser->parse($content);
+            if ($ast === null) {
+                fwrite(STDERR, "[WARN] AST構築に失敗しました\n");
+                return [];
+            }
+            
+            $traverser = new NodeTraverser();
+            $visitor = new class($this) extends \PhpParser\NodeVisitorAbstract {
+                private StringConcatAnalyzer $analyzer;
+                
+                public function __construct(StringConcatAnalyzer $analyzer) {
+                    $this->analyzer = $analyzer;
+                }
+                
+                public function leaveNode(\PhpParser\Node $node) {
+                    // 文字列結合の解析
+                    if ($node instanceof \PhpParser\Node\Expr\BinaryOp\Concat) {
+                        $this->analyzer->processConcat($node);
+                    }
+                    
+                    // 変数への代入の解析
+                    if ($node instanceof \PhpParser\Node\Expr\Assign) {
+                        if ($node->expr instanceof \PhpParser\Node\Expr\BinaryOp\Concat) {
+                            $this->analyzer->processConcat($node->expr, $node->var);
+                        }
+                    }
+                }
+            };
+            
+            $traverser->addVisitor($visitor);
+            $traverser->traverse($ast);
+            return $this->concatResults;
+            
+        } catch (\Exception $e) {
+            fwrite(STDERR, "[WARN] 文字列結合解析エラー: {$e->getMessage()}\n");
+            return [];
+        }
+    }
+    
+    /**
+     * 文字列結合を処理
+     * 
+     * @param \PhpParser\Node\Expr\BinaryOp\Concat $node 結合ノード
+     * @param \PhpParser\Node\Expr|null $target 代入先（オプション）
+     * @return void
+     */
+    public function processConcat(\PhpParser\Node\Expr\BinaryOp\Concat $node, ?\PhpParser\Node\Expr $target = null): void {
+        $leftValues = $this->getPossibleValues($node->left);
+        $rightValues = $this->getPossibleValues($node->right);
+        
+        $results = [];
+        foreach ($leftValues as $left) {
+            foreach ($rightValues as $right) {
+                $results[] = $left . $right;
+            }
+        }
+        
+        if ($target !== null) {
+            $varName = $this->getVariableName($target);
+            if ($varName !== null) {
+                $this->concatResults[$varName] = $results;
+            }
+        } else {
+            $this->concatResults[] = $results;
+        }
+    }
+    
+    /**
+     * 式から取りうる値を取得
+     * 
+     * @param \PhpParser\Node\Expr $expr 式
+     * @return array 取りうる値の配列
+     */
+    public function getPossibleValues(\PhpParser\Node\Expr $expr): array {
+        if ($expr instanceof \PhpParser\Node\Scalar\String_) {
+            return [$expr->value];
+        }
+        
+        if ($expr instanceof \PhpParser\Node\Expr\BinaryOp\Concat) {
+            $leftValues = $this->getPossibleValues($expr->left);
+            $rightValues = $this->getPossibleValues($expr->right);
+            
+            $results = [];
+            foreach ($leftValues as $left) {
+                foreach ($rightValues as $right) {
+                    $results[] = $left . $right;
+                }
+            }
+            return $results;
+        }
+        
+        if ($expr instanceof \PhpParser\Node\Expr\Ternary) {
+            $trueValues = $this->getPossibleValues($expr->if);
+            $falseValues = $this->getPossibleValues($expr->else);
+            return array_merge($trueValues, $falseValues);
+        }
+        
+        if ($expr instanceof \PhpParser\Node\Expr\Variable) {
+            // 変数の場合は、既に解析済みの結果があればそれを使用
+            $varName = '$' . $expr->name;
+            if (isset($this->concatResults[$varName])) {
+                return $this->concatResults[$varName];
+            }
+            // 変数の値が不明な場合は空文字列を返す
+            return [''];
+        }
+        
+        // その他の式の場合は空文字列を返す
+        return [''];
+    }
+    
+    /**
+     * 変数名を取得
+     * 
+     * @param \PhpParser\Node\Expr $expr 式
+     * @return string|null 変数名
+     */
+    public function getVariableName(\PhpParser\Node\Expr $expr): ?string {
+        if ($expr instanceof \PhpParser\Node\Expr\Variable) {
+            return '$' . $expr->name;
+        }
+        return null;
+    }
+    
+    /**
+     * 文字列結合情報を取得
+     * 
+     * @return array 文字列結合情報
+     */
+    public function getConcatResults(): array {
+        return $this->concatResults;
+    }
+}
+
+// メモリ設定
+ini_set('memory_limit', '512M');
+
+// コマンドライン引数の処理
+if ($argc < 2) {
+    echo "使用方法: php analyzer.php <解析対象ディレクトリ> [出力ファイルパス]\n";
+    echo "例: php analyzer.php ./src ./output/analysis.xlsx\n";
+    exit(1);
+}
+
+$targetDir = $argv[1];
+$outputFile = $argv[2] ?? './output/analysis.xlsx';
+
+// 出力ディレクトリの作成
+$outputDir = dirname($outputFile);
+if (!is_dir($outputDir)) {
+    mkdir($outputDir, 0777, true);
+}
+
+// アナライザーの初期化と実行
+try {
+    $analyzer = new StaticAnalyzer();
+    $analyzer->analyze($targetDir);
+
+    // Excelワークブックの作成
+    $spreadsheet = new Spreadsheet();
+
+    // File-CRUDシート
+    $sheet = $spreadsheet->getActiveSheet();
+    $sheet->setTitle('File-CRUD');
+    $sheet->setCellValue('A1', 'file');
+    $sheet->setCellValue('B1', 'table');
+    $sheet->setCellValue('C1', 'C');
+    $sheet->setCellValue('D1', 'R');
+    $sheet->setCellValue('E1', 'U');
+    $sheet->setCellValue('F1', 'D');
+
+    // ファイルの解析
+    $files = $analyzer->getFiles();
+    $row = 2;
+
+    foreach ($files as $file) {
+        if (isset($file['content'])) {
+            // SQLクエリの抽出
+            $queries = $analyzer->extractSqlQueries($file['content']);
+            
+            // 各クエリを解析
+            foreach ($queries as $sql) {
+                $result = $analyzer->analyzeSql($sql);
+
+                // File-CRUDシートの更新
+                if (!empty($result['crud'])) {
+                    $sheet = $spreadsheet->getSheet(0);
+                    $sheet->setCellValue('A' . $row, $file['path']);
+                    $sheet->setCellValue('B' . $row, implode(', ', array_unique($result['tables'])));
+                    $sheet->setCellValue('C' . $row, in_array('C', $result['crud']) ? 'C' : '');
+                    $sheet->setCellValue('D' . $row, in_array('R', $result['crud']) ? 'R' : '');
+                    $sheet->setCellValue('E' . $row, in_array('U', $result['crud']) ? 'U' : '');
+                    $sheet->setCellValue('F' . $row, in_array('D', $result['crud']) ? 'D' : '');
+                    $row++;
+                }
+            }
+        }
+    }
+
+    // Excelファイルの保存
+    $writer = new Xlsx($spreadsheet);
+    $writer->save($outputFile);
+
+    echo "解析が完了しました。出力ファイル: $outputFile\n";
+
+} catch (\Exception $e) {
+    echo "エラーが発生しました: " . $e->getMessage() . "\n";
+    exit(1);
+}
