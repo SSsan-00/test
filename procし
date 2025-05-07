@@ -1,0 +1,262 @@
+#!/usr/bin/env php
+<?php
+/**
+ * proc_analyzer.php — ストアドプロシージャ呼び出し解析ツール（単一ファイル）
+ * --------------------------------------------------------------------------
+ * ・input/procs.txt            … 解析対象プロシージャ名（1 行 1 件）
+ * ・<TARGET_DIR> (既定 ./src) … 再帰的に *.php / *.inc / *.sql を走査
+ * ・procs.xlsx (既定)          … 解析結果を「StoredProcs」シートへ出力
+ *
+ * 出力列（ヘッダー）
+ *   A: file        … 呼び出し元ファイル（相対パス）
+ *   B: procedure   … プロシージャ名
+ *   C: table       … （空欄）
+ *   D: crud        … （空欄）
+ *   E: args        … 引数リスト（カンマ区切り）
+ *
+ * 依存: nikic/php-parser, phpoffice/phpspreadsheet, greenlion/php-sql-parser
+ * PHP 8.1 以上推奨
+ * --------------------------------------------------------------------------
+ * 2025-05-07 初版
+ */
+
+declare(strict_types=1);
+
+require_once __DIR__ . '/vendor/autoload.php';
+
+use PhpParser\{ParserFactory, Node, NodeTraverser, NodeVisitorAbstract};
+use PhpOffice\PhpSpreadsheet\{Spreadsheet, Writer\Xlsx};
+use PHPSQLParser\PHPSQLParser;
+
+/* ===== ユーティリティ ===== */
+
+/**
+ * 文字列からコメントを除去（PHP / SQL / JS / HTML すべて対象）
+ */
+function strip_comments(string $code): string
+{
+    // PHP, JS, C系ブロック/行コメントおよび HTML コメントを段階的に除去
+    $patterns = [
+        // HTML <!--  -->
+        '/<!--.*?-->/s',
+        // C, PHP ブロックコメント /* */
+        '/\/\*.*?\*\//s',
+        // 行コメント //, #  （先頭が // だが https:// を壊さないため負向後読み）
+        '/(^|\s)//[^\r\n]*/m',
+        '/(^|\s)#[^\r\n]*/m',
+    ];
+    return (string)@preg_replace($patterns, '', $code);
+}
+
+/**
+ * 再帰ディレクトリ走査（yield でメモリ節約）
+ */
+function iterate_files(string $dir, array $ext = ['php', 'inc', 'sql']): Generator
+{
+    $rii = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS)
+    );
+    foreach ($rii as $file) {
+        if ($file->isFile() && in_array(strtolower($file->getExtension()), $ext, true)) {
+            yield $file->getPathname();
+        }
+    }
+}
+
+/* ===== ストアドプロシージャ呼び出し検出 ===== */
+
+/**
+ * PHP コード中のストアドプロシージャ呼び出しを抽出する NodeVisitor
+ */
+class ProcCallVisitor extends NodeVisitorAbstract
+{
+    /** @var string[] */
+    private array $procNames;
+    /** @var array<string, array<int, string>> filePath => [ [proc, args]... ] */
+    public array $matches = [];
+
+    public function __construct(array $procNames, private string $filePath)
+    {
+        $this->procNames = array_map('strtolower', $procNames);
+    }
+
+    public function enterNode(Node $node)
+    {
+        // 関数呼び出し (proc_name(...))
+        if ($node instanceof Node\Expr\FuncCall && $node->name instanceof Node\Name) {
+            $called = strtolower($node->name->toString());
+            if (in_array($called, $this->procNames, true)) {
+                // 引数のソースコードをそのまま文字列で取得
+                $args = array_map(
+                    fn(Node\Arg $a) => trim((new PhpParser\PrettyPrinter\Standard())->prettyPrintExpr($a->value)),
+                    $node->args
+                );
+                $this->matches[] = [$called, implode(', ', $args)];
+            }
+        }
+
+        // SQL を含む文字列リテラル => SQL パースで再度検出
+        if ($node instanceof Node\Scalar\String_) {
+            $this->parseSqlString($node->value);
+        }
+        if ($node instanceof Node\Scalar\Encapsed) {
+            $this->parseSqlString($node->value);
+        }
+    }
+
+    /**
+     * SQL 文字列から CALL / SELECT proc(...) を検出
+     */
+    private function parseSqlString(string $sql): void
+    {
+        $sqlLower = strtolower($sql);
+        foreach ($this->procNames as $proc) {
+            if (!str_contains($sqlLower, $proc . '(') && !str_contains($sqlLower, "call $proc")) {
+                continue;
+            }
+            try {
+                $parsed = (new PHPSQLParser($sql))->parsed;
+            } catch (\Throwable) {
+                $parsed = [];
+            }
+            // CALL 文
+            if (isset($parsed['CALL'][0]['base_expr'])) {
+                $name = strtolower($parsed['CALL'][0]['base_expr']);
+                if ($name === $proc) {
+                    $args = array_column($parsed['CALL'][0]['sub_tree'] ?? [], 'base_expr');
+                    $this->matches[] = [$name, implode(', ', $args)];
+                }
+            }
+            // SELECT proc(...)
+            if (isset($parsed['SELECT'][0]['sub_tree'][0]['base_expr'])) {
+                $name = strtolower($parsed['SELECT'][0]['sub_tree'][0]['base_expr']);
+                if ($name === $proc) {
+                    $args = array_column(
+                        $parsed['SELECT'][0]['sub_tree'][0]['sub_tree']['args'] ?? [],
+                        'base_expr'
+                    );
+                    $this->matches[] = [$name, implode(', ', $args)];
+                }
+            }
+        }
+    }
+}
+
+/**
+ * 1 ファイルを解析して [ [proc, args]...] の配列を返す
+ */
+function analyze_file(string $filePath, array $procNames): array
+{
+    $code = file_get_contents($filePath);
+    if ($code === false) {
+        return [];
+    }
+    $clean = strip_comments($code);
+
+    // PHP 解析
+    $parser = (new ParserFactory())->createForNewestSupportedVersion();
+    try {
+        $ast = $parser->parse($clean);
+    } catch (\Throwable) {
+        $ast = null;  // 構文エラーでも無視して SQL 検出へ
+    }
+
+    $matches = [];
+    if ($ast !== null) {
+        $visitor = new ProcCallVisitor($procNames, $filePath);
+        $traverser = new NodeTraverser();
+        $traverser->addVisitor($visitor);
+        $traverser->traverse($ast);
+        $matches = $visitor->matches;
+    }
+
+    // SQL ファイル / 文字列内 SQL のフォールバック正規表現
+    //   CALL proc_name(…)
+    //   SELECT proc_name(…)
+    $pattern = '/\b(?:call|select)\s+(' . implode('|', array_map('preg_quote', $procNames)) . ')\s*\((.*?)\)/is';
+    if (preg_match_all($pattern, $clean, $m, PREG_SET_ORDER)) {
+        foreach ($m as $row) {
+            $matches[] = [strtolower($row[1]), trim($row[2])];
+        }
+    }
+
+    return $matches;
+}
+
+/* ===== メイン処理 ===== */
+
+function main(array $argv): void
+{
+    [$targetDir, $output] = [
+        $argv[1] ?? './src',
+        $argv[2] ?? './procs.xlsx',
+    ];
+
+    // プロシージャ名一覧を取得
+    $procFile = __DIR__ . '/input/procs.txt';
+    if (!is_file($procFile)) {
+        fwrite(STDERR, "Error: input/procs.txt が見つかりません\n");
+        exit(1);
+    }
+    $procNames = array_values(
+        array_filter(
+            array_map('trim', file($procFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES))
+        )
+    );
+    if (!$procNames) {
+        fwrite(STDERR, "Error: procs.txt が空です\n");
+        exit(1);
+    }
+
+    $results = []; // [['file'=>..., 'proc'=>..., 'args'=>...], ...]
+
+    foreach (iterate_files($targetDir) as $file) {
+        $matches = analyze_file($file, $procNames);
+        foreach ($matches as [$proc, $args]) {
+            $results[] = [
+                'file' => ltrim(str_replace($targetDir, '', $file), DIRECTORY_SEPARATOR),
+                'proc' => $proc,
+                'table' => '',  // 要件どおり空
+                'crud' => '',   // 要件どおり空
+                'args' => $args,
+            ];
+        }
+    }
+
+    if (!$results) {
+        fwrite(STDOUT, "プロシージャ呼び出しは見つかりませんでした\n");
+        return;
+    }
+
+    // Excel 出力
+    $wb  = new Spreadsheet();
+    $sh  = $wb->getActiveSheet();
+    $sh->setTitle('StoredProcs');
+
+    // ヘッダー
+    $headers = ['file', 'procedure', 'table', 'crud', 'args'];
+    $sh->fromArray($headers, null, 'A1');
+
+    // データ
+    $row = 2;
+    foreach ($results as $rec) {
+        $sh->fromArray([
+            $rec['file'],
+            $rec['proc'],
+            $rec['table'],
+            $rec['crud'],
+            $rec['args'],
+        ], null, "A{$row}");
+        $row++;
+    }
+
+    // 幅自動調整
+    foreach (range('A', 'E') as $col) {
+        $sh->getColumnDimension($col)->setAutoSize(true);
+    }
+
+    (new Xlsx($wb))->save($output);
+    fwrite(STDOUT, "解析完了: {$output} に出力しました ({$row-2} 件)\n");
+}
+
+main($argv);
