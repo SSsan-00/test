@@ -1,0 +1,200 @@
+#!/usr/bin/env php
+<?php
+/**
+ * proc_usage_extractor.php — ストアドプロシージャ使用状況 抽出ツール（単一ファイル版 / PHP-CLI）
+ * =====================================================================================================
+ *  ◆ 依存ライブラリ
+ *      composer require "phpoffice/phpspreadsheet:^4.2"
+ *
+ *  ◆ 使い方
+ *      $ php proc_usage_extractor.php <TARGET_DIR> [OUTPUT.xlsx]
+ *          TARGET_DIR  … 解析対象ディレクトリ（再帰）
+ *          OUTPUT.xlsx … 出力先（省略時 ./proc_usage.xlsx）
+ *
+ *  ◆ 動作概要
+ *      1.  カレントディレクトリ ./input/procs.txt からストアドプロシージャ名リストを読み込む
+ *      2.  指定フォルダ内の *.php / *.inc ファイルを再帰的に走査
+ *      3.  ファイル内のコメントを除去した後、リストに載るプロシージャ呼び出しを検出し引数を取得
+ *      4.  以下ヘッダー構成で Excel に出力
+ *              ファイル名 | ストアドプロシージャ名 | CRUD | テーブル名 | 引数
+ *         ├ 同一ファイルで複数呼び出しがある場合 ─ 2 行目以降のファイル名セルは空欄にする
+ *         └ ファイルが変わる際に 1 行空白行を挿入
+ *
+ *  ◆ 免責
+ *      単純な正規表現で検出を行います。ネストした括弧や文字列結合を多用した動的 SQL には未対応です。
+ *      厳密解析が必要な場合は PhpParser 等による AST 解析を組み込んでください。
+ *
+ *  2025-05-08  fully-featured initial release
+ */
+
+declare(strict_types=1);
+
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+
+// ──────────────────────────────────────────────────────────────────────────────
+// ① 入力パラメータと初期設定
+// ──────────────────────────────────────────────────────────────────────────────
+const HEADER = ['ファイル名', 'ストアドプロシージャ名', 'CRUD', 'テーブル名', '引数'];
+
+$argvCount = $_SERVER['argc'];
+if ($argvCount < 2 || in_array($argv[1], ['-h', '--help'], true)) {
+    fwrite(STDERR, "Usage: php proc_usage_extractor.php <TARGET_DIR> [OUTPUT.xlsx]\n");
+    exit(1);
+}
+
+$targetDir   = realpath($argv[1]) ?: '';
+$outputPath  = $argvCount >= 3 ? $argv[2] : __DIR__ . '/proc_usage.xlsx';
+$procsTxt    = __DIR__ . '/input/procs.txt';
+
+if (!is_dir($targetDir)) {
+    fwrite(STDERR, "ERROR: TARGET_DIR '{$argv[1]}' is not a directory.\n");
+    exit(1);
+}
+if (!is_file($procsTxt)) {
+    fwrite(STDERR, "ERROR: {$procsTxt} が見つかりません。\n");
+    exit(1);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// ② ストアドプロシージャ名リストを取得
+// ──────────────────────────────────────────────────────────────────────────────
+$procedures = array_values(
+    array_filter(
+        array_map('trim', file($procsTxt, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES)),
+        static fn(string $l): bool => $l !== ''
+    )
+);
+if ($procedures === []) {
+    fwrite(STDERR, "ERROR: procs.txt が空、または読み込みに失敗しました。\n");
+    exit(1);
+}
+
+// 正規表現パターンを事前生成（大文字小文字を無視）
+$procPatterns = [];
+foreach ($procedures as $proc) {
+    // \b だけだとスキーマ付き dbo.proc のピリオドで途切れるため look-behind を用いる
+    $escaped = preg_quote($proc, '/');
+    $procPatterns[$proc] = '/(?<![A-Z0-9_])' . $escaped . '\s*\(([^)]*)\)/i';
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// ③ 解析開始
+// ──────────────────────────────────────────────────────────────────────────────
+$results = [];                // Excel に書き込む配列
+$dirIter = new RecursiveIteratorIterator(
+    new RecursiveDirectoryIterator($targetDir, FilesystemIterator::SKIP_DOTS),
+    RecursiveIteratorIterator::SELF_FIRST
+);
+
+foreach ($dirIter as $file) {
+    if (!$file->isFile()) {
+        continue;
+    }
+    $ext = strtolower($file->getExtension());
+    if (!in_array($ext, ['php', 'inc'], true)) {
+        continue;             // 対象拡張子以外はスキップ
+    }
+
+    $code       = file_get_contents($file->getPathname());
+    $cleanCode  = stripComments($code);
+    $fileRows   = detectProcedures($cleanCode, $procPatterns, $file->getPathname(), $targetDir);
+
+    if ($fileRows !== []) {
+        $results = array_merge($results, $fileRows, [['', '', '', '', '']]); // ⇒ 1 行空白を挿入
+    }
+}
+
+// 空行を末尾に入れたくないので削除
+if (end($results) === ['', '', '', '', '']) {
+    array_pop($results);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// ④ Excel 出力
+// ──────────────────────────────────────────────────────────────────────────────
+$spreadsheet = new Spreadsheet();
+$sheet       = $spreadsheet->getActiveSheet();
+$sheet->fromArray(HEADER, null, 'A1');
+if ($results !== []) {
+    $sheet->fromArray($results, null, 'A2');
+}
+
+// 見やすさ向上: ヘッダーを太字 & 列幅自動調整
+$headerCellRange = $sheet->getStyle('A1:E1');
+$headerCellRange->getFont()->setBold(true);
+foreach (range('A', 'E') as $col) {
+    $sheet->getColumnDimension($col)->setAutoSize(true);
+}
+
+$writer = new Xlsx($spreadsheet);
+try {
+    $writer->save($outputPath);
+    echo "✓ 解析完了: {$outputPath} を生成しました。\n";
+} catch (Throwable $e) {
+    fwrite(STDERR, "ERROR: Excel 書き込みに失敗しました — {$e->getMessage()}\n");
+    exit(1);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// ⑤ 補助関数
+// ──────────────────────────────────────────────────────────────────────────────
+/**
+ * PHP コメントをすべて取り除く
+ *   ・token_get_all でトークン分割し、コメント／ドキュメントコメントを除去
+ *   ・インライン HTML / 文字列 / コードはそのまま保持
+ */
+function stripComments(string $code): string
+{
+    $output = '';
+    foreach (token_get_all($code) as $token) {
+        if (is_string($token)) {
+            $output .= $token;         // 記号（{}, ; など）
+            continue;
+        }
+        [$id, $text] = $token;
+        // コメント種別をスキップ
+        if (in_array($id, [T_COMMENT, T_DOC_COMMENT], true)) {
+            continue;
+        }
+        $output .= $text;
+    }
+    return $output;
+}
+
+/**
+ * 指定ファイル内でプロシージャ呼び出しを検出し、出力用行データを作成
+ *
+ * @param string   $code         コメント除去済みソースコード
+ * @param string[] $patterns     ['procName' => '/regex/'] の連想配列
+ * @param string   $absPath      ファイルの絶対パス
+ * @param string   $baseDir      変換元ベースパス（相対化用）
+ *
+ * @return array<int, array{string,string,string,string,string}>
+ */
+function detectProcedures(
+    string $code,
+    array $patterns,
+    string $absPath,
+    string $baseDir
+): array {
+    $relPath = ltrim(str_replace('\\', '/', substr($absPath, strlen($baseDir))), '/');
+    $rows    = [];
+
+    foreach ($patterns as $proc => $regex) {
+        if (!preg_match_all($regex, $code, $matches, PREG_SET_ORDER)) {
+            continue;                   // 呼び出し無し
+        }
+        foreach ($matches as $idx => $m) {
+            // 同ファイル 2 行目以降はファイル名セルを空欄に
+            $rows[] = [
+                $idx === 0 ? $relPath : '',
+                $proc,
+                '',                     // CRUD (空欄)
+                '',                     // テーブル名 (空欄)
+                trim($m[1]),            // 引数文字列
+            ];
+        }
+    }
+    return $rows;
+}
