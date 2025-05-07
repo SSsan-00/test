@@ -1,0 +1,231 @@
+#!/usr/bin/env php
+<?php
+/**
+ * external_access_analyzer.php
+ * ------------------------------------------------------------------
+ *  指定ディレクトリ以下を再帰走査し、外部アクセス URL を収集して
+ *  Excel 1 シート（ExternalAccess）に出力する静的解析 CLI ツール。
+ *
+ *  2025-05-07  fully‑featured version (for ChatGPT user)
+ * ------------------------------------------------------------------
+ *  依存:
+ *     composer require phpoffice/phpspreadsheet:^4.2
+ * ------------------------------------------------------------------
+ *  使い方:
+ *     php external_access_analyzer.php <TARGET_DIR> [OUTPUT.xlsx]
+ *       TARGET_DIR   … 解析対象ディレクトリ
+ *       OUTPUT.xlsx  … 出力先 (省略時 ExternalAccess.xlsx)
+ * ------------------------------------------------------------------
+ */
+
+declare(strict_types=1);
+
+require_once __DIR__ . '/vendor/autoload.php';
+
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+
+/* === 1. コマンドライン引数の取得 ======================================= */
+if ($argc < 2) {
+    fwrite(STDERR, "Usage: php {$argv[0]} <TARGET_DIR> [OUTPUT.xlsx]\n");
+    exit(1);
+}
+$targetDir   = realpath($argv[1]) ?: $argv[1];
+$outputFile  = $argv[2] ?? 'ExternalAccess.xlsx';
+
+/* === 2. 走査対象拡張子と結果格納用配列 ================================ */
+$extensions = ['php', 'inc', 'js', 'html'];
+$results    = [];   // 1 行: [file, type, url]
+
+/* === 3. 解析処理本体 =================================================== */
+
+/**
+ * ディレクトリ以下を再帰的に走査して対象ファイル一覧を取得。
+ */
+function collectFiles(string $dir, array $exts): array
+{
+    $rii = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS)
+    );
+
+    $files = [];
+    foreach ($rii as $file) {
+        if ($file->isFile()) {
+            $ext = strtolower($file->getExtension());
+            if (in_array($ext, $exts, true)) {
+                $files[] = $file->getPathname();
+            }
+        }
+    }
+    return $files;
+}
+
+/**
+ * PHP/JS/HTML コメントをなるべく安全に除去するユーティリティ。
+ *  - PHP: token_get_all() でコメントトークンのみ除去
+ *  - JS/HTML: 正規表現で /* … * /, // …, <!-- … --> を除去
+ */
+function stripComments(string $code, string $ext): string
+{
+    if ($ext === 'php' || $ext === 'inc') {         // --- PHP ----------
+        $out = '';
+        foreach (token_get_all($code) as $tok) {
+            if (is_array($tok)) {
+                [$id, $text] = $tok;
+                if (in_array($id, [T_COMMENT, T_DOC_COMMENT], true)) {
+                    continue; // コメントは無視
+                }
+                $out .= $text;
+            } else {
+                $out .= $tok;  // 文字列トークン
+            }
+        }
+        $code = $out;
+    }
+
+    /* --- C/JS ブロック & 行コメント, HTML コメント -------------------- */
+    // ブロックコメント /* ... */
+    $code = preg_replace('#/\*.*?\*/#s', '', $code) ?? $code;
+    // 行コメント // ...  （URL 内 // は極力避けるよう https?:// を除外）
+    $code = preg_replace('#(?<!http:|https:)//.*$#m', '', $code) ?? $code;
+    // HTML コメント <!-- ... -->
+    $code = preg_replace('#<!--.*?-->#s', '', $code) ?? $code;
+
+    return $code;
+}
+
+/**
+ * PHP 埋め込み表現をざっくり「解決」するヘルパ。
+ *   - リテラル文字列はそのまま結合
+ *   - 変数・関数・定数など動的部分は {var} でマスク
+ *   - 候補が複数あれば重複排除して配列で返す
+ *
+ * @return string[] 解析後 URL 候補（空なら元文字列をそのまま返す）
+ */
+function resolvePhpEmbedded(string $raw): array
+{
+    if (strpos($raw, '<?') === false) {
+        return [$raw];          // PHP 埋め込み無し
+    }
+
+    $candidates = [];
+
+    // 1) <?php … ?> / <?= … ?> ブロックを走査
+    $phpPattern = '#<\?(?:php)?(.*?)\?>#s';
+    if (preg_match_all($phpPattern, $raw, $blocks, PREG_SET_ORDER)) {
+        foreach ($blocks as $blk) {
+            $expr = $blk[1];
+
+            // 2) 文字列リテラルを抽出
+            if (preg_match_all('#[\'"]([^\'"]+)[\'"]#', $expr, $lit)) {
+                $candidates[] = implode('', $lit[1]); // 連結
+            } else {
+                $candidates[] = '{var}';
+            }
+        }
+    }
+
+    // 3) PHP ブロック外に残った文字列も追加
+    $plain = preg_replace($phpPattern, '{var}', $raw);
+    $candidates[] = $plain;
+
+    return array_values(array_unique($candidates));
+}
+
+/**
+ * ファイル 1 つを解析し、外部アクセス行を配列で返す。
+ * 返値: [ [file, type, url], ... ]
+ */
+function analyze(string $file, array $tagPatterns): array
+{
+    $ext  = strtolower(pathinfo($file, PATHINFO_EXTENSION));
+    $code = file_get_contents($file);
+    $code = stripComments($code, $ext);  // コメント除去
+
+    $rows = [];
+
+    foreach ($tagPatterns as $type => $pattern) {
+        if (!preg_match_all($pattern, $code, $m, PREG_SET_ORDER)) {
+            continue; // 該当なし
+        }
+
+        foreach ($m as $hit) {
+            // マッチした URL はキャプチャ番号がパターン毎に違う
+            //   → 末尾のグループに揃えてあるので array_pop で取得
+            $rawUrl = trim(array_pop($hit), "\"' \t\r\n");
+
+            foreach (resolvePhpEmbedded($rawUrl) as $url) {
+                // URL らしければそのまま、そうでなければスキップ
+                if ($url === '' || $url === '{var}') {
+                    continue;
+                }
+                $rows[] = [$file, $type, $url];
+            }
+        }
+    }
+
+    return $rows;
+}
+
+/* --- 4. 検索用正規表現（タグ ⇒ パターン） ----------------------------- */
+$tagPatterns = [
+    /* <form action="..."> */
+    'action' => '#<form\b[^>]*\baction\s*=\s*([\'"])(.*?)\1#is',
+
+    /* <a href="..."> */
+    'href'   => '#<a\b[^>]*\bhref\s*=\s*([\'"])(.*?)\1#is',
+
+    /* <iframe src="..."> */
+    'iframe' => '#<iframe\b[^>]*\bsrc\s*=\s*([\'"])(.*?)\1#is',
+
+    /* document.anything.action = '...';  (JS) */
+    'action' => '#document\.\s*[A-Za-z_]\w*\s*\.action\s*=\s*([\'"])(.*?)\1#i',
+
+    /* new XMLHttpRequest().open( 'METHOD', 'URL', ... ) */
+    'XMLHttpRequest' =>
+        '#\b\w+\.open\s*\(\s*[\'"][A-Z]+[\'"]\s*,\s*([\'"])(.*?)\1#i',
+
+    /* window.open('URL') */
+    'window.open' => '#window\.open\s*\(\s*([\'"])(.*?)\1#i',
+
+    /* window.location.href / assign / replace = 'URL' */
+    'window.open' =>
+        '#window\.location\.(?:href|assign|replace)\s*=\s*([\'"])(.*?)\1#i',
+
+    /* header('Location: URL') */
+    'header' =>
+        '#header\s*\(\s*[\'"]\s*Location\s*:\s*([\'"]?)(.*?)\1\s*\)#i',
+];
+
+/* --- 5. 解析ループ ----------------------------------------------------- */
+foreach (collectFiles($targetDir, $extensions) as $file) {
+    $results = array_merge($results, analyze($file, $tagPatterns));
+}
+
+/* --- 6. Excel 出力 ----------------------------------------------------- */
+$spreadsheet = new Spreadsheet();
+$sheet       = $spreadsheet->getActiveSheet();
+$sheet->setTitle('ExternalAccess');
+
+/* ヘッダー行 */
+$sheet->fromArray(['file', 'type', 'url'], null, 'A1');
+
+/* データ行 */
+$rowNo = 2;
+foreach ($results as [$file, $type, $url]) {
+    // 相対パスに変換して出力（可読性向上）
+    $relative = ltrim(str_replace(realpath($targetDir), '', realpath($file)), DIRECTORY_SEPARATOR);
+    $sheet->fromArray([$relative, $type, $url], null, "A{$rowNo}");
+    $rowNo++;
+}
+
+/* 列幅を自動調整（文字数ベースの簡易版） */
+foreach (range('A', 'C') as $col) {
+    $sheet->getColumnDimension($col)->setAutoSize(true);
+}
+
+/* 保存 */
+$writer = new Xlsx($spreadsheet);
+$writer->save($outputFile);
+
+echo "解析完了: {$outputFile} に " . ($rowNo - 2) . " 行を書き出しました。\n";
