@@ -1,0 +1,163 @@
+# 静的解析ツール
+## 概要
+解析対象のフォルダ内の`php`,`inc`,`html`,`js`ファイルを再帰的に静的解析を行い、解析結果をエクセル出力するCLIツール
+## 使用ライブラリ
+- nikic/php-parser
+- greenlion/php-sql-parser
+- phpoffice/phpspreadsheet
+- mck89/peast
+## 処理の流れ
+1. inputフォルダ読み込み
+    - カレントディレクトリの `input`フォルダにある`views.txt`と`procs.txt`を読み込みビューとストアドプロシージャの情報を取得する
+        - 読み込むテキストファイルには一行ごとに各リストを羅列している 
+1. フォルダ読み込み
+    - 解析対象のフォルダ内のファイルを再帰的に読み込む
+1. クリーンアップ処理
+    - ファイル中のコメントと無駄な空白、改行を削除する
+    - 文字列結合している場合はつなげた状態に直す
+    - phpで記述している配列のキーを引用符で囲っていない場合は、補完する
+        - 定数で定義している場合はそのままで良い
+    - ファイル中のPHP,JSの定数と変数の値を解決して変数や定数で記述している箇所を実際の値に書き換える
+        - HTMLやJSで<?= $file ?>のようなPHPを埋め込んでいるパターンでも変数や定数の値を解決して適切に書き換える
+        - 条件分岐などで値に複数候補がある場合は全て出力するようにする
+        - インクルードファイルで定義している場合にも対応する
+1. SQL解析
+    - ソースコードからPostgreSQLで記述されているクエリを全て抽出してそのファイル上で行われているCRUD操作を分析する
+    - ファイル内で同じ変数名で複数のクエリが使われている場合すべて解析する
+    - 必要に応じてテーブル名に＠を付与して注釈をつける
+        - 複数の注釈がある場合は全て出力する　ex)@temp,multi
+        - 以下注釈一覧
+            - @view
+            - @temp
+            - @multi
+    - `対象クエリ`
+        ### **SELECT**  
+        例:  
+        `SELECT * FROM users WHERE id = 1`
+        - →users:R
+        ### **INSERT INTO**  
+        例:  
+        `INSERT INTO users (name, email) VALUES ('John', 'john@example.com')`
+        - →users:C
+        ### **UPDATE**  
+        例:  
+        `UPDATE users SET name = 'Jane' WHERE id = 1`
+        - →users:U
+        ### **DELETE**  
+        例:  
+        `DELETE FROM users WHERE id = 1`
+        - →users:D
+        ### **SELECT INTO TEMP**  
+        例:  
+        `SELECT * INTO TEMP temp_users FROM users`
+        - →temp_users:C@temp
+        - users:R
+        ### **CREATE TEMP TABLE**  
+        例:  
+        `CREATE TEMP TABLE temp_users AS SELECT * FROM users`
+        - →temp_users:C@temp
+        ### **DROP TABLE**  
+        例:  
+        `DROP TABLE users`
+        - →users:D
+        ### **TRUNCATE**  
+        例:  
+        `TRUNCATE users`
+        - →users:D
+        ### **WITH（共通テーブル式 / CTE）**  
+        例:  
+        `WITH recent_users AS (SELECT * FROM users WHERE created_at > now() - interval '7 days') SELECT * FROM recent_users`
+        - →recent_users:C@temp,R
+        - →users:R
+        ### **JOIN**  
+        例:  
+        `SELECT u.*, o.* FROM users u JOIN orders o ON u.id = o.user_id`
+        - →users:R
+        - →orders:R
+    - `views.txt`を参照してテーブル名とビュー名が一致するならテーブル名@viewにする
+    - 条件分岐などでテーブル名に複数候補がある場合はテーブル名@multiにする
+    - 対象テーブルに複数のCRUD操作が行われている場合は全て出力するようにする
+    - ひとつのクエリに複数の対象クエリが含まれているなら全て考慮して解析する
+    - サブクエリ中のクエリも解析してCRUD判定する
+    - エイリアスがある場合は元のテーブル名を出力するようにする
+1. 関数解析
+    - ファイル内のユーザー定義関数をを検知して定義元を確認したときにクエリを発行している場合はそのクエリに応じてCRUD情報を対象テーブルに付与する
+    - 関数の定義によってCRUD操作や対象テーブルが引数などによって異なる場合を考慮する
+        - ex)get_value関数の定義なら第2引数がテーブル名となりR判定する
+    - 関数内で別の関数をよんでCRUD操作を行う場合、最初の呼び出し元のファイルにCRUD情報を付与する
+    - CRUDの判定機銃はSQL解析の対象クエリのルールと同じ
+1. インクルード解析
+    - ソースコードを解析してインクルードファイルがあればそのファイル情報を取得する
+    - インクルードファイルが別のインクルードファイルを呼んでいる場合も出力する
+    - インクルードファイルの深さを検索して出力する時は深さの昇順に出力する
+1. 外部アクセス解析
+    - ソースコードを解析して外部アクセスしている箇所を発見してそのURLを取得する
+    - 出力ルール
+        ### **フォーム action**
+        例:  
+        `<form action="https://example.com/submit" method="post">`
+        ### **アンカータグ a href**
+        例:  
+        `<a href="https://example.com">リンク</a>`
+        ### **iframe src**
+        例:  
+        `<iframe src="https://example.com/embed"></iframe>`
+        ### **document.<任意要素名>.action**
+        例:  
+        `document.main.action = 'https://example.com/submit'`  
+        - `main` 部分は任意の要素名（例: `form1`, `loginForm`, `searchForm` など）
+        ### **JavaScript XMLHttpRequest**
+        例:  
+        `xhr.open('GET', 'https://api.example.com/data')`  
+        - オブジェクト名は任意（例: `xhr`, `request`, `http` など）
+        - 第2引数がURL
+        ### **window.open**
+        例:  
+        `window.open('https://example.com')`  
+        - 第1引数がURL
+        ### **window.location**
+        例:
+        `window.location.href = 'https://example.com'`
+        ### **HTTP ヘッダー location**
+        例:  
+        `header('Location: https://example.com')`
+    - それぞれタグ付けしてURLを出力する
+    - 以下のタグを適切に付与
+        - action
+        - href 
+        - XMLHttpRequest
+        - window.open
+        - header
+        - iframe
+1. ストアドプロシージャ解析
+    - `procs.txt`から取得したストアドプロシージャリストを参照して使われているファイルを取得する
+    - ストアドプロシージャが使われている箇所の引数の情報を取得する
+1. シート出力
+    - 解析結果をまとめてカレントディレクトリのoutputフォルダにエクセル出力する
+    - 出力するシート
+        1. ファイル単位のCRUD図
+            - SQL解析と関数解析の結果をまとめて出力する
+            - ファイル名とテーブル名とCRUDがヘッダー
+            - ファイル名は解析フォルダからの相対パスで出力して複数行になる場合は最初の一回のみの出力にする
+            - 違うファイルになる時は一行空白を開ける
+        1. ファイル単位のCRUD操作を行う関数一覧
+            - 関数解析の結果をまとめて出力する
+            - ファイル名と関数名とテーブル名とCRUDがヘッダー
+            - ファイル単位で使っている関数と操作するテーブルとCRUDを出力する
+        1. ストアドプロシージャを使用しているファイルと引数情報
+            - ストアドプロシージャ解析の結果をまとめて出力する
+            - ファイル名とストアドプロシージャ名とテーブル名とCRUDと引数がヘッダー
+            - テーブル名とCRUDは空で良い
+        1. インクルードファイル一覧
+            - インクルード解析の結果をまとめて出力する 
+            - ファイル名とインクルードファイルと深さがヘッダー
+        1. 外部アクセスのURL一覧
+            - 外部アクセス解析の結果をまとめて出力する
+            - ファイル名とタグとURLがヘッダー
+## 備考
+- 大量のファイルを解析するためメモリ効率の良い実装を行う
+- 文法ミスなどで静的解析ライブラリが解析に失敗するファイルの混在が確認されているので、解析に失敗するファイルに対してはフォールバック処理で同じ結果を得られるように実装する
+- 1つのファイルで完結させてツールを実装する
+- ファイル名を出力するときは解析フォルダからの相対パスで出力する
+    - 絶対パスで指定している場合は絶対パスで出力する
+ーーー
