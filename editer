@@ -1,0 +1,280 @@
+<?php
+declare(strict_types=1);
+
+/**
+ * 静的解析ツールの前処理スクリプト
+ * 
+ * このスクリプトは、PHP、HTML、JavaScriptファイルに対して以下の前処理を行う
+ * 1. PHPの開始タグの補完
+ * 2. コメントの除去
+ * 3. 配列キーの引用符補完
+ * 
+ * 処理の流れ：
+ * 1. コマンドライン引数の検証
+ * 2. 出力ディレクトリの作成
+ * 3. ファイルの再帰的な走査と処理
+ * 4. 処理結果の出力
+ */
+
+require_once __DIR__ . '/vendor/autoload.php';
+
+/* ---------- 1. 引数確認 ---------- */
+if (PHP_SAPI !== 'cli') {
+    fwrite(STDERR, "This script must be run from CLI.\n");
+    exit(1);
+}
+if (empty($argv[1])) {
+    fwrite(STDERR, "Usage: php editer.php <TARGET_DIR>\n");
+    exit(1);
+}
+$targetDir = realpath($argv[1]);
+if ($targetDir === false || !is_dir($targetDir)) {
+    fwrite(STDERR, "Error: '{$argv[1]}' is not a directory.\n");
+    exit(1);
+}
+
+/* ---------- 2. 出力フォルダ ---------- */
+$outRoot = getcwd() . DIRECTORY_SEPARATOR . 'edited_' . basename($targetDir);
+if (!is_dir($outRoot) && !mkdir($outRoot, 0777, true) && !is_dir($outRoot)) {
+    fwrite(STDERR, "Error: failed to create output directory '{$outRoot}'.\n");
+    exit(1);
+}
+
+/* ---------- 4. 再帰走査 ---------- */
+$allowedExt = ['php', 'inc', 'js', 'html'];
+$iter = new RecursiveIteratorIterator(
+    new RecursiveDirectoryIterator(
+        $targetDir,
+        FilesystemIterator::SKIP_DOTS | FilesystemIterator::FOLLOW_SYMLINKS
+    ),
+    RecursiveIteratorIterator::SELF_FIRST
+);
+
+foreach ($iter as $info) {
+    if ($info->isDir()) {
+        $rel = substr($info->getPathname(), strlen($targetDir) + 1);
+        if ($rel !== '' && !is_dir($outRoot . DIRECTORY_SEPARATOR . $rel)) {
+            mkdir($outRoot . DIRECTORY_SEPARATOR . $rel, 0777, true);
+        }
+        continue;
+    }
+
+    $ext = strtolower($info->getExtension());
+    if (!in_array($ext, $allowedExt, true)) {
+        continue;
+    }
+
+    $srcPath = $info->getPathname();
+    $relPath = substr($srcPath, strlen($targetDir) + 1);
+    $destPath = $outRoot . DIRECTORY_SEPARATOR . $relPath;
+
+    $code = file_get_contents($srcPath) ?: '';
+    switch ($ext) {
+        case 'php':
+        case 'inc':
+            $code = handlePhp($code);
+            break;
+        case 'js':
+            $code = handleJs($code);
+            break;
+        case 'html':
+            $code = handleHtml($code);
+            break;
+    }
+
+    // UTF‑8 へ統一
+    if (!mb_check_encoding($code, 'UTF-8')) {
+        $code = mb_convert_encoding($code, 'UTF-8', 'auto');
+    }
+
+    if (!is_dir(dirname($destPath))) {
+        mkdir(dirname($destPath), 0777, true);
+    }
+    file_put_contents($destPath, $code);
+    echo "✓ {$relPath}\n";
+}
+
+echo "\nALL DONE  →  {$outRoot}\n";
+
+/* ========================================================
+   ▽ 言語別処理
+   ====================================================== */
+
+/**
+ * PHPファイルの処理
+ * 
+ * 1. 短縮タグの補完
+ * 2. コメントの除去
+ * 3. 配列キーの引用符補完
+ * 
+ * @param string $src ソースコード
+ * @return string 処理済みのコード
+ */
+function handlePhp(string $src): string
+{
+    // (1) 短縮タグ補完
+    $src = preg_replace('/<\?(?!php|=|xml)/i', '<?php', $src);
+
+    // (2) コメント除去
+    $clean = '';
+    foreach (token_get_all($src) as $t) {
+        if (is_array($t)) {
+            [$id, $txt] = $t;
+            if (in_array($id, [T_COMMENT, T_DOC_COMMENT], true)) {
+                continue;
+            }
+            $clean .= $txt;
+        } else {
+            $clean .= $t;
+        }
+    }
+
+    // (3) 引用符補完（正規表現ベース）
+    $out = fallbackQuoteKeys($clean);
+
+    return compressWhitespace($out);
+}
+
+/**
+ * JavaScriptファイルの処理
+ * 
+ * 処理の流れ：
+ * 1. 文字列を1文字ずつ走査
+ * 2. 現在の状態（コード、コメント、文字列）に応じて処理
+ * 3. 文字列リテラル内のエスケープシーケンスを保持
+ * 
+ * @param string $code 処理対象のJavaScriptコード
+ * @return string コメントを除去し、空白を圧縮したコード
+ */
+function handleJs(string $code): string
+{
+    // 状態管理用の変数
+    $out = '';           // 出力バッファ
+    $i = 0;             // 現在の文字位置
+    $len = strlen($code); // コードの長さ
+    $st = 'code';       // 現在の状態（code: 通常コード, lc: 単一行コメント, bc: 複数行コメント, sq: シングルクォート文字列, dq: ダブルクォート文字列, tpl: テンプレートリテラル）
+
+    // 1文字ずつ走査
+    while ($i < $len) {
+        $c = $code[$i];           // 現在の文字
+        $n = $code[$i + 1] ?? ''; // 次の文字（存在しない場合は空文字）
+
+        switch ($st) {
+            case 'code': // 通常のコード
+                // 単一行コメントの開始（//）
+                if ($c === '/' && $n === '/') {
+                    $st = 'lc';
+                    $i += 2;
+                    break;
+                }
+                // 複数行コメントの開始（/*）
+                if ($c === '/' && $n === '*') {
+                    $st = 'bc';
+                    $i += 2;
+                    break;
+                }
+                // 文字列リテラルの開始
+                if ($c === "'" || $c === '"' || $c === '`') {
+                    $st = $c === '`' ? 'tpl' : ($c === "'" ? 'sq' : 'dq');
+                }
+                $out .= $c;
+                $i++;
+                break;
+
+            case 'lc': // 単一行コメント
+                // 改行でコメント終了
+                if ($c === "\n") {
+                    $out .= $c;
+                    $st = 'code';
+                }
+                $i++;
+                break;
+
+            case 'bc': // 複数行コメント
+                // コメント終了（*/）
+                if ($c === '*' && $n === '/') {
+                    $st = 'code';
+                    $i += 2;
+                } else {
+                    $i++;
+                }
+                break;
+
+            case 'sq': // シングルクォート文字列
+            case 'dq': // ダブルクォート文字列
+            case 'tpl': // テンプレートリテラル
+                $out .= $c;
+                // エスケープシーケンスの処理
+                if ($c === '\\') {
+                    $out .= $n;
+                    $i += 2;
+                    break;
+                }
+                // 文字列終了
+                if (($st === 'sq' && $c === "'")
+                    || ($st === 'dq' && $c === '"')
+                    || ($st === 'tpl' && $c === '`')) {
+                    $st = 'code';
+                }
+                $i++;
+                break;
+        }
+    }
+
+    // 空白の圧縮処理
+    return compressWhitespace($out);
+}
+
+/**
+ * HTMLファイルの処理
+ * 
+ * 1. コメントの除去
+ * 2. 空白の圧縮
+ * 
+ * @param string $code ソースコード
+ * @return string 処理済みのコード
+ */
+function handleHtml(string $code): string
+{
+    return compressWhitespace(preg_replace('/<!--[\s\S]*?-->/', '', $code));
+}
+
+/* ========================================================
+   ▽ 補助関数
+   ====================================================== */
+
+/**
+ * 配列キーの引用符補完（フォールバック）
+ * 
+ * ASTパーサーが失敗した場合の代替処理
+ * 正規表現を使用して配列キーに引用符を追加
+ * 
+ * @param string $code ソースコード
+ * @return string 処理済みのコード
+ */
+function fallbackQuoteKeys(string $code): string
+{
+    // [ key =>] -> [ 'key' => ] （ただし SNAKE_CASE はスキップ）
+    $replacer = function (array $m): string {
+        return preg_match('/^[A-Z_][A-Z0-9_]*$/', $m[2]) ? $m[0] : "{$m[1]}'{$m[2]}'{$m[3]}";
+    };
+    $code = preg_replace_callback('/(\[\s*)([A-Za-z_\x80-\xff][A-Za-z0-9_\x80-\xff]*)\s*(=>)/', $replacer, $code);
+    $code = preg_replace_callback('/(\[\s*)([A-Za-z_\x80-\xff][A-Za-z0-9_\x80-\xff]*)\s*(\])/', $replacer, $code);
+    $code = preg_replace_callback('/(\barray\s*\(\s*)([A-Za-z_\x80-\xff][A-Za-z0-9_\x80-\xff]*)\s*(=>)/i', $replacer, $code);
+    return $code;
+}
+
+/**
+ * 空白の圧縮
+ * 
+ * 1. 行末の空白を削除
+ * 2. 連続する改行を2行に制限
+ * 
+ * @param string $code ソースコード
+ * @return string 処理済みのコード
+ */
+function compressWhitespace(string $code): string
+{
+    $code = preg_replace('/[ \t]+$/m', '', $code);  // 行末空白削除
+    return preg_replace('/\n{3,}/', "\n\n", $code); // 連続改行 2 行に
+}
