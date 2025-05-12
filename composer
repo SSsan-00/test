@@ -1,0 +1,12 @@
+{
+    "require": {
+        "nikic/php-parser": "^5.4",
+        "greenlion/php-sql-parser": "^4.7",
+        "phpoffice/phpspreadsheet": "^4.2"
+    },
+    "autoload": {
+        "psr-4": {
+            "Editer\\": "src/"
+        }
+    }
+}
