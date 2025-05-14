@@ -1,0 +1,797 @@
+<?php
+/**
+ * PHPファイルのインクルード解析ツール V2
+ * 
+ * 指定されたディレクトリ内のPHPファイルを再帰的に走査し、
+ * includeやrequire文を検出してエクセル出力するツール
+ * 
+ * 使用方法: php includesResolverV2.php [対象ディレクトリパス]
+ */
+
+// Composerのオートロードを使用
+require 'vendor/autoload.php';
+
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+use PhpParser\ParserFactory;
+use PhpParser\NodeTraverser;
+use PhpParser\NodeVisitor\NameResolver;
+use PhpParser\Node;
+use PhpParser\Node\Expr\Include_;
+use PhpParser\Node\Scalar\String_;
+use PhpParser\Node\Expr\BinaryOp\Concat;
+use PhpParser\Node\Expr\Variable;
+use PhpParser\Node\Expr\ConstFetch;
+use PhpParser\NodeVisitorAbstract;
+
+/**
+ * インクルード文を検出して収集するビジター
+ */
+class IncludeCollectorVisitor extends NodeVisitorAbstract
+{
+    public $includes = [];
+    private $variableValues = [];
+    private $constantValues = [];
+    private $filePath;
+    
+    public function __construct($filePath, $variableValues = [], $constantValues = [])
+    {
+        $this->filePath = $filePath;
+        $this->variableValues = $variableValues;
+        $this->constantValues = $constantValues;
+    }
+    
+    public function enterNode(Node $node)
+    {
+        if ($node instanceof Include_) {
+            $rawIncludePath = $this->resolveIncludePath($node->expr);
+            $this->includes[] = $rawIncludePath;
+        }
+        
+        // 変数の代入を追跡
+        if ($node instanceof Node\Expr\Assign && $node->var instanceof Variable) {
+            $varName = $node->var->name;
+            $value = $this->resolveValue($node->expr);
+            if ($value !== null) {
+                $this->variableValues[$varName] = $value;
+            }
+        }
+        
+        // 定数の定義を追跡
+        if ($node instanceof Node\Expr\FuncCall && $node->name instanceof Node\Name && (string)$node->name === 'define') {
+            if (count($node->args) >= 2) {
+                $constNameExpr = $node->args[0]->value;
+                if ($constNameExpr instanceof Node\Scalar\String_) {
+                    $constName = $constNameExpr->value;
+                    $value = $this->resolveValue($node->args[1]->value);
+                    if ($value !== null) {
+                        $this->constantValues[$constName] = $value;
+                    }
+                }
+            }
+        }
+    }
+    
+    /**
+     * インクルードパスのノードを解決する
+     */
+    private function resolveIncludePath(Node $expr)
+    {
+        // 直接文字列の場合
+        if ($expr instanceof String_) {
+            return $expr->value;
+        }
+        
+        // 連結演算子の場合
+        if ($expr instanceof Concat) {
+            $left = $this->resolveIncludePath($expr->left);
+            $right = $this->resolveIncludePath($expr->right);
+            return $left . $right;
+        }
+        
+        // 変数の場合
+        if ($expr instanceof Variable) {
+            $varName = $expr->name;
+            if (isset($this->variableValues[$varName])) {
+                return $this->variableValues[$varName];
+            }
+            return 'CHECK!';
+        }
+        
+        // 定数の場合
+        if ($expr instanceof ConstFetch) {
+            $constName = (string) $expr->name;
+            
+            // 特殊な定数の処理
+            if ($constName === '__DIR__') {
+                return dirname($this->filePath);
+            } elseif ($constName === '__FILE__') {
+                return $this->filePath;
+            } elseif (isset($this->constantValues[$constName])) {
+                return $this->constantValues[$constName];
+            }
+            
+            // PHPの特殊定数
+            if ($constName === 'DIRECTORY_SEPARATOR') {
+                return DIRECTORY_SEPARATOR;
+            } elseif ($constName === 'PHP_EOL') {
+                return PHP_EOL;
+            }
+            
+            return 'CHECK!';
+        }
+        
+        // 関数呼び出しの場合
+        if ($expr instanceof Node\Expr\FuncCall && $expr->name instanceof Node\Name) {
+            $funcName = (string) $expr->name;
+            
+            // dirname関数の処理
+            if ($funcName === 'dirname' && count($expr->args) >= 1) {
+                $arg = $this->resolveIncludePath($expr->args[0]->value);
+                if ($arg !== null) {
+                    return dirname($arg);
+                }
+            }
+        }
+        
+        // 解決できなかった場合
+        return 'CHECK!';
+    }
+    
+    /**
+     * 式の値を解決する
+     */
+    private function resolveValue(Node $expr)
+    {
+        if ($expr instanceof String_) {
+            return $expr->value;
+        }
+        
+        if ($expr instanceof Concat) {
+            $left = $this->resolveValue($expr->left);
+            $right = $this->resolveValue($expr->right);
+            if ($left !== null && $right !== null) {
+                return $left . $right;
+            }
+        }
+        
+        if ($expr instanceof Variable) {
+            $varName = $expr->name;
+            if (isset($this->variableValues[$varName])) {
+                return $this->variableValues[$varName];
+            }
+        }
+        
+        if ($expr instanceof ConstFetch) {
+            $constName = (string) $expr->name;
+            if ($constName === '__DIR__') {
+                return dirname($this->filePath);
+            } elseif ($constName === '__FILE__') {
+                return $this->filePath;
+            } elseif (isset($this->constantValues[$constName])) {
+                return $this->constantValues[$constName];
+            }
+        }
+        
+        if ($expr instanceof Node\Expr\FuncCall && $expr->name instanceof Node\Name) {
+            $funcName = (string) $expr->name;
+            if ($funcName === 'dirname' && count($expr->args) >= 1) {
+                $arg = $this->resolveValue($expr->args[0]->value);
+                if ($arg !== null) {
+                    return dirname($arg);
+                }
+            }
+        }
+        
+        return null;
+    }
+}
+
+/**
+ * PHPファイルからインクルードパスを抽出するクラス
+ */
+class IncludeAnalyzer
+{
+    private $baseDir;
+    private $parser;
+    private $traverser;
+    
+    /**
+     * コンストラクタ
+     * 
+     * @param string $baseDir 解析の基準となるディレクトリ
+     */
+    public function __construct($baseDir)
+    {
+        $this->baseDir = rtrim($baseDir, '/');
+        
+        // PHP-Parserの初期化
+        $parserFactory = new ParserFactory;
+        $this->parser = $parserFactory->createForNewestSupportedVersion();
+        $this->traverser = new NodeTraverser();
+        $this->traverser->addVisitor(new NameResolver());
+    }
+    
+    /**
+     * 指定されたディレクトリ内のPHPファイルを再帰的に収集
+     * 
+     * @param string $dir 走査するディレクトリ
+     * @return array PHPファイルパスの配列
+     */
+    public function collectPhpFiles($dir)
+    {
+        $files = [];
+        $iterator = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($dir, RecursiveDirectoryIterator::SKIP_DOTS)
+        );
+        
+        foreach ($iterator as $file) {
+            if ($file->isFile() && ($file->getExtension() === 'php' || $file->getExtension() === 'inc')) {
+                $files[] = $file->getPathname();
+            }
+        }
+        
+        return $files;
+    }
+    
+    /**
+     * PHPファイルからインクルード文を抽出
+     * 
+     * @param string $filePath 解析対象のPHPファイルパス
+     * @return array インクルードパスの配列
+     */
+    public function extractIncludes($filePath)
+    {
+        $content = file_get_contents($filePath);
+        $includes = [];
+        
+        // コメントアウトされていない箇所のみを抽出
+        $cleanContent = $this->removeComments($content);
+        
+        try {
+            // PHP-Parserでの解析を試みる
+            $ast = $this->parser->parse($cleanContent);
+            $visitor = new IncludeCollectorVisitor($filePath);
+            $this->traverser->addVisitor($visitor);
+            $this->traverser->traverse($ast);
+            
+            // 検出されたインクルード文を処理
+            foreach ($visitor->includes as $includePath) {
+                $resolvedPath = $this->resolveDynamicPath($includePath, $filePath);
+                $includes[] = [
+                    'raw' => $includePath,
+                    'resolved' => $resolvedPath
+                ];
+            }
+            
+            // ビジターをリセット
+            $this->traverser->removeVisitor($visitor);
+            
+        } catch (\Exception $e) {
+            // パースエラーの場合はフォールバックで正規表現で解析
+            $patterns = [
+                '/include\s+[\'"]([^\'"]+)[\'"]/',
+                '/include_once\s+[\'"]([^\'"]+)[\'"]/',
+                '/require\s+[\'"]([^\'"]+)[\'"]/',
+                '/require_once\s+[\'"]([^\'"]+)[\'"]/',
+            ];
+            
+            foreach ($patterns as $pattern) {
+                if (preg_match_all($pattern, $cleanContent, $matches)) {
+                    foreach ($matches[1] as $includePath) {
+                        $resolvedPath = $this->resolveDynamicPath($includePath, $filePath);
+                        $includes[] = [
+                            'raw' => $includePath,
+                            'resolved' => $resolvedPath
+                        ];
+                    }
+                }
+            }
+        }
+        
+        return $includes;
+    }
+    
+    /**
+     * コメントを除去する
+     * 
+     * @param string $content PHPのコード
+     * @return string コメントを除去したコード
+     */
+    private function removeComments($content)
+    {
+        $tokens = token_get_all($content);
+        $cleanContent = '';
+        
+        foreach ($tokens as $token) {
+            if (is_array($token)) {
+                if ($token[0] !== T_COMMENT && $token[0] !== T_DOC_COMMENT) {
+                    $cleanContent .= $token[1];
+                }
+            } else {
+                $cleanContent .= $token;
+            }
+        }
+        
+        return $cleanContent;
+    }
+    
+    /**
+     * 動的パスを解決する
+     * 
+     * @param string $includePath 元のインクルードパス
+     * @param string $filePath インクルード文を含むファイルのパス
+     * @return string 解決されたパス
+     */
+    private function resolveDynamicPath($includePath, $filePath)
+    {
+        // すでにCHECK!が含まれる場合はそのまま返す
+        if (strpos($includePath, 'CHECK!') !== false) {
+            return $includePath;
+        }
+
+        $fileDir = dirname($filePath);
+
+        // __DIR__ の置換
+        $includePath = str_replace('__DIR__', $fileDir, $includePath);
+        // __FILE__ の置換
+        $includePath = str_replace('__FILE__', $filePath, $includePath);
+        // dirname(__FILE__) の置換
+        $includePath = preg_replace('/dirname\s*\(\s*__FILE__\s*\)/', $fileDir, $includePath);
+
+        // 変数を含むパスの場合はCHECK!を返す
+        if (preg_match('/\$[a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*/', $includePath)) {
+            return 'CHECK!';
+        }
+
+        // 相対パスの解決を試みる
+        if (preg_match('/^(\/|[A-Z]:\\\\)/i', $includePath)) {
+            // 絶対パスの場合
+            $candidate = realpath($includePath);
+            if ($candidate !== false) {
+                return $candidate;
+            }
+        } else {
+            // 相対パスの場合
+            // ./ や ../ で始まる相対パスはそのまま
+            if (strpos($includePath, './') === 0 || strpos($includePath, '../') === 0) {
+                $fullPath = $fileDir . DIRECTORY_SEPARATOR . $includePath;
+            } else {
+                // 指定されていない場合はカレントディレクトリからの相対パスとみなす
+                $fullPath = $fileDir . DIRECTORY_SEPARATOR . $includePath;
+            }
+
+            $candidate = realpath($fullPath);
+            if ($candidate !== false) {
+                return $candidate;
+            }
+            
+            // 実際のファイルパスを解決できない場合、そのまま返す
+            return $fullPath;
+        }
+
+        // パスを解決できなかった場合
+        return 'CHECK!';
+    }
+    
+    /**
+     * 絶対パスを相対パスに変換
+     * 
+     * @param string $path 変換するパス
+     * @param bool $includeProjectFolderInPath プロジェクトフォルダ名をパスに含めるかどうか（デフォルトはfalse）
+     * @return string 基準ディレクトリからの相対パス
+     */
+    public function toRelativePath($path, $includeProjectFolderInPath = false)
+    {
+        // CHECK!が含まれているならそのまま返す
+        if (strpos($path, 'CHECK!') !== false) {
+            return 'CHECK!';
+        }
+
+        // baseDirのrealpath取得
+        $baseDirReal = realpath($this->baseDir);
+        if ($baseDirReal === false) {
+            return 'CHECK!';
+        }
+        
+        // パス候補を抽出するロジック
+        $candidates = [];
+        
+        // 候補1: そのままのパス
+        $candidates[] = $path;
+        
+        // 候補2: realpath適用
+        $realPath = realpath($path);
+        if ($realPath !== false) {
+            $candidates[] = $realPath;
+        }
+        
+        // 候補3: baseDirからの相対パス
+        if (!preg_match('/^(\/|[A-Z]:\\\\)/i', $path)) {
+            $absPath = $baseDirReal . DIRECTORY_SEPARATOR . $path;
+            if (file_exists($absPath)) {
+                $candidates[] = $absPath;
+            }
+        }
+        
+        // 候補4: 文字列内に解析対象フォルダ名が含まれる場合、その後の部分を抽出
+        $baseDirName = basename($baseDirReal);
+        if (preg_match('/'. preg_quote($baseDirName, '/') . '[\\/\\\\]([^\'"]+)/', $path, $matches)) {
+            $extractedPath = $matches[1];
+            // 抽出されたパスが存在するか確認
+            $checkPath = $baseDirReal . DIRECTORY_SEPARATOR . $extractedPath;
+            if (file_exists($checkPath)) {
+                $candidates[] = $checkPath;
+            }
+        }
+        
+        // 候補5: 絶対パス内から解析対象フォルダを基準とした相対パスを抽出
+        if (preg_match('/^(\/|[A-Z]:\\\\)/i', $path)) {
+            $parts = preg_split('/[\\/\\\\]/', $path);
+            $foundBaseDir = false;
+            $relativePath = '';
+            
+            foreach ($parts as $part) {
+                if ($foundBaseDir) {
+                    $relativePath .= ($relativePath ? DIRECTORY_SEPARATOR : '') . $part;
+                } elseif ($part === $baseDirName) {
+                    $foundBaseDir = true;
+                }
+            }
+            
+            if ($foundBaseDir && $relativePath) {
+                $checkPath = $baseDirReal . DIRECTORY_SEPARATOR . $relativePath;
+                if (file_exists($checkPath)) {
+                    $candidates[] = $checkPath;
+                }
+            }
+        }
+        
+        // すべての候補を評価して最適な相対パスを返す
+        foreach ($candidates as $candidate) {
+            if (file_exists($candidate)) {
+                $realCandidate = realpath($candidate);
+                if ($realCandidate !== false && strpos($realCandidate, $baseDirReal) === 0) {
+                    // 解析ディレクトリからの相対パスを返す
+                    $relativePath = substr($realCandidate, strlen($baseDirReal) + 1);
+                    
+                    // プロジェクトフォルダ名をパスに含める場合（この部分はコメントアウト）
+                    /*
+                    if ($includeProjectFolderInPath) {
+                        return basename($baseDirReal) . DIRECTORY_SEPARATOR . $relativePath;
+                    }
+                    */
+                    
+                    return $relativePath;
+                }
+            }
+        }
+        
+        // どの候補も適合しない場合はCHECK!を返す
+        return 'CHECK!';
+    }
+
+    /**
+     * インクルードの依存関係を再帰的に解析
+     * 
+     * @param string $filePath 解析対象のファイルパス
+     * @param int $depth 現在の深さ
+     * @param array $visited 訪問済みファイルのリスト（循環参照対策）
+     * @param bool $includeProjectFolderInPath プロジェクトフォルダ名をパスに含めるかどうか
+     * @return array 依存関係のツリー
+     */
+    public function analyzeDependencies($filePath, $depth = 0, $visited = [], $includeProjectFolderInPath = false)
+    {
+        // 絶対パスに変換
+        $filePath = realpath($filePath) ?: $filePath;
+        
+        // 循環参照チェック
+        if (!file_exists($filePath)) {
+            return [
+                [
+                    'file' => 'CHECK!',
+                    'depth' => $depth + 1,
+                    'not_found' => true,
+                    'children' => []
+                ]
+            ];
+        }
+        
+        if (in_array($filePath, $visited)) {
+            // 循環参照が検出された場合
+            return [
+                [
+                    'file' => $this->toRelativePath($filePath, $includeProjectFolderInPath),
+                    'depth' => $depth + 1,
+                    'circular' => true,
+                    'children' => []
+                ]
+            ];
+        }
+        
+        $visited[] = $filePath;
+        $includes = $this->extractIncludes($filePath);
+        $dependencies = [];
+        
+        foreach ($includes as $include) {
+            $includePath = $include['resolved'];
+            
+            // 解決できないパスの場合はこれ以上解析しない
+            if ($includePath === 'CHECK!' || strpos($includePath, 'CHECK!') !== false) {
+                $dependencies[] = [
+                    'file' => 'CHECK!',
+                    'depth' => $depth + 1,
+                    'children' => []
+                ];
+                continue;
+            }
+            
+            // 存在しないファイルはこれ以上解析しない
+            if (!file_exists($includePath)) {
+                $dependencies[] = [
+                    'file' => 'CHECK!',
+                    'depth' => $depth + 1,
+                    'not_found' => true,
+                    'children' => []
+                ];
+                continue;
+            }
+            
+            $childDependencies = $this->analyzeDependencies($includePath, $depth + 1, $visited, $includeProjectFolderInPath);
+            
+            $dependencies[] = [
+                'file' => $this->toRelativePath($includePath, $includeProjectFolderInPath),
+                'depth' => $depth + 1,
+                'children' => $childDependencies
+            ];
+        }
+        
+        return $dependencies;
+    }
+}
+
+/**
+ * エクセル出力を行うクラス
+ */
+class ExcelExporter
+{
+    private $analyzer;
+    private $spreadsheet;
+    
+    /**
+     * コンストラクタ
+     */
+    public function __construct()
+    {
+        $this->spreadsheet = new Spreadsheet();
+        $this->spreadsheet->getProperties()
+            ->setCreator('PHP Includes Analyzer')
+            ->setTitle('インクルード解析結果')
+            ->setDescription('PHPファイルのインクルード解析結果');
+    }
+    
+    /**
+     * 第1シートの作成（ファイルとインクルードの一覧）
+     * 
+     * @param array $results 解析結果
+     */
+    public function createFirstSheet($results)
+    {
+        $sheet = $this->spreadsheet->getActiveSheet();
+        $sheet->setTitle('インクルード一覧');
+        
+        // ヘッダー
+        $sheet->setCellValue('A1', 'ファイル名');
+        $sheet->setCellValue('B1', 'インクルードファイルパス');
+        
+        $row = 2;
+        
+        foreach ($results as $result) {
+            $file = $result['file'];
+            $includes = $result['includes'];
+            
+            if (empty($includes)) {
+                $sheet->setCellValue('A' . $row, $file);
+                $sheet->setCellValue('B' . $row, '');
+                $row++;
+            } else {
+                foreach ($includes as $include) {
+                    $sheet->setCellValue('A' . $row, $file);
+                    $sheet->setCellValue('B' . $row, $include['relative']);
+                    $row++;
+                }
+            }
+        }
+        
+        // カラム幅の自動調整
+        $sheet->getColumnDimension('A')->setAutoSize(true);
+        $sheet->getColumnDimension('B')->setAutoSize(true);
+    }
+    
+    /**
+     * 第2シートの作成（依存関係の深さ）
+     * 
+     * @param array $dependencies 依存関係のデータ
+     */
+    public function createSecondSheet($dependencies)
+    {
+        $sheet = $this->spreadsheet->createSheet();
+        $sheet->setTitle('インクルード依存関係');
+        
+        // ヘッダー
+        $sheet->setCellValue('A1', 'ファイル名');
+        $sheet->setCellValue('B1', 'インクルードファイルパス');
+        $sheet->setCellValue('C1', '深さ');
+        $sheet->setCellValue('D1', '状態');
+        
+        $row = 2;
+        
+        foreach ($dependencies as $file => $deps) {
+            $row = $this->addDependenciesToSheet($sheet, $row, $file, $deps);
+        }
+        
+        // カラム幅の自動調整
+        $sheet->getColumnDimension('A')->setAutoSize(true);
+        $sheet->getColumnDimension('B')->setAutoSize(true);
+        $sheet->getColumnDimension('C')->setAutoSize(true);
+        $sheet->getColumnDimension('D')->setAutoSize(true);
+    }
+    
+    /**
+     * 依存関係データをシートに追加（再帰的に呼び出される）
+     * 
+     * @param object $sheet シートオブジェクト
+     * @param int $row 現在の行番号
+     * @param string $sourceFile 元のファイル名
+     * @param array $dependencies 依存関係データ
+     * @return int 更新された行番号
+     */
+    private function addDependenciesToSheet($sheet, $row, $sourceFile, $dependencies)
+    {
+        foreach ($dependencies as $dependency) {
+            $sheet->setCellValue('A' . $row, $sourceFile);
+            $sheet->setCellValue('B' . $row, $dependency['file']);
+            $sheet->setCellValue('C' . $row, $dependency['depth']);
+            
+            $status = '';
+            if (isset($dependency['circular']) && $dependency['circular']) {
+                $status = '循環参照';
+            } elseif (isset($dependency['not_found']) && $dependency['not_found']) {
+                $status = 'ファイルなし';
+            }
+            $sheet->setCellValue('D' . $row, $status);
+            
+            $row++;
+            
+            if (!empty($dependency['children'])) {
+                $row = $this->addDependenciesToSheet($sheet, $row, $sourceFile, $dependency['children']);
+            }
+        }
+        
+        return $row;
+    }
+    
+    /**
+     * エクセルファイルの保存
+     * 
+     * @param string $filename 保存するファイル名
+     */
+    public function save($filename)
+    {
+        $writer = new Xlsx($this->spreadsheet);
+        $writer->save($filename);
+    }
+}
+
+/**
+ * メイン関数
+ * 
+ * @param string $targetDir 解析対象ディレクトリ
+ * @param bool $includeProjectFolderInPath プロジェクトフォルダ名をパスに含めるかどうか（デフォルトはfalse）
+ * 注: このオプションを有効にするには、toRelativePath メソッド内のコメントアウト部分を有効にする必要があります。
+ */
+function main($targetDir, $includeProjectFolderInPath = false)
+{
+    // PHPファイルの収集
+    $files = collectPhpFiles($targetDir);
+    if (empty($files)) {
+        echo "エラー: PHPファイルが見つかりませんでした。\n";
+        exit(1);
+    }
+
+    // インクルードパスの解析
+    $analyzer = new IncludeAnalyzer($targetDir);
+    $results = [];
+    $dependencies = [];
+    
+    foreach ($files as $file) {
+        $includes = $analyzer->extractIncludes($file);
+        $relativeFile = $analyzer->toRelativePath($file, $includeProjectFolderInPath);
+        
+        // インクルードの相対パスを解決
+        foreach ($includes as &$include) {
+            $include['relative'] = $analyzer->toRelativePath($include['resolved'], $includeProjectFolderInPath);
+        }
+        
+        if (!empty($includes)) {
+            $results[] = [
+                'file' => $relativeFile,
+                'includes' => $includes
+            ];
+            
+            // 依存関係の解析
+            $deps = $analyzer->analyzeDependencies($file, 0, [], $includeProjectFolderInPath);
+            if (!empty($deps)) {
+                $dependencies[$relativeFile] = $deps;
+            }
+        }
+    }
+
+    // Excelファイルの生成
+    $timestamp = date('Ymd_His');
+    $excelFile = $targetDir . '/includes_analysis_' . $timestamp . '.xlsx';
+    $exporter = new ExcelExporter();
+    $exporter->createFirstSheet($results);
+    $exporter->createSecondSheet($dependencies);
+    $exporter->save($excelFile);
+
+    echo "解析が完了しました。結果は {$excelFile} に保存されました。\n";
+}
+
+/**
+ * PHPファイルを収集
+ */
+function collectPhpFiles($dir)
+{
+    $files = [];
+    $iterator = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($dir, RecursiveDirectoryIterator::SKIP_DOTS)
+    );
+
+    foreach ($iterator as $file) {
+        if ($file->isFile() && $file->getExtension() === 'php') {
+            $files[] = $file->getPathname();
+        }
+    }
+
+    return $files;
+}
+
+// メインスクリプト
+if (php_sapi_name() === 'cli' && isset($argv[0]) && basename($argv[0]) === 'includesResolverV2.php') {
+    // ヘルプオプションのチェック
+    if ($argc === 2 && ($argv[1] === '--help' || $argv[1] === '-h')) {
+        echo "使用方法: php includesResolverV2.php [対象ディレクトリパス] [オプション]\n";
+        echo "オプション:\n";
+        echo "  -p, --include-project-folder  パスにプロジェクトフォルダ名を含める\n";
+        echo "  -h, --help                    このヘルプを表示\n";
+        echo "\n";
+        echo "注: プロジェクトフォルダ名を含めるオプションを有効にするには、toRelativePath メソッド内の\n";
+        echo "    コメントアウト部分を有効にする必要があります。\n";
+        exit(0);
+    }
+
+    // 引数のチェック
+    if ($argc < 2) {
+        echo "使用方法: php includesResolverV2.php [対象ディレクトリパス] [-p|--include-project-folder]\n";
+        echo "詳細は --help オプションを参照してください。\n";
+        exit(1);
+    }
+
+    $targetDir = $argv[1];
+    if (!is_dir($targetDir)) {
+        echo "エラー: 指定されたパスはディレクトリではありません: {$targetDir}\n";
+        exit(1);
+    }
+
+    // プロジェクトフォルダ名を含めるオプションのチェック
+    $includeProjectFolder = false;
+    for ($i = 2; $i < $argc; $i++) {
+        if ($argv[$i] === '-p' || $argv[$i] === '--include-project-folder') {
+            $includeProjectFolder = true;
+            break;
+        }
+    }
+
+    main($targetDir, $includeProjectFolder);
+} 
