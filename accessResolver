@@ -1,0 +1,934 @@
+#!/usr/bin/env php
+<?php
+/**
+ * Access Resolver CLI Tool
+ * 
+ * フォルダ内のPHP/INC/HTML/JSファイルを再帰的に解析し、
+ * 外部アクセスの一覧をエクセル形式で出力するツール
+ */
+
+// エラー表示設定
+error_reporting(E_ALL);
+ini_set('display_errors', 1);
+
+// メモリ制限を設定（必要に応じて調整）
+ini_set('memory_limit', '512M');
+
+// PhpSpreadsheetライブラリのオートロード
+if (file_exists(__DIR__ . '/vendor/autoload.php')) {
+    require __DIR__ . '/vendor/autoload.php';
+}
+
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+use PhpOffice\PhpSpreadsheet\Style\Fill;
+
+// メイン処理
+// コマンドライン実行時のみエントリーポイントとして動作
+if (isset($argv[0]) && basename($argv[0]) === 'accessResolver.php') {
+    // コマンドライン引数の処理
+    if ($argc < 2) {
+        echo "使用方法: php accessResolver.php <解析対象フォルダ> [出力ファイル名]\n";
+        exit(1);
+    }
+
+    $targetDir = $argv[1];
+    $outputFile = isset($argv[2]) ? $argv[2] : 'access_report.xlsx';
+
+    // フォルダの存在確認
+    if (!is_dir($targetDir)) {
+        echo "エラー: 指定されたフォルダ '{$targetDir}' が存在しません\n";
+        exit(1);
+    }
+
+    // 必要なライブラリのチェック
+    if (!class_exists('ZipArchive')) {
+        echo "エラー: ZipArchiveクラスが利用できません。PHP-zipモジュールをインストールしてください\n";
+        exit(1);
+    }
+
+    /**
+     * ファイルを再帰的に探索する
+     *
+     * @param string $dir 探索対象ディレクトリ
+     * @param array $extensions 対象ファイル拡張子
+     * @return array ファイルパスの配列
+     */
+    function findFiles($dir, $extensions) {
+        $files = [];
+        $iterator = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($dir, RecursiveDirectoryIterator::SKIP_DOTS)
+        );
+
+        foreach ($iterator as $file) {
+            if ($file->isFile()) {
+                $extension = strtolower(pathinfo($file->getPathname(), PATHINFO_EXTENSION));
+                if (in_array($extension, $extensions)) {
+                    $files[] = $file->getPathname();
+                }
+            }
+        }
+
+        return $files;
+    }
+
+    /**
+     * ファイル内容をクリーンアップする
+     *
+     * @param string $content ファイル内容
+     * @return string クリーンアップ後の内容
+     */
+    function cleanupFileContent($content) {
+        // PHPの開始タグが省略されている場合に補完
+        if (strpos($content, '<?php') === false && strpos($content, '<?') === false) {
+            $content = '<?php ' . $content;
+        }
+        
+        // コメントを除去
+        $content = preg_replace('/\/\/.*$/m', '', $content); // 一行コメント
+        $content = preg_replace('/\/\*.*?\*\//s', '', $content); // 複数行コメント
+        $content = preg_replace('/#.*$/m', '', $content); // Shellスタイルのコメント
+        
+        // PHPの文字列結合を解決する (単純な定数的なものだけ)
+        $content = resolvePhpStringConcatenation($content);
+        
+        // JavaScriptの文字列結合を解決する
+        $content = resolveJsStringConcatenation($content);
+        
+        // PHP変数埋め込みを解決する
+        $content = resolvePhpVariableEmbedding($content);
+        
+        return $content;
+    }
+
+    /**
+     * PHPの文字列結合を解決する
+     *
+     * @param string $content ファイル内容
+     * @return string 結合解決後の内容
+     */
+    function resolvePhpStringConcatenation($content) {
+        // 変数定義を抽出
+        $variables = [];
+        preg_match_all('/\$([a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*)\s*=\s*[\'"]([^\'"]*)[\'"];/i', $content, $matches, PREG_SET_ORDER);
+        
+        foreach ($matches as $match) {
+            $varName = $match[1];
+            $varValue = $match[2];
+            $variables[$varName] = $varValue;
+        }
+        
+        // 定数の定義を抽出
+        $constants = [];
+        preg_match_all('/define\s*\(\s*[\'"]([^\'"]+)[\'"]\s*,\s*[\'"]([^\'"]+)[\'"]\s*\)/i', $content, $matches, PREG_SET_ORDER);
+        
+        foreach ($matches as $match) {
+            $constName = $match[1];
+            $constValue = $match[2];
+            $constants[$constName] = $constValue;
+        }
+        
+        // 文字列結合パターンを検出
+        $pattern = '/([\'"])(.*?)\1(?:\s*\.\s*(?:([\'"])(.*?)\3|\$([a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*)(?:\s*\.\s*|\b)|([A-Z_][A-Z0-9_]*)(?:\s*\.\s*|\b)))+/';
+        
+        return preg_replace_callback($pattern, function($matches) use ($variables, $constants) {
+            // マッチした全体の文字列を取得
+            $fullMatch = $matches[0];
+            
+            // 結合部分を解析
+            $parts = [];
+            preg_match_all('/([\'"])(.*?)\1|\$([a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*)\b|([A-Z_][A-Z0-9_]*)\b/i', $fullMatch, $subMatches, PREG_SET_ORDER);
+            
+            $resultString = '';
+            
+            foreach ($subMatches as $subMatch) {
+                if (!empty($subMatch[2])) {
+                    // 文字列リテラル
+                    $resultString .= $subMatch[2];
+                } else if (!empty($subMatch[3])) {
+                    // 変数
+                    $varName = $subMatch[3];
+                    if (isset($variables[$varName])) {
+                        $resultString .= $variables[$varName];
+                    } else {
+                        // 解決できない変数はそのまま残す
+                        $resultString .= '$' . $varName;
+                    }
+                } else if (!empty($subMatch[4])) {
+                    // 定数
+                    $constName = $subMatch[4];
+                    if (isset($constants[$constName])) {
+                        $resultString .= $constants[$constName];
+                    } else {
+                        // 解決できない定数はそのまま残す
+                        $resultString .= $constName;
+                    }
+                }
+            }
+            
+            return "'" . $resultString . "'";
+        }, $content);
+    }
+
+    /**
+     * JavaScriptの文字列結合を解決する
+     *
+     * @param string $content ファイル内容
+     * @return string 結合解決後の内容
+     */
+    function resolveJsStringConcatenation($content) {
+        // JavaScriptの変数定義を抽出
+        $jsVariables = [];
+        preg_match_all('/(?:var|let|const)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*[\'"]([^\'"]*)[\'"];/i', $content, $matches, PREG_SET_ORDER);
+        
+        foreach ($matches as $match) {
+            $varName = $match[1];
+            $varValue = $match[2];
+            $jsVariables[$varName] = $varValue;
+        }
+        
+        // 文字列結合パターンを検出
+        $pattern = '/([\'"])(.*?)\1(?:\s*\+\s*(?:([\'"])(.*?)\3|([a-zA-Z_$][a-zA-Z0-9_$]*)(?:\s*\+\s*|\b)))+/';
+        
+        return preg_replace_callback($pattern, function($matches) use ($jsVariables) {
+            // マッチした全体の文字列を取得
+            $fullMatch = $matches[0];
+            
+            // 結合部分を解析
+            $parts = [];
+            preg_match_all('/([\'"])(.*?)\1|([a-zA-Z_$][a-zA-Z0-9_$]*)\b/i', $fullMatch, $subMatches, PREG_SET_ORDER);
+            
+            $resultString = '';
+            
+            foreach ($subMatches as $subMatch) {
+                if (!empty($subMatch[2])) {
+                    // 文字列リテラル
+                    $resultString .= $subMatch[2];
+                } else if (!empty($subMatch[3])) {
+                    // 変数
+                    $varName = $subMatch[3];
+                    if (isset($jsVariables[$varName])) {
+                        $resultString .= $jsVariables[$varName];
+                    } else {
+                        // 解決できない変数はそのまま残す
+                        $resultString .= $varName;
+                    }
+                }
+            }
+            
+            return "'" . $resultString . "'";
+        }, $content);
+    }
+
+    /**
+     * PHP変数埋め込みを解決する
+     * 例: <?php $var = 'foo.php'; ?> <a href="<?= $var ?>"> を <a href="foo.php"> に変換
+     *
+     * @param string $content ファイル内容
+     * @return string 変数解決後の内容
+     */
+    function resolvePhpVariableEmbedding($content) {
+        // 変数定義を抽出
+        $variables = [];
+        preg_match_all('/\$([a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*)\s*=\s*[\'"]([^\'"]*)[\'"];/i', $content, $matches, PREG_SET_ORDER);
+        
+        foreach ($matches as $match) {
+            $varName = $match[1];
+            $varValue = $match[2];
+            $variables[$varName] = $varValue;
+        }
+        
+        // 定数の定義を抽出
+        $constants = [];
+        preg_match_all('/define\s*\(\s*[\'"]([^\'"]+)[\'"]\s*,\s*[\'"]([^\'"]+)[\'"]\s*\)/i', $content, $matches, PREG_SET_ORDER);
+        
+        foreach ($matches as $match) {
+            $constName = $match[1];
+            $constValue = $match[2];
+            $constants[$constName] = $constValue;
+        }
+        
+        // 変数埋め込みを解決
+        $content = preg_replace_callback('/<\?=\s*\$([a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*)\s*\?>/i', function($matches) use ($variables) {
+            $varName = $matches[1];
+            if (isset($variables[$varName])) {
+                return $variables[$varName];
+            }
+            return $matches[0]; // 解決できない場合は元のまま
+        }, $content);
+        
+        // 変数埋め込みを解決
+        $content = preg_replace_callback('/<\?php\s+echo\s+\$([a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*);\s*\?>/i', function($matches) use ($variables) {
+            $varName = $matches[1];
+            if (isset($variables[$varName])) {
+                return $variables[$varName];
+            }
+            return $matches[0]; // 解決できない場合は元のまま
+        }, $content);
+        
+        // 変数埋め込みを解決（定数パターン）
+        $content = preg_replace_callback('/<\?php\s+echo\s+([A-Z_][A-Z0-9_]*);\s*\?>/i', function($matches) use ($constants) {
+            $constName = $matches[1];
+            if (isset($constants[$constName])) {
+                return $constants[$constName];
+            }
+            return $matches[0]; // 解決できない場合は元のまま
+        }, $content);
+        
+        return $content;
+    }
+
+    /**
+     * ファイル内の外部アクセスを解析する
+     *
+     * @param string $filePath ファイルパス
+     * @param string $baseDir ベースディレクトリ
+     * @return array 解析結果
+     */
+    function analyzeExternalAccess($filePath, $baseDir) {
+        $content = file_get_contents($filePath);
+        $extension = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
+        $relativePath = str_replace($baseDir . '/', '', $filePath);
+        
+        // ファイル内容をクリーンアップ
+        $cleanContent = cleanupFileContent($content);
+        
+        $accessPoints = [];
+        
+        // 1. フォームアクション
+        preg_match_all('/<form[^>]*action=["\']([^"\']+)["\'][^>]*>/i', $cleanContent, $matches);
+        foreach ($matches[1] as $url) {
+            $accessPoints[] = [
+                'file' => $relativePath,
+                'tag' => 'action',
+                'url' => $url
+            ];
+        }
+        
+        // 2. アンカータグ
+        preg_match_all('/<a[^>]*href=["\']([^"\']+)["\'][^>]*>/i', $cleanContent, $matches);
+        foreach ($matches[1] as $url) {
+            $accessPoints[] = [
+                'file' => $relativePath,
+                'tag' => 'href',
+                'url' => $url
+            ];
+        }
+        
+        // 3. iframeのsrc
+        preg_match_all('/<iframe[^>]*src=["\']([^"\']+)["\'][^>]*>/i', $cleanContent, $matches);
+        foreach ($matches[1] as $url) {
+            $accessPoints[] = [
+                'file' => $relativePath,
+                'tag' => 'iframe',
+                'url' => $url
+            ];
+        }
+        
+        // 4. document.*.action
+        preg_match_all('/document\.[a-zA-Z0-9_]+\.action\s*=\s*["\']([^"\']+)["\']/i', $cleanContent, $matches);
+        foreach ($matches[1] as $url) {
+            $accessPoints[] = [
+                'file' => $relativePath,
+                'tag' => 'action',
+                'url' => $url
+            ];
+        }
+        
+        // 5. XMLHttpRequest
+        preg_match_all('/\.open\s*\(\s*["\'][^"\']+["\']\s*,\s*["\']([^"\']+)["\']/i', $cleanContent, $matches);
+        foreach ($matches[1] as $url) {
+            $accessPoints[] = [
+                'file' => $relativePath,
+                'tag' => 'XMLHttpRequest',
+                'url' => $url
+            ];
+        }
+        
+        // 6. window.open
+        preg_match_all('/window\.open\s*\(\s*["\']([^"\']+)["\']/i', $cleanContent, $matches);
+        foreach ($matches[1] as $url) {
+            $accessPoints[] = [
+                'file' => $relativePath,
+                'tag' => 'window.open',
+                'url' => $url
+            ];
+        }
+        
+        // 7. window.location
+        preg_match_all('/window\.location(?:\.href)?\s*=\s*["\']([^"\']+)["\']/i', $cleanContent, $matches);
+        foreach ($matches[1] as $url) {
+            $accessPoints[] = [
+                'file' => $relativePath,
+                'tag' => 'window.location',
+                'url' => $url
+            ];
+        }
+        
+        // 8. HTTPヘッダーLocation
+        preg_match_all('/header\s*\(\s*["\']Location:\s*([^"\']+)["\']/i', $cleanContent, $matches);
+        foreach ($matches[1] as $url) {
+            $accessPoints[] = [
+                'file' => $relativePath,
+                'tag' => 'header',
+                'url' => $url
+            ];
+        }
+        
+        // 9. linkタグのsrc
+        preg_match_all('/<link[^>]*href=["\']([^"\']+)["\'][^>]*>/i', $cleanContent, $matches);
+        foreach ($matches[1] as $url) {
+            $accessPoints[] = [
+                'file' => $relativePath,
+                'tag' => 'link',
+                'url' => $url
+            ];
+        }
+        
+        // 10. scriptタグのsrc
+        preg_match_all('/<script[^>]*src=["\']([^"\']+)["\'][^>]*>/i', $cleanContent, $matches);
+        foreach ($matches[1] as $url) {
+            $accessPoints[] = [
+                'file' => $relativePath,
+                'tag' => 'script',
+                'url' => $url
+            ];
+        }
+        
+        // 11. escape関数を使っている場合は引数の値を取得
+        preg_match_all('/(?:htmlspecialchars|htmlentities|urlencode|rawurlencode|addslashes|escapeshellarg|escapeshellcmd)\s*\(\s*[\'"]([^\'"]+)[\'"]\s*\)/i', $cleanContent, $matches);
+        foreach ($matches[1] as $url) {
+            // URLの場合のみ処理（簡易チェック）
+            if (preg_match('/\.[a-z]{2,4}$|\//i', $url)) {
+                $accessPoints[] = [
+                    'file' => $relativePath,
+                    'tag' => 'escaped',
+                    'url' => $url
+                ];
+            }
+        }
+        
+        // 12. PHPのinclude/require系
+        $includePatterns = [
+            '/include\s*\(\s*[\'"]([^\'"]+)[\'"]\s*\)/i',
+            '/include_once\s*\(\s*[\'"]([^\'"]+)[\'"]\s*\)/i',
+            '/require\s*\(\s*[\'"]([^\'"]+)[\'"]\s*\)/i',
+            '/require_once\s*\(\s*[\'"]([^\'"]+)[\'"]\s*\)/i',
+            '/include\s+[\'"]([^\'"]+)[\'"]/i',
+            '/include_once\s+[\'"]([^\'"]+)[\'"]/i',
+            '/require\s+[\'"]([^\'"]+)[\'"]/i',
+            '/require_once\s+[\'"]([^\'"]+)[\'"]/i'
+        ];
+        
+        foreach ($includePatterns as $pattern) {
+            preg_match_all($pattern, $cleanContent, $matches);
+            foreach ($matches[1] as $url) {
+                $accessPoints[] = [
+                    'file' => $relativePath,
+                    'tag' => 'include',
+                    'url' => $url
+                ];
+            }
+        }
+        
+        // 13. PHPのfile_get_contents系
+        $fileAccessPatterns = [
+            '/file_get_contents\s*\(\s*[\'"]([^\'"]+)[\'"]\s*\)/i',
+            '/file_put_contents\s*\(\s*[\'"]([^\'"]+)[\'"]/i',
+            '/fopen\s*\(\s*[\'"]([^\'"]+)[\'"]/i',
+            '/readfile\s*\(\s*[\'"]([^\'"]+)[\'"]\s*\)/i',
+            '/file\s*\(\s*[\'"]([^\'"]+)[\'"]\s*\)/i'
+        ];
+        
+        foreach ($fileAccessPatterns as $pattern) {
+            preg_match_all($pattern, $cleanContent, $matches);
+            foreach ($matches[1] as $url) {
+                $accessPoints[] = [
+                    'file' => $relativePath,
+                    'tag' => 'file-access',
+                    'url' => $url
+                ];
+            }
+        }
+        
+        return $accessPoints;
+    }
+
+    /**
+     * URLから実際のファイルパスを解決する
+     *
+     * @param string $url URL
+     * @param string $baseDir ベースディレクトリ
+     * @return string 解決されたファイルパス（解決できない場合はCHECK!）
+     */
+    function resolveTargetFile($url, $baseDir) {
+        // 外部URLの場合は何も返さない
+        if (preg_match('/^(https?:\/\/|\/\/)/i', $url)) {
+            return '';
+        }
+        
+        // クエリパラメータや#以降を除去して保存
+        $queryString = '';
+        if (strpos($url, '?') !== false) {
+            list($cleanUrl, $queryString) = explode('?', $url, 2);
+            $queryString = '?' . $queryString;
+        } else {
+            $cleanUrl = $url;
+        }
+        
+        // フラグメントを処理
+        $fragment = '';
+        if (strpos($cleanUrl, '#') !== false) {
+            list($cleanUrl, $fragment) = explode('#', $cleanUrl, 2);
+            $fragment = '#' . $fragment;
+        }
+        
+        // 解析対象のディレクトリ
+        $rootDir = getcwd();
+        $targetDir = realpath($rootDir);
+        
+        // 候補となるパスのリスト
+        $candidatePaths = [];
+        
+        // 1. そのままのパスで解決を試みる
+        $fullPath = $baseDir . '/' . $cleanUrl;
+        $resolvedPath = realpath($fullPath);
+        if ($resolvedPath && file_exists($resolvedPath) && is_file($resolvedPath)) {
+            $candidatePaths[] = $resolvedPath;
+        }
+        
+        // 2. 拡張子の追加や変更を試みる
+        $extensions = ['', '.php', '.inc', '.html', '.htm', '.js', '.css'];
+        $urlWithoutExt = preg_replace('/\.[^.\/]+$/', '', $cleanUrl);
+        
+        foreach ($extensions as $ext) {
+            if (empty($ext) && $urlWithoutExt === $cleanUrl) {
+                continue; // 拡張子がない場合はスキップ
+            }
+            
+            $pathWithExt = $baseDir . '/' . $urlWithoutExt . $ext;
+            $resolvedPathWithExt = realpath($pathWithExt);
+            
+            if ($resolvedPathWithExt && file_exists($resolvedPathWithExt) && is_file($resolvedPathWithExt) && 
+                !in_array($resolvedPathWithExt, $candidatePaths)) {
+                $candidatePaths[] = $resolvedPathWithExt;
+            }
+        }
+        
+        // 3. インデックスファイルの検索 (URLがディレクトリを指している場合)
+        $indexes = ['index.php', 'index.html', 'index.htm', 'default.php', 'default.html', 'main.php'];
+        $dirPath = $baseDir . '/' . $cleanUrl;
+        
+        if (is_dir($dirPath)) {
+            foreach ($indexes as $index) {
+                $indexPath = $dirPath . '/' . $index;
+                $resolvedIndexPath = realpath($indexPath);
+                
+                if ($resolvedIndexPath && file_exists($resolvedIndexPath) && is_file($resolvedIndexPath) && 
+                    !in_array($resolvedIndexPath, $candidatePaths)) {
+                    $candidatePaths[] = $resolvedIndexPath;
+                }
+            }
+        }
+        
+        // 4. ファイル名だけで検索（プロジェクト全体で）
+        $fileName = basename($cleanUrl);
+        if (!empty($fileName)) {
+            $foundFiles = findAllFilesByName($fileName, $targetDir);
+            if (!empty($foundFiles)) {
+                foreach ($foundFiles as $foundFile) {
+                    if (!in_array($foundFile, $candidatePaths)) {
+                        $candidatePaths[] = $foundFile;
+                    }
+                }
+            }
+        }
+        
+        // 5. ファイル名から推測されるパターンを検索
+        if (!empty($fileName)) {
+            // 拡張子なしのファイル名
+            $fileNameWithoutExt = pathinfo($fileName, PATHINFO_FILENAME);
+            if (!empty($fileNameWithoutExt)) {
+                // 共通のディレクトリパターン
+                $commonDirs = [
+                    '/includes/', 
+                    '/inc/', 
+                    '/pages/', 
+                    '/public/', 
+                    '/views/', 
+                    '/templates/', 
+                    '/assets/',
+                    '/js/',
+                    '/css/',
+                    '/images/',
+                    '/lib/'
+                ];
+                
+                foreach ($commonDirs as $dir) {
+                    foreach ($extensions as $ext) {
+                        // パターンを構築
+                        $pattern = '*' . $dir . '*' . $fileNameWithoutExt . $ext;
+                        $foundByPattern = glob($targetDir . $pattern);
+                        
+                        if (!empty($foundByPattern)) {
+                            foreach ($foundByPattern as $file) {
+                                if (file_exists($file) && is_file($file) && !in_array($file, $candidatePaths)) {
+                                    $candidatePaths[] = $file;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 6. 相対パスの解決をさらに試みる
+        if (strpos($cleanUrl, '../') === 0 || strpos($cleanUrl, './') === 0) {
+            // 親ディレクトリの参照を含むパスの場合
+            $currentDir = dirname($baseDir);
+            $relPath = str_replace(['../', './'], '', $cleanUrl);
+            
+            $iterations = 0;
+            $maxIterations = 10; // 無限ループ防止
+            
+            while (strpos($cleanUrl, '../') === 0 && $iterations < $maxIterations) {
+                $cleanUrl = substr($cleanUrl, 3);  // '../'を削除
+                $currentDir = dirname($currentDir); // 親ディレクトリへ移動
+                $iterations++;
+            }
+            
+            $potentialPath = $currentDir . '/' . $relPath;
+            
+            if (file_exists($potentialPath) && is_file($potentialPath) && !in_array($potentialPath, $candidatePaths)) {
+                $candidatePaths[] = $potentialPath;
+            }
+        }
+        
+        // 7. パスをベースディレクトリからの相対パスに変換
+        $relativePaths = [];
+        $uniquePaths = array_unique($candidatePaths); // 重複を排除
+        
+        foreach ($uniquePaths as $path) {
+            // 解析対象ディレクトリからの相対パスに変換
+            $relativePath = enhancedRelativePath($path, $targetDir);
+            if ($relativePath) {
+                // 順序付けを行い、解析対象フォルダに近いパスを優先
+                $priority = calculatePathPriority($path, $baseDir, $targetDir);
+                $relativePaths[$relativePath] = [
+                    'path' => $relativePath . $queryString . $fragment,
+                    'priority' => $priority
+                ];
+            }
+        }
+        
+        // 結果のパスをプライオリティでソート
+        if (!empty($relativePaths)) {
+            uasort($relativePaths, function($a, $b) {
+                return $a['priority'] <=> $b['priority'];
+            });
+            
+            // 最大5つまでの候補を返す（プライオリティ順）
+            $result = array_map(function($item) {
+                return $item['path'];
+            }, array_slice($relativePaths, 0, 5, true));
+            
+            return implode(', ', $result);
+        }
+        
+        // 候補がない場合、クエリパラメータとフラグメントを元に戻して返す
+        return 'CHECK!';
+    }
+
+    /**
+     * 拡張された相対パス変換機能
+     * 
+     * @param string $path 変換するパス
+     * @param string $baseDir ベースディレクトリ
+     * @return string|false 相対パス、変換できない場合はfalse
+     */
+    function enhancedRelativePath($path, $baseDir) {
+        // baseDirのrealpathを取得
+        $baseDir = realpath($baseDir);
+        if ($baseDir === false) {
+            return false;
+        }
+        
+        // pathのrealpathを取得
+        $realPath = realpath($path);
+        if ($realPath === false) {
+            return false;
+        }
+        
+        // ベースディレクトリの配下にあるか確認
+        if (strpos($realPath, $baseDir) === 0) {
+            // ベースディレクトリからの相対パスを返す
+            return str_replace('\\', '/', substr($realPath, strlen($baseDir) + 1));
+        }
+        
+        // ベースディレクトリ配下にない場合は、相対パスを計算
+        $baseComponents = explode(DIRECTORY_SEPARATOR, $baseDir);
+        $pathComponents = explode(DIRECTORY_SEPARATOR, $realPath);
+        
+        // 共通のパス部分を見つける
+        $i = 0;
+        while ($i < count($baseComponents) && $i < count($pathComponents) && 
+               strcasecmp($baseComponents[$i], $pathComponents[$i]) === 0) { // 大文字小文字を区別しない比較
+            $i++;
+        }
+        
+        // 上位ディレクトリへの移動を計算
+        $upCount = count($baseComponents) - $i;
+        $relativePath = str_repeat('../', $upCount);
+        
+        // ターゲットパスの残りの部分を追加
+        for ($j = $i; $j < count($pathComponents); $j++) {
+            $relativePath .= $pathComponents[$j] . ($j < count($pathComponents) - 1 ? '/' : '');
+        }
+        
+        return $relativePath;
+    }
+
+    /**
+     * パスの優先度を計算する
+     * 
+     * @param string $path ファイルパス
+     * @param string $sourceDir ソースディレクトリ
+     * @param string $rootDir ルートディレクトリ
+     * @return int 優先度（低いほど優先）
+     */
+    function calculatePathPriority($path, $sourceDir, $rootDir) {
+        $priority = 100; // 基本優先度
+        
+        // ソースディレクトリに近いほど優先度が高い
+        $pathDepth = substr_count($path, DIRECTORY_SEPARATOR);
+        $sourceDepth = substr_count($sourceDir, DIRECTORY_SEPARATOR);
+        $priority -= abs($pathDepth - $sourceDepth) * 5;
+        
+        // 共通のディレクトリ部分が多いほど優先度が高い
+        $pathDirs = explode(DIRECTORY_SEPARATOR, dirname($path));
+        $sourceDirs = explode(DIRECTORY_SEPARATOR, $sourceDir);
+        
+        $commonDirs = 0;
+        for ($i = 0; $i < min(count($pathDirs), count($sourceDirs)); $i++) {
+            if (strcasecmp($pathDirs[$i], $sourceDirs[$i]) === 0) {
+                $commonDirs++;
+            } else {
+                break;
+            }
+        }
+        
+        $priority += $commonDirs * 10;
+        
+        // ソースディレクトリからの相対的な距離
+        if (strpos($path, $sourceDir) === 0) {
+            // ソースディレクトリの子孫
+            $priority += 30;
+        } else if (strpos($sourceDir, dirname($path)) === 0) {
+            // ソースディレクトリの先祖
+            $priority += 20;
+        }
+        
+        // ルートディレクトリからの相対的な距離
+        if (strpos($path, $rootDir) === 0) {
+            // ルートディレクトリの子孫
+            $priority += 15;
+        }
+        
+        // ファイル名が一致するか
+        $sourceFile = basename($sourceDir);
+        $pathFile = basename($path);
+        
+        if (strcasecmp($sourceFile, $pathFile) === 0) {
+            $priority += 25;
+        }
+        
+        return $priority;
+    }
+    
+    /**
+     * 指定された名前に一致するすべてのファイルを検索する
+     *
+     * @param string $fileName 検索するファイル名
+     * @param string $baseDir 検索対象ディレクトリ
+     * @return array 見つかったファイルパスの配列
+     */
+    function findAllFilesByName($fileName, $baseDir) {
+        $files = [];
+        
+        if (empty($fileName)) {
+            return $files;
+        }
+        
+        try {
+            $iterator = new RecursiveIteratorIterator(
+                new RecursiveDirectoryIterator($baseDir, RecursiveDirectoryIterator::SKIP_DOTS),
+                RecursiveIteratorIterator::LEAVES_ONLY
+            );
+            
+            foreach ($iterator as $file) {
+                if (strcasecmp($file->getFilename(), $fileName) === 0) { // 大文字小文字を区別しない比較
+                    $files[] = $file->getRealPath();
+                }
+            }
+        } catch (Exception $e) {
+            // 例外が発生した場合は空の配列を返す
+            return [];
+        }
+        
+        return $files;
+    }
+
+    /**
+     * 解析結果をエクセルに出力する
+     *
+     * @param array $accessPoints 解析結果
+     * @param array $allFiles 全ファイルリスト
+     * @param string $outputFile 出力ファイル名
+     */
+    function generateExcelReport($accessPoints, $allFiles, $outputFile) {
+        $spreadsheet = new Spreadsheet();
+        
+        // 1. メインワークシートの作成
+        $mainSheet = $spreadsheet->getActiveSheet();
+        $mainSheet->setTitle('アクセス一覧');
+        
+        // ヘッダー設定
+        $mainSheet->setCellValue('A1', 'ファイル名');
+        $mainSheet->setCellValue('B1', 'タグ');
+        $mainSheet->setCellValue('C1', 'URL');
+        $mainSheet->setCellValue('D1', '解決先ファイル');
+        $mainSheet->setCellValue('E1', '解決ステータス');
+        
+        // ヘッダーのスタイル設定
+        $mainSheet->getStyle('A1:E1')->getFont()->setBold(true);
+        
+        // データ入力
+        $row = 2;
+        foreach ($accessPoints as $point) {
+            $mainSheet->setCellValue('A' . $row, $point['file']);
+            $mainSheet->setCellValue('B' . $row, $point['tag']);
+            $mainSheet->setCellValue('C' . $row, $point['url']);
+            
+            // 解決先の候補
+            $resolvedFile = resolveTargetFile($point['url'], dirname(getcwd() . '/' . $point['file']));
+            $mainSheet->setCellValue('D' . $row, $resolvedFile);
+            
+            // 解決ステータス
+            $status = ($resolvedFile === 'CHECK!') ? '未解決' : 
+                      (empty($resolvedFile) ? '外部URL' : '解決済');
+            $mainSheet->setCellValue('E' . $row, $status);
+            
+            // 解決ステータスに応じたセルの色付け
+            if ($status === '未解決') {
+                $mainSheet->getStyle('E' . $row)->getFill()
+                    ->setFillType(\PhpOffice\PhpSpreadsheet\Style\Fill::FILL_SOLID)
+                    ->getStartColor()->setRGB('FFCCCC'); // 薄い赤
+            } elseif ($status === '解決済') {
+                $mainSheet->getStyle('E' . $row)->getFill()
+                    ->setFillType(\PhpOffice\PhpSpreadsheet\Style\Fill::FILL_SOLID)
+                    ->getStartColor()->setRGB('CCFFCC'); // 薄い緑
+            }
+            
+            $row++;
+        }
+        
+        // オートフィルター設定
+        $mainSheet->setAutoFilter('A1:E' . ($row - 1));
+        
+        // カラム幅の自動調整
+        foreach (range('A', 'E') as $col) {
+            $mainSheet->getColumnDimension($col)->setAutoSize(true);
+        }
+        
+        // 2. アクセス先のないファイルのワークシート作成
+        $noAccessSheet = $spreadsheet->createSheet();
+        $noAccessSheet->setTitle('アクセス先なし');
+        
+        // ヘッダー設定
+        $noAccessSheet->setCellValue('A1', 'ファイル名');
+        $noAccessSheet->getStyle('A1')->getFont()->setBold(true);
+        
+        // アクセス先のないファイルを抽出
+        $filesWithAccess = array_unique(array_column($accessPoints, 'file'));
+        $filesWithoutAccess = array_diff($allFiles, $filesWithAccess);
+        
+        // データ入力
+        $row = 2;
+        foreach ($filesWithoutAccess as $file) {
+            $noAccessSheet->setCellValue('A' . $row, $file);
+            $row++;
+        }
+        
+        // カラム幅の自動調整
+        $noAccessSheet->getColumnDimension('A')->setAutoSize(true);
+        
+        // 3. 未解決URLのワークシート作成
+        $unresolvedSheet = $spreadsheet->createSheet();
+        $unresolvedSheet->setTitle('未解決URL');
+        
+        // ヘッダー設定
+        $unresolvedSheet->setCellValue('A1', 'ファイル名');
+        $unresolvedSheet->setCellValue('B1', 'タグ');
+        $unresolvedSheet->setCellValue('C1', 'URL');
+        $unresolvedSheet->getStyle('A1:C1')->getFont()->setBold(true);
+        
+        // 未解決URLを抽出
+        $row = 2;
+        foreach ($accessPoints as $point) {
+            $resolvedFile = resolveTargetFile($point['url'], dirname(getcwd() . '/' . $point['file']));
+            if ($resolvedFile === 'CHECK!') {
+                $unresolvedSheet->setCellValue('A' . $row, $point['file']);
+                $unresolvedSheet->setCellValue('B' . $row, $point['tag']);
+                $unresolvedSheet->setCellValue('C' . $row, $point['url']);
+                $row++;
+            }
+        }
+        
+        // カラム幅の自動調整
+        foreach (range('A', 'C') as $col) {
+            $unresolvedSheet->getColumnDimension($col)->setAutoSize(true);
+        }
+        
+        // エクセルファイルの保存
+        $writer = new Xlsx($spreadsheet);
+        $writer->save($outputFile);
+    }
+
+    // メイン処理
+    try {
+        echo "解析を開始: {$targetDir}\n";
+        
+        // 対象拡張子
+        $targetExtensions = ['php', 'inc', 'html', 'js'];
+        
+        // 対象ファイルの検索
+        $files = findFiles($targetDir, $targetExtensions);
+        $fileCount = count($files);
+        echo "対象ファイル数: {$fileCount}\n";
+        
+        // 解析処理
+        $allAccessPoints = [];
+        $relativeFiles = []; // 相対パスのファイル一覧
+        
+        foreach ($files as $i => $file) {
+            echo "\r解析中: " . ($i + 1) . "/{$fileCount}";
+            
+            $accessPoints = analyzeExternalAccess($file, $targetDir);
+            $allAccessPoints = array_merge($allAccessPoints, $accessPoints);
+            
+            // 相対パスを保存
+            $relativeFiles[] = str_replace($targetDir . '/', '', $file);
+        }
+        echo "\n";
+        
+        // エクセル出力
+        echo "結果をエクセルに出力中...\n";
+        generateExcelReport($allAccessPoints, $relativeFiles, $outputFile);
+        
+        echo "完了しました！出力ファイル: {$outputFile}\n";
+        
+    } catch (Exception $e) {
+        echo "エラーが発生しました: " . $e->getMessage() . "\n";
+        exit(1);
+    }
+}
