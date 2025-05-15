@@ -48,6 +48,24 @@ class FunctionCallVisitor extends \PhpParser\NodeVisitorAbstract
         $this->currentFile = $file;
     }
 
+    private function getArgumentString($args) {
+        $argStrings = [];
+        foreach ($args as $arg) {
+            if ($arg->value instanceof Node\Scalar\String_) {
+                $argStrings[] = '"' . $arg->value->value . '"';
+            } elseif ($arg->value instanceof Node\Scalar\LNumber) {
+                $argStrings[] = $arg->value->value;
+            } elseif ($arg->value instanceof Node\Expr\Variable) {
+                $argStrings[] = '$' . $arg->value->name;
+            } elseif ($arg->value instanceof Node\Expr\Array_) {
+                $argStrings[] = '[...]';
+            } else {
+                $argStrings[] = '...';
+            }
+        }
+        return implode(', ', $argStrings);
+    }
+
     public function enterNode(Node $node)
     {
         if ($node instanceof Node\Stmt\Function_) {
@@ -60,7 +78,6 @@ class FunctionCallVisitor extends \PhpParser\NodeVisitorAbstract
             if ($node->name instanceof Node\Name) {
                 $functionName = $node->name->toString();
                 if (!in_array($functionName, $this->builtinFunctions)) {
-                    // 関数名から名前空間を取り除く
                     $shortName = $this->getShortName($functionName);
                     $context = $this->currentFunction ?: "";
                     $isRecursive = ($functionName === $this->currentFunction) ? "再帰呼び出し" : "";
@@ -68,7 +85,8 @@ class FunctionCallVisitor extends \PhpParser\NodeVisitorAbstract
                         'file' => $this->currentFile,
                         'function' => $shortName,
                         'context' => $context,
-                        'is_recursive' => $isRecursive
+                        'is_recursive' => $isRecursive,
+                        'arguments' => $this->getArgumentString($node->args)
                     ];
                 }
             }
@@ -83,7 +101,8 @@ class FunctionCallVisitor extends \PhpParser\NodeVisitorAbstract
                     'file' => $this->currentFile,
                     'function' => $methodName,
                     'context' => $context,
-                    'is_recursive' => $isRecursive
+                    'is_recursive' => $isRecursive,
+                    'arguments' => $this->getArgumentString($node->args)
                 ];
             }
         } elseif ($node instanceof Node\Expr\MethodCall) {
@@ -97,7 +116,8 @@ class FunctionCallVisitor extends \PhpParser\NodeVisitorAbstract
                     'file' => $this->currentFile,
                     'function' => $methodName,
                     'context' => $context,
-                    'is_recursive' => $isRecursive
+                    'is_recursive' => $isRecursive,
+                    'arguments' => $this->getArgumentString($node->args)
                 ];
             }
         }
@@ -192,8 +212,9 @@ function createExcel($results, $outputFile)
     $sheet->setCellValue('A1', 'ファイル名');
     $sheet->setCellValue('B1', '呼び出し関数');
     $sheet->setCellValue('C1', '呼び出し元');
-    $sheet->setCellValue('D1', '備考');
-    $sheet->getStyle('A1:D1')->getFont()->setBold(true);
+    $sheet->setCellValue('D1', '引数');
+    $sheet->setCellValue('E1', '備考');
+    $sheet->getStyle('A1:E1')->getFont()->setBold(true);
 
     $row = 2;
     foreach ($results as $file => $calls) {
@@ -201,7 +222,8 @@ function createExcel($results, $outputFile)
             $sheet->setCellValue('A' . $row, $file);
             $sheet->setCellValue('B' . $row, $call['function']);
             $sheet->setCellValue('C' . $row, $call['context']);
-            $sheet->setCellValue('D' . $row, $call['is_recursive']);
+            $sheet->setCellValue('D' . $row, $call['arguments']);
+            $sheet->setCellValue('E' . $row, $call['is_recursive']);
             $row++;
         }
     }
@@ -211,6 +233,7 @@ function createExcel($results, $outputFile)
     $sheet->getColumnDimension('B')->setAutoSize(true);
     $sheet->getColumnDimension('C')->setAutoSize(true);
     $sheet->getColumnDimension('D')->setAutoSize(true);
+    $sheet->getColumnDimension('E')->setAutoSize(true);
 
     // 保存
     $writer = new Xlsx($spreadsheet);
