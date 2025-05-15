@@ -1,0 +1,263 @@
+#!/usr/bin/env php
+<?php
+
+// メモリ制限を引き上げ
+ini_set('memory_limit', '512M');
+
+require_once __DIR__ . '/vendor/autoload.php';
+
+use PhpParser\Node;
+use PhpParser\NodeFinder;
+use PhpParser\ParserFactory;
+use PhpParser\NodeTraverser;
+use PhpParser\NodeVisitor\NameResolver;
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+use PhpOffice\PhpSpreadsheet\Style\Alignment;
+
+// コメント除去用のビジター
+class CommentRemover extends \PhpParser\NodeVisitorAbstract
+{
+    public function leaveNode(Node $node)
+    {
+        // コメントを除去
+        $node->setAttribute('comments', []);
+        return $node;
+    }
+}
+
+class FunctionCallVisitor extends \PhpParser\NodeVisitorAbstract
+{
+    private $currentFile;
+    private $currentFunction;
+    private $functionCalls = [];
+    private $builtinFunctions;
+    private $definedFunctions = [];
+
+    public function __construct()
+    {
+        $this->builtinFunctions = get_defined_functions();
+        $this->builtinFunctions = array_merge(
+            $this->builtinFunctions['internal'],
+            $this->builtinFunctions['user']
+        );
+    }
+
+    public function setCurrentFile($file)
+    {
+        $this->currentFile = $file;
+    }
+
+    public function enterNode(Node $node)
+    {
+        if ($node instanceof Node\Stmt\Function_) {
+            $this->currentFunction = $node->name->toString();
+            $this->definedFunctions[] = $this->currentFunction;
+        } elseif ($node instanceof Node\Stmt\ClassMethod) {
+            $this->currentFunction = $node->name->toString();
+            $this->definedFunctions[] = $this->currentFunction;
+        } elseif ($node instanceof Node\Expr\FuncCall) {
+            if ($node->name instanceof Node\Name) {
+                $functionName = $node->name->toString();
+                if (!in_array($functionName, $this->builtinFunctions)) {
+                    // 関数名から名前空間を取り除く
+                    $shortName = $this->getShortName($functionName);
+                    $context = $this->currentFunction ?: "";
+                    $isRecursive = ($functionName === $this->currentFunction) ? "再帰呼び出し" : "";
+                    $this->functionCalls[] = [
+                        'file' => $this->currentFile,
+                        'function' => $shortName,
+                        'context' => $context,
+                        'is_recursive' => $isRecursive
+                    ];
+                }
+            }
+        } elseif ($node instanceof Node\Expr\StaticCall) {
+            if ($node->class instanceof Node\Name && $node->name instanceof Node\Identifier) {
+                $methodName = $node->name->toString();
+                
+                $context = $this->currentFunction ?: "";
+                $isRecursive = ($methodName === $this->currentFunction) ? "再帰呼び出し" : "";
+                
+                $this->functionCalls[] = [
+                    'file' => $this->currentFile,
+                    'function' => $methodName,
+                    'context' => $context,
+                    'is_recursive' => $isRecursive
+                ];
+            }
+        } elseif ($node instanceof Node\Expr\MethodCall) {
+            if ($node->name instanceof Node\Identifier) {
+                $methodName = $node->name->toString();
+                
+                $context = $this->currentFunction ?: "";
+                $isRecursive = ($methodName === $this->currentFunction) ? "再帰呼び出し" : "";
+                
+                $this->functionCalls[] = [
+                    'file' => $this->currentFile,
+                    'function' => $methodName,
+                    'context' => $context,
+                    'is_recursive' => $isRecursive
+                ];
+            }
+        }
+    }
+
+    /**
+     * 完全修飾名から短い名前を取得
+     * 
+     * @param string $name
+     * @return string
+     */
+    private function getShortName($name) {
+        if (strpos($name, '\\') !== false) {
+            $parts = explode('\\', $name);
+            return end($parts);
+        }
+        return $name;
+    }
+
+    public function leaveNode(Node $node)
+    {
+        if ($node instanceof Node\Stmt\Function_ || $node instanceof Node\Stmt\ClassMethod) {
+            $this->currentFunction = null;
+        }
+    }
+
+    public function getFunctionCalls()
+    {
+        return $this->functionCalls;
+    }
+}
+
+function processFile($file, $parser, $visitor)
+{
+    $code = file_get_contents($file);
+    
+    // 短縮タグを通常のPHPタグに変換
+    $code = preg_replace('/<\?(?!php|=)/', '<?php ', $code);
+    
+    try {
+        $ast = $parser->parse($code);
+        if ($ast === null) {
+            return [];
+        }
+
+        $visitor->setCurrentFile($file);
+        $traverser = new NodeTraverser();
+        $traverser->addVisitor(new NameResolver());
+        $traverser->addVisitor(new CommentRemover()); // コメント除去を追加
+        $traverser->addVisitor($visitor);
+        $traverser->traverse($ast);
+
+        return $visitor->getFunctionCalls();
+    } catch (\PhpParser\Error $e) {
+        echo "Error parsing file {$file}: {$e->getMessage()}\n";
+        return [];
+    }
+}
+
+function scanDirectory($directory)
+{
+    $parser = (new ParserFactory)->createForNewestSupportedVersion();
+    $visitor = new FunctionCallVisitor();
+    $results = [];
+
+    $iterator = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($directory)
+    );
+
+    foreach ($iterator as $file) {
+        if ($file->isFile()) {
+            $extension = strtolower($file->getExtension());
+            if (in_array($extension, ['php', 'inc', 'html', 'js'])) {
+                $relativePath = str_replace($directory . '/', '', $file->getPathname());
+                $functionCalls = processFile($file->getPathname(), $parser, $visitor);
+                if (!empty($functionCalls)) {
+                    $results[$relativePath] = $functionCalls;
+                }
+            }
+        }
+    }
+
+    return $results;
+}
+
+function createExcel($results, $outputFile)
+{
+    $spreadsheet = new Spreadsheet();
+    $sheet = $spreadsheet->getActiveSheet();
+
+    // ヘッダー設定
+    $sheet->setCellValue('A1', 'ファイル名');
+    $sheet->setCellValue('B1', '呼び出し関数');
+    $sheet->setCellValue('C1', '呼び出し元');
+    $sheet->setCellValue('D1', '備考');
+    $sheet->getStyle('A1:D1')->getFont()->setBold(true);
+
+    $row = 2;
+    foreach ($results as $file => $calls) {
+        foreach ($calls as $call) {
+            $sheet->setCellValue('A' . $row, $file);
+            $sheet->setCellValue('B' . $row, $call['function']);
+            $sheet->setCellValue('C' . $row, $call['context']);
+            $sheet->setCellValue('D' . $row, $call['is_recursive']);
+            $row++;
+        }
+    }
+
+    // 列幅の自動調整
+    $sheet->getColumnDimension('A')->setAutoSize(true);
+    $sheet->getColumnDimension('B')->setAutoSize(true);
+    $sheet->getColumnDimension('C')->setAutoSize(true);
+    $sheet->getColumnDimension('D')->setAutoSize(true);
+
+    // 保存
+    $writer = new Xlsx($spreadsheet);
+    $writer->save($outputFile);
+}
+
+// メイン処理
+if ($argc < 2) {
+    echo "使用方法: php funcCallFinder.php <ディレクトリまたはファイルパス> [出力ファイル名]\n";
+    exit(1);
+}
+
+// 最後の引数が.xlsxで終わっていれば、それを出力ファイル名とする
+$lastArg = $argv[$argc - 1];
+if (preg_match('/\.xlsx$/', $lastArg)) {
+    $outputFile = $lastArg;
+    $pathArgs = array_slice($argv, 1, $argc - 2);
+} else {
+    $outputFile = 'function_calls_' . date('Ymd_His') . '.xlsx';
+    $pathArgs = array_slice($argv, 1);
+}
+
+$results = [];
+foreach ($pathArgs as $path) {
+    if (is_dir($path)) {
+        // ディレクトリの場合は再帰的にスキャン
+        $dirResults = scanDirectory($path);
+        $results = array_merge($results, $dirResults);
+    } elseif (is_file($path)) {
+        // 単一ファイルの場合
+        $parser = (new ParserFactory)->createForNewestSupportedVersion();
+        $visitor = new FunctionCallVisitor();
+        $functionCalls = processFile($path, $parser, $visitor);
+        if (!empty($functionCalls)) {
+            $relativePath = basename($path);
+            $results[$relativePath] = $functionCalls;
+        }
+    } else {
+        echo "警告: 指定されたパスが存在しません: {$path}\n";
+    }
+}
+
+if (empty($results)) {
+    echo "エラー: 解析結果が得られませんでした。\n";
+    exit(1);
+}
+
+createExcel($results, $outputFile);
+
+echo "解析が完了しました。結果は {$outputFile} に保存されました。\n";
