@@ -1,11 +1,11 @@
 <?php
 /**
- * PHPファイルのインクルード解析ツール V2
+ * PHPファイルのインクルード解析ツール 
  * 
  * 指定されたディレクトリ内のPHPファイルを再帰的に走査し、
  * includeやrequire文を検出してエクセル出力するツール
  * 
- * 使用方法: php includesResolverV2.php [対象ディレクトリパス]
+ * 使用方法: php includesResolver.php [対象ディレクトリパス]
  */
 
 // Composerのオートロードを使用
@@ -86,7 +86,10 @@ class IncludeCollectorVisitor extends NodeVisitorAbstract
         if ($expr instanceof Concat) {
             $left = $this->resolveIncludePath($expr->left);
             $right = $this->resolveIncludePath($expr->right);
-            return $left . $right;
+            if ($left !== 'CHECK!' && $right !== 'CHECK!') {
+                return $left . $right;
+            }
+            return 'CHECK!';
         }
         
         // 変数の場合
@@ -95,7 +98,8 @@ class IncludeCollectorVisitor extends NodeVisitorAbstract
             if (isset($this->variableValues[$varName])) {
                 return $this->variableValues[$varName];
             }
-            return 'CHECK!';
+            // 変数の値が未定義の場合は、変数名を保持して後で解決を試みる
+            return '$' . $varName;
         }
         
         // 定数の場合
@@ -128,7 +132,7 @@ class IncludeCollectorVisitor extends NodeVisitorAbstract
             // dirname関数の処理
             if ($funcName === 'dirname' && count($expr->args) >= 1) {
                 $arg = $this->resolveIncludePath($expr->args[0]->value);
-                if ($arg !== null) {
+                if ($arg !== 'CHECK!') {
                     return dirname($arg);
                 }
             }
@@ -323,11 +327,11 @@ class IncludeAnalyzer
      * @param string $filePath インクルード文を含むファイルのパス
      * @return string 解決されたパス
      */
-    private function resolveDynamicPath($includePath, $filePath)
+    protected function resolveDynamicPath($includePath, $filePath)
     {
         // すでにCHECK!が含まれる場合はそのまま返す
-        if (strpos($includePath, 'CHECK!') !== false) {
-            return $includePath;
+        if ($includePath === 'CHECK!') {
+            return 'CHECK!';
         }
 
         $fileDir = dirname($filePath);
@@ -338,10 +342,75 @@ class IncludeAnalyzer
         $includePath = str_replace('__FILE__', $filePath, $includePath);
         // dirname(__FILE__) の置換
         $includePath = preg_replace('/dirname\s*\(\s*__FILE__\s*\)/', $fileDir, $includePath);
+        // dirname(__DIR__) の置換
+        $includePath = preg_replace('/dirname\s*\(\s*__DIR__\s*\)/', dirname($fileDir), $includePath);
 
-        // 変数を含むパスの場合はCHECK!を返す
+        // パスにリテラル文字列が含まれるかチェック
+        if (preg_match('/"([^"]+)"/', $includePath, $matches) || 
+            preg_match('/\'([^\']+)\'/', $includePath, $matches)) {
+            $literalPath = $matches[1];
+            
+            // リテラルパスが絶対パスでなければ、現在のファイルの場所から相対的に解決を試みる
+            if (!preg_match('/^(\/|[A-Z]:\\\\)/i', $literalPath)) {
+                $fullPath = $fileDir . DIRECTORY_SEPARATOR . $literalPath;
+                if (file_exists($fullPath)) {
+                    return $fullPath;
+                }
+            }
+        }
+
+        // 変数や未解決のマジック定数を含むパスの場合
         if (preg_match('/\$[a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*/', $includePath)) {
-            return 'CHECK!';
+            // 変数を含むパスから、後半部分（変数の後のパス部分）を抽出
+            $pathParts = preg_split('/[\\/\\\\]/', $includePath);
+            $lastNonVariablePart = '';
+            
+            // 後ろから探して、変数を含まないパス部分を見つける
+            for ($i = count($pathParts) - 1; $i >= 0; $i--) {
+                $part = $pathParts[$i];
+                if (!preg_match('/\$/', $part)) {
+                    if (empty($lastNonVariablePart)) {
+                        $lastNonVariablePart = $part;
+                    } else {
+                        $lastNonVariablePart = $part . DIRECTORY_SEPARATOR . $lastNonVariablePart;
+                    }
+                } else {
+                    break;
+                }
+            }
+            
+            // 後半部分のファイル名や部分パスを使って検索
+            if (!empty($lastNonVariablePart)) {
+                // ダブルクォートまたはシングルクォートを除去
+                $lastNonVariablePart = preg_replace('/["\']/', '', $lastNonVariablePart);
+                
+                // 最後のパス部分がファイル名の場合
+                if (pathinfo($lastNonVariablePart, PATHINFO_EXTENSION)) {
+                    $resolvedPath = $this->findFileByNameInDirectory(basename($lastNonVariablePart), $this->baseDir);
+                    if ($resolvedPath) {
+                        return $resolvedPath . ' (resolved from filename)';
+                    }
+                }
+                
+                // 部分パスで検索
+                $resolvedPath = $this->findPartialPathMatch($lastNonVariablePart, $this->baseDir);
+                if ($resolvedPath) {
+                    return $resolvedPath . ' (resolved from partial path)';
+                }
+            }
+            
+            return $includePath . ' (unresolved variable)';
+        }
+
+        // __で始まるマジック定数の処理
+        if (strpos($includePath, '__') !== false) {
+            // パスからパーツを抽出してファイル名や部分パスを見つける
+            $resolvedPath = $this->findPartialPathMatch($includePath, $this->baseDir);
+            if ($resolvedPath) {
+                return $resolvedPath;
+            }
+            
+            return $includePath . ' (unresolved magic constant)';
         }
 
         // 相対パスの解決を試みる
@@ -350,6 +419,12 @@ class IncludeAnalyzer
             $candidate = realpath($includePath);
             if ($candidate !== false) {
                 return $candidate;
+            }
+            
+            // 絶対パスが解決できない場合は、ファイル名や部分パスで探索を試みる
+            $resolvedPath = $this->findPartialPathMatch($includePath, $this->baseDir);
+            if ($resolvedPath) {
+                return $resolvedPath;
             }
         } else {
             // 相対パスの場合
@@ -366,12 +441,194 @@ class IncludeAnalyzer
                 return $candidate;
             }
             
+            // 相対パスが解決できない場合は、ファイル名や部分パスで探索を試みる
+            $resolvedPath = $this->findPartialPathMatch($includePath, $this->baseDir);
+            if ($resolvedPath) {
+                return $resolvedPath;
+            }
+            
             // 実際のファイルパスを解決できない場合、そのまま返す
-            return $fullPath;
+            return $fullPath . ' (not found)';
         }
 
         // パスを解決できなかった場合
         return 'CHECK!';
+    }
+    
+    /**
+     * 部分パスからファイルを検索して解決する
+     * 
+     * @param string $includePath インクルードパス
+     * @param string $baseDir 検索を開始するベースディレクトリ
+     * @return string|false 解決されたパス、または見つからない場合はfalse
+     */
+    private function findPartialPathMatch($includePath, $baseDir)
+    {
+        // パスを分解して部分パスを探す
+        $pathParts = preg_split('/[\\/\\\\]/', $includePath);
+        $candidates = [];
+        
+        // 右側から文字列を抽出して候補とする（ファイル名優先）
+        $currentPart = '';
+        for ($i = count($pathParts) - 1; $i >= 0; $i--) {
+            $part = $pathParts[$i];
+            
+            // 変数やマジック定数を含む部分はスキップ
+            if (empty($part) || 
+                strpos($part, '$') !== false || 
+                strpos($part, '__') !== false ||
+                strpos($part, 'CHECK!') !== false) {
+                continue;
+            }
+            
+            // パスの右側から結合していく
+            if (empty($currentPart)) {
+                $currentPart = $part;
+            } else {
+                $currentPart = $part . DIRECTORY_SEPARATOR . $currentPart;
+            }
+            
+            $candidates[] = $currentPart;
+        }
+        
+        // 左側から文字列を抽出して候補に追加
+        $currentPart = '';
+        for ($i = 0; $i < count($pathParts); $i++) {
+            $part = $pathParts[$i];
+            
+            // 変数やマジック定数を含む部分はスキップ
+            if (empty($part) || 
+                strpos($part, '$') !== false || 
+                strpos($part, '__') !== false ||
+                strpos($part, 'CHECK!') !== false) {
+                continue;
+            }
+            
+            // パスの左側から結合していく
+            if (empty($currentPart)) {
+                $currentPart = $part;
+            } else {
+                $currentPart = $currentPart . DIRECTORY_SEPARATOR . $part;
+            }
+            
+            // 左側から抽出した候補がすでにあれば追加しない
+            if (!in_array($currentPart, $candidates)) {
+                $candidates[] = $currentPart;
+            }
+        }
+        
+        // ファイル名のみを候補とする
+        $fileName = basename($includePath);
+        if (!empty($fileName) && 
+            strpos($fileName, '$') === false && 
+            strpos($fileName, '__') === false &&
+            strpos($fileName, 'CHECK!') === false &&
+            !in_array($fileName, $candidates)) {
+            $candidates[] = $fileName;
+        }
+        
+        // 拡張子がない場合、PHPの拡張子を追加した候補も用意する
+        foreach ($candidates as $candidate) {
+            if (!pathinfo($candidate, PATHINFO_EXTENSION)) {
+                $candidates[] = $candidate . '.php';
+                $candidates[] = $candidate . '.inc';
+            }
+        }
+        
+        // 候補から重複を削除
+        $candidates = array_unique($candidates);
+        
+        // 各候補が実際に存在するか確認
+        foreach ($candidates as $candidate) {
+            $foundFile = $this->findFileByNameOrPath($candidate, $baseDir);
+            if ($foundFile) {
+                return $foundFile;
+            }
+        }
+        
+        return false;
+    }
+    
+    /**
+     * ファイル名または部分パスからファイルを検索
+     * 
+     * @param string $pattern 検索するファイル名または部分パス
+     * @param string $directory 検索対象ディレクトリ
+     * @return string|false 見つかったファイルの絶対パス、見つからない場合はfalse
+     */
+    private function findFileByNameOrPath($pattern, $directory)
+    {
+        if (empty($pattern) || !is_dir($directory)) {
+            return false;
+        }
+        
+        try {
+            // ファイル名のみの場合
+            if (strpos($pattern, DIRECTORY_SEPARATOR) === false) {
+                return $this->findFileByNameInDirectory($pattern, $directory);
+            }
+            
+            // 部分パスの場合は完全一致するものを探す
+            $iterator = new RecursiveIteratorIterator(
+                new RecursiveDirectoryIterator($directory, RecursiveDirectoryIterator::SKIP_DOTS),
+                RecursiveIteratorIterator::LEAVES_ONLY
+            );
+            
+            foreach ($iterator as $file) {
+                $filePath = $file->getPathname();
+                // ファイル名から部分パスが見つかる場合
+                if (strpos($filePath, $pattern) !== false) {
+                    return $file->getRealPath();
+                }
+            }
+            
+            // 完全一致するものが見つからない場合、パスパターンの末尾部分だけでマッチを試みる
+            $pathParts = explode(DIRECTORY_SEPARATOR, $pattern);
+            $fileNamePattern = end($pathParts);
+            return $this->findFileByNameInDirectory($fileNamePattern, $directory);
+            
+        } catch (\Exception $e) {
+            // 例外が発生した場合は検索を中止
+            return false;
+        }
+        
+        // return false;
+    }
+    
+    /**
+     * ディレクトリ内で指定されたファイル名を検索
+     * 
+     * @param string $fileName 検索するファイル名
+     * @param string $directory 検索対象ディレクトリ
+     * @return string|false 見つかったファイルの絶対パス、見つからない場合はfalse
+     */
+    private function findFileByNameInDirectory($fileName, $directory)
+    {
+        if (empty($fileName) || !is_dir($directory)) {
+            return false;
+        }
+        
+        // ファイル名に拡張子が含まれていない場合はPHP拡張子を追加
+        if (!pathinfo($fileName, PATHINFO_EXTENSION)) {
+            $fileName .= '.php';
+        }
+        
+        try {
+            $iterator = new RecursiveIteratorIterator(
+                new RecursiveDirectoryIterator($directory, RecursiveDirectoryIterator::SKIP_DOTS),
+                RecursiveIteratorIterator::LEAVES_ONLY
+            );
+            
+            foreach ($iterator as $file) {
+                if ($file->getFilename() === $fileName) {
+                    return $file->getRealPath();
+                }
+            }
+            return false;
+        } catch (\Exception $e) {
+            // 例外が発生した場合は検索を中止
+            return false;
+        }
     }
     
     /**
@@ -758,10 +1015,10 @@ function collectPhpFiles($dir)
 }
 
 // メインスクリプト
-if (php_sapi_name() === 'cli' && isset($argv[0]) && basename($argv[0]) === 'includesResolverV2.php') {
+if (php_sapi_name() === 'cli' && isset($argv[0]) && basename($argv[0]) === 'includesResolver.php') {
     // ヘルプオプションのチェック
     if ($argc === 2 && ($argv[1] === '--help' || $argv[1] === '-h')) {
-        echo "使用方法: php includesResolverV2.php [対象ディレクトリパス] [オプション]\n";
+        echo "使用方法: php includesResolver.php [対象ディレクトリパス] [オプション]\n";
         echo "オプション:\n";
         echo "  -p, --include-project-folder  パスにプロジェクトフォルダ名を含める\n";
         echo "  -h, --help                    このヘルプを表示\n";
@@ -773,7 +1030,7 @@ if (php_sapi_name() === 'cli' && isset($argv[0]) && basename($argv[0]) === 'incl
 
     // 引数のチェック
     if ($argc < 2) {
-        echo "使用方法: php includesResolverV2.php [対象ディレクトリパス] [-p|--include-project-folder]\n";
+        echo "使用方法: php includesResolver.php [対象ディレクトリパス] [-p|--include-project-folder]\n";
         echo "詳細は --help オプションを参照してください。\n";
         exit(1);
     }
