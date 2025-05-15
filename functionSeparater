@@ -1,0 +1,650 @@
+<?php
+
+use PhpParser\Error;
+use PhpParser\NodeTraverser;
+use PhpParser\NodeVisitor\NameResolver;
+use PhpParser\ParserFactory;
+use PhpParser\Node;
+use PhpParser\NodeVisitorAbstract;
+use PhpParser\PrettyPrinter;
+use PhpParser\ErrorHandler\Collecting;
+
+require_once __DIR__ . '/vendor/autoload.php';
+
+/**
+ * 関数とクラス定義のみを抽出するVisitor
+ */
+class FunctionClassExtractor extends NodeVisitorAbstract
+{
+    private $functionAndClassNodes = [];
+
+    public function enterNode(Node $node)
+    {
+        if ($node instanceof Node\Stmt\Function_ ||
+            $node instanceof Node\Stmt\Class_ ||
+            $node instanceof Node\Stmt\Interface_ ||
+            $node instanceof Node\Stmt\Trait_ ||
+            $node instanceof Node\Stmt\Enum_) {
+            $this->functionAndClassNodes[] = $node;
+        }
+    }
+
+    public function getFunctionAndClassNodes()
+    {
+        return $this->functionAndClassNodes;
+    }
+    
+    public function reset()
+    {
+        $this->functionAndClassNodes = [];
+    }
+}
+
+/**
+ * 関数とクラス定義を除去するVisitor
+ */
+class FunctionClassRemover extends NodeVisitorAbstract
+{
+    public function leaveNode(Node $node)
+    {
+        if ($node instanceof Node\Stmt\Function_ ||
+            $node instanceof Node\Stmt\Class_ ||
+            $node instanceof Node\Stmt\Interface_ ||
+            $node instanceof Node\Stmt\Trait_ ||
+            $node instanceof Node\Stmt\Enum_) {
+            return NodeTraverser::REMOVE_NODE;
+        }
+        
+        return $node;
+    }
+}
+
+/**
+ * コメントを除去するVisitor
+ */
+class CommentRemover extends NodeVisitorAbstract
+{
+    public function beforeTraverse(array $nodes)
+    {
+        foreach ($nodes as $node) {
+            $node->setAttribute('comments', []);
+        }
+        return $nodes;
+    }
+
+    public function leaveNode(Node $node)
+    {
+        $node->setAttribute('comments', []);
+        return $node;
+    }
+}
+
+/**
+ * PHPファイルを処理する関数
+ *
+ * @param string $sourceFile 処理するファイル
+ * @param string $outputDirOnlyFunctions 関数・クラスのみのファイルを出力するディレクトリ
+ * @param string $outputDirWithoutFunctions 関数・クラスを除いたファイルを出力するディレクトリ
+ * @param string $sourceDir 元のディレクトリ
+ * @param array $options オプション設定
+ * @return bool 処理が成功したかどうか
+ */
+function processFile($sourceFile, $outputDirOnlyFunctions, $outputDirWithoutFunctions, $sourceDir, $options = [])
+{
+    $extension = strtolower(pathinfo($sourceFile, PATHINFO_EXTENSION));
+    $allowedExtensions = ['php', 'inc', 'html', 'js'];
+    
+    if (!in_array($extension, $allowedExtensions)) {
+        return false;
+    }
+    
+    // HTMLやJSファイルではPHPコードが含まれていない可能性があるため、まず内容を確認
+    $content = file_get_contents($sourceFile);
+    if (strpos($content, '<?') === false && $extension !== 'php' && $extension !== 'inc') {
+        // PHPコードが含まれていないファイルはスキップ
+        return false;
+    }
+    
+    // メモリ使用量を減らすためにファイル内容変数をクリア
+    $content = null;
+    
+    try {
+        $parser = (new ParserFactory)->createForNewestSupportedVersion();
+        $prettyPrinter = new PrettyPrinter\Standard;
+        
+        // ファイル内容を取得
+        $code = file_get_contents($sourceFile);
+        
+        // 短縮タグを標準PHPタグに変換
+        $code = preg_replace('/<\?(?!php|=)/', '<?php ', $code);
+        
+        // エラーハンドラ設定
+        $errorHandler = new Collecting();
+        
+        // コードをパース
+        $stmts = $parser->parse($code, $errorHandler);
+        
+        // パースエラーの処理
+        $errors = $errorHandler->getErrors();
+        if (!empty($errors)) {
+            if ($options['verbose']) {
+                foreach ($errors as $error) {
+                    echo "警告: {$sourceFile}: {$error->getMessage()}\n";
+                }
+            }
+            
+            // 致命的エラーの場合はフォールバック処理
+            if ($stmts === null) {
+                if ($options['verbose']) {
+                    echo "フォールバック処理を試行: {$sourceFile}\n";
+                }
+                
+                // トークン分析によるフォールバック処理
+                return fallbackProcessing($sourceFile, $outputDirOnlyFunctions, $outputDirWithoutFunctions, $sourceDir, $code);
+            }
+        }
+        
+        // ディレクトリ構造を維持するための相対パスを計算
+        $relativePath = ltrim(str_replace(rtrim($sourceDir, '/\\'), '', $sourceFile), '/\\');
+        
+        // 出力先のディレクトリを作成
+        $outputFunctionsPath = $outputDirOnlyFunctions . '/' . dirname($relativePath);
+        $outputNoFunctionsPath = $outputDirWithoutFunctions . '/' . dirname($relativePath);
+        
+        if (!file_exists($outputFunctionsPath) && $outputFunctionsPath !== $outputDirOnlyFunctions . '/.') {
+            mkdir($outputFunctionsPath, 0777, true);
+        }
+        
+        if (!file_exists($outputNoFunctionsPath) && $outputNoFunctionsPath !== $outputDirWithoutFunctions . '/.') {
+            mkdir($outputNoFunctionsPath, 0777, true);
+        }
+        
+        // 関数とクラス定義のみを抽出
+        $traverser1 = new NodeTraverser();
+        $extractor = new FunctionClassExtractor();
+        $commentRemover = new CommentRemover();
+        
+        $traverser1->addVisitor(new NameResolver());
+        $traverser1->addVisitor($commentRemover);
+        $traverser1->addVisitor($extractor);
+        
+        $traverser1->traverse($stmts);
+        $functionAndClassNodes = $extractor->getFunctionAndClassNodes();
+        
+        // 関数とクラスを除去
+        $traverser2 = new NodeTraverser();
+        $remover = new FunctionClassRemover();
+        
+        $traverser2->addVisitor(new NameResolver());
+        $traverser2->addVisitor($commentRemover);
+        $traverser2->addVisitor($remover);
+        
+        $stmtsWithoutFunctions = $traverser2->traverse($stmts);
+        
+        // 関数とクラス定義のみのファイルを出力
+        if (!empty($functionAndClassNodes)) {
+            $onlyFunctionsCode = "<?php\n" . $prettyPrinter->prettyPrint($functionAndClassNodes);
+            file_put_contents(
+                $outputDirOnlyFunctions . '/' . $relativePath,
+                $onlyFunctionsCode
+            );
+        }
+        
+        // 関数とクラスを除いたファイルを出力（残りのコードがある場合のみ）
+        if (!empty($stmtsWithoutFunctions)) {
+            $withoutFunctionsCode = "<?php\n" . $prettyPrinter->prettyPrint($stmtsWithoutFunctions);
+            file_put_contents(
+                $outputDirWithoutFunctions . '/' . $relativePath,
+                $withoutFunctionsCode
+            );
+        }
+        
+        // メモリ解放
+        unset($code, $stmts, $functionAndClassNodes, $stmtsWithoutFunctions);
+        $extractor->reset();
+        
+        return true;
+        
+    } catch (Error $e) {
+        if ($options['verbose']) {
+            echo "エラー: {$sourceFile}: {$e->getMessage()}\n";
+        }
+        
+        // フォールバック処理を試みる
+        if ($options['fallback']) {
+            if ($options['verbose']) {
+                echo "フォールバック処理を試行: {$sourceFile}\n";
+            }
+            return fallbackProcessing($sourceFile, $outputDirOnlyFunctions, $outputDirWithoutFunctions, $sourceDir, isset($code) ? $code : null);
+        }
+        
+        return false;
+    }
+}
+
+/**
+ * パースに失敗した場合のフォールバック処理
+ * トークン解析を使用して関数とクラスの定義を分離
+ *
+ * @param string $sourceFile ソースファイル
+ * @param string $outputDirOnlyFunctions 関数・クラスのみのファイルを出力するディレクトリ
+ * @param string $outputDirWithoutFunctions 関数・クラスを除いたファイルを出力するディレクトリ
+ * @param string $sourceDir 元のディレクトリ
+ * @param string|null $code すでに読み込まれたコード
+ * @return bool 処理が成功したかどうか
+ */
+function fallbackProcessing($sourceFile, $outputDirOnlyFunctions, $outputDirWithoutFunctions, $sourceDir, $code = null)
+{
+    try {
+        if ($code === null) {
+            // ファイル内容を取得
+            $code = file_get_contents($sourceFile);
+            
+            // 短縮タグを標準PHPタグに変換
+            $code = preg_replace('/<\?(?!php|=)/', '<?php ', $code);
+        }
+        
+        // トークン解析
+        $tokens = token_get_all($code);
+        
+        // ディレクトリ構造を維持するための相対パスを計算
+        $relativePath = ltrim(str_replace(rtrim($sourceDir, '/\\'), '', $sourceFile), '/\\');
+        
+        // 出力先のディレクトリを作成
+        $outputFunctionsPath = $outputDirOnlyFunctions . '/' . dirname($relativePath);
+        $outputNoFunctionsPath = $outputDirWithoutFunctions . '/' . dirname($relativePath);
+        
+        if (!file_exists($outputFunctionsPath) && $outputFunctionsPath !== $outputDirOnlyFunctions . '/.') {
+            mkdir($outputFunctionsPath, 0777, true);
+        }
+        
+        if (!file_exists($outputNoFunctionsPath) && $outputNoFunctionsPath !== $outputDirWithoutFunctions . '/.') {
+            mkdir($outputNoFunctionsPath, 0777, true);
+        }
+        
+        // 関数とクラス定義を検出して分離
+        $inDefinition = false;
+        $braceLevel = 0;
+        $definitionCode = '';
+        $remainingCode = '';
+        $definitionStart = false;
+        
+        foreach ($tokens as $token) {
+            if (is_array($token)) {
+                list($id, $text) = $token;
+                
+                // コメントをスキップ
+                if ($id == T_COMMENT || $id == T_DOC_COMMENT) {
+                    continue;
+                }
+                
+                // 関数/クラス定義の開始を検出
+                if (in_array($id, [T_FUNCTION, T_CLASS, T_INTERFACE, T_TRAIT]) && !$inDefinition) {
+                    $inDefinition = true;
+                    $definitionStart = true;
+                }
+                
+                if ($inDefinition) {
+                    $definitionCode .= $text;
+                    
+                    if ($text === '{') {
+                        $braceLevel++;
+                    } elseif ($text === '}') {
+                        $braceLevel--;
+                        if ($braceLevel === 0) {
+                            $inDefinition = false;
+                        }
+                    }
+                } else {
+                    if (!$definitionStart) {
+                        $remainingCode .= $text;
+                    }
+                    $definitionStart = false;
+                }
+            } else {
+                if ($inDefinition) {
+                    $definitionCode .= $token;
+                    
+                    if ($token === '{') {
+                        $braceLevel++;
+                    } elseif ($token === '}') {
+                        $braceLevel--;
+                        if ($braceLevel === 0) {
+                            $inDefinition = false;
+                        }
+                    }
+                } else {
+                    if (!$definitionStart) {
+                        $remainingCode .= $token;
+                    }
+                    $definitionStart = false;
+                }
+            }
+        }
+        
+        // 関数とクラス定義のみのファイルを出力
+        if (!empty($definitionCode)) {
+            file_put_contents(
+                $outputDirOnlyFunctions . '/' . $relativePath,
+                "<?php\n" . $definitionCode
+            );
+        }
+        
+        // 関数とクラスを除いたファイルを出力
+        if (!empty($remainingCode)) {
+            file_put_contents(
+                $outputDirWithoutFunctions . '/' . $relativePath,
+                "<?php\n" . $remainingCode
+            );
+        }
+        
+        // メモリ解放
+        unset($code, $tokens, $definitionCode, $remainingCode);
+        
+        return true;
+    } catch (Exception $e) {
+        echo "フォールバック処理中のエラー: {$sourceFile}: {$e->getMessage()}\n";
+        return false;
+    }
+}
+
+/**
+ * ディレクトリを再帰的に処理する関数
+ *
+ * @param string $dir 処理するディレクトリ
+ * @param string $outputDirOnlyFunctions 関数・クラスのみのファイルを出力するディレクトリ
+ * @param string $outputDirWithoutFunctions 関数・クラスを除いたファイルを出力するディレクトリ
+ * @param array $options オプション設定
+ * @return array 処理結果の統計情報
+ */
+function processDirectory($dir, $outputDirOnlyFunctions, $outputDirWithoutFunctions, $options = [])
+{
+    $stats = [
+        'total' => 0,
+        'success' => 0,
+        'skipped' => 0,
+        'error' => 0
+    ];
+    
+    $startTime = microtime(true);
+    
+    $files = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($dir, RecursiveDirectoryIterator::SKIP_DOTS)
+    );
+    
+    foreach ($files as $file) {
+        if ($file->isFile()) {
+            $extension = strtolower($file->getExtension());
+            if (in_array($extension, ['php', 'inc', 'html', 'js'])) {
+                $stats['total']++;
+                
+                if ($options['verbose']) {
+                    echo "処理中: {$file->getPathname()}\n";
+                }
+                
+                $result = processFile($file->getPathname(), $outputDirOnlyFunctions, $outputDirWithoutFunctions, $dir, $options);
+                
+                if ($result === true) {
+                    $stats['success']++;
+                } elseif ($result === false) {
+                    $stats['skipped']++;
+                } else {
+                    $stats['error']++;
+                }
+                
+                // メモリ使用量を監視し、必要ならGCを強制実行
+                if ($stats['total'] % 50 === 0) {
+                    gc_collect_cycles();
+                    
+                    if ($options['memory_limit_check']) {
+                        $memoryUsage = memory_get_usage(true);
+                        $memoryLimit = $options['memory_limit'] * 1024 * 1024; // MB → bytes
+                        
+                        if ($memoryUsage > $memoryLimit) {
+                            echo "警告: メモリ使用量が上限に近づいています: " . round($memoryUsage / 1024 / 1024, 2) . "MB\n";
+                            gc_collect_cycles();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    $endTime = microtime(true);
+    $stats['time'] = $endTime - $startTime;
+    
+    return $stats;
+}
+
+/**
+ * テストディレクトリを作成して処理をテストする関数
+ */
+function runTests()
+{
+    echo "テストを実行します...\n";
+    
+    // テストディレクトリの作成
+    $testDir = __DIR__ . '/test_function_separator';
+    if (!file_exists($testDir)) {
+        mkdir($testDir, 0777, true);
+    }
+    
+    // テストケースの作成
+    $testCases = [
+        // 標準的なPHPファイル
+        'standard.php' => '<?php
+function test1() { 
+    echo "Test function"; 
+    // コメント
+}
+
+class TestClass { 
+    public function method1() { 
+        echo "Test method";
+        /* コメントブロック */
+    }
+    
+    private $var = 123;
+}
+
+$var = "テスト変数";
+echo $var;',
+
+        // 短縮タグを使用したファイル
+        'short_tag.php' => '<? 
+class ShortTagClass { 
+    function test() { 
+        echo "Short tag test"; 
+    } 
+}
+$x = 10; // コメント',
+
+        // HTMLファイル内のPHPコード
+        'mixed.html' => '<html>
+<head><title>Test</title></head>
+<body>
+<?php
+function htmlFunc() {
+    return "HTML Function";
+}
+?>
+<h1>Test Page</h1>
+<?php echo "テスト出力"; ?>
+</body>
+</html>',
+
+        // パースエラーを含むファイル
+        'error.php' => '<?php
+function brokenFunc( {  // 括弧が閉じていない
+    echo "Broken";
+}
+
+class ValidClass {
+    public function test() {
+        echo "Valid";
+    }
+}
+
+$var = 123;'
+    ];
+    
+    // テストファイルの作成
+    foreach ($testCases as $filename => $content) {
+        file_put_contents($testDir . '/' . $filename, $content);
+    }
+    
+    // サブディレクトリのテスト
+    $subDir = $testDir . '/subdir';
+    if (!file_exists($subDir)) {
+        mkdir($subDir, 0777, true);
+    }
+    
+    file_put_contents($subDir . '/subtest.inc', '<?php
+function subTest() {
+    return "Sub directory test";
+}
+
+$subVar = "Sub variable";');
+    
+    // 出力ディレクトリの設定
+    $outputDir = __DIR__ . '/test_output';
+    $outputDirOnlyFunctions = $outputDir . '/functions_only';
+    $outputDirWithoutFunctions = $outputDir . '/without_functions';
+    
+    // ディレクトリの消去と作成
+    if (file_exists($outputDir)) {
+        removeDirectory($outputDir);
+    }
+    
+    mkdir($outputDirOnlyFunctions, 0777, true);
+    mkdir($outputDirWithoutFunctions, 0777, true);
+    
+    // テスト実行
+    $options = [
+        'verbose' => true,
+        'fallback' => true,
+        'memory_limit_check' => false,
+        'memory_limit' => 128 // MB
+    ];
+    
+    $stats = processDirectory($testDir, $outputDirOnlyFunctions, $outputDirWithoutFunctions, $options);
+    
+    // 結果の表示
+    echo "\nテスト結果:\n";
+    echo "処理されたファイル: {$stats['total']}\n";
+    echo "成功: {$stats['success']}\n";
+    echo "スキップ: {$stats['skipped']}\n";
+    echo "エラー: {$stats['error']}\n";
+    echo "処理時間: " . round($stats['time'], 2) . "秒\n";
+    
+    // 出力ファイルの検証
+    echo "\n出力ファイルの検証:\n";
+    foreach ($testCases as $filename => $content) {
+        $functionsFile = $outputDirOnlyFunctions . '/' . $filename;
+        $withoutFile = $outputDirWithoutFunctions . '/' . $filename;
+        
+        echo "$filename:\n";
+        echo "  関数のみ: " . (file_exists($functionsFile) ? "存在します" : "存在しません") . "\n";
+        echo "  関数なし: " . (file_exists($withoutFile) ? "存在します" : "存在しません") . "\n";
+    }
+    
+    // サブディレクトリの検証
+    $subFunctionsFile = $outputDirOnlyFunctions . '/subdir/subtest.inc';
+    $subWithoutFile = $outputDirWithoutFunctions . '/subdir/subtest.inc';
+    
+    echo "subdir/subtest.inc:\n";
+    echo "  関数のみ: " . (file_exists($subFunctionsFile) ? "存在します" : "存在しません") . "\n";
+    echo "  関数なし: " . (file_exists($subWithoutFile) ? "存在します" : "存在しません") . "\n";
+    
+    echo "\nテスト完了\n";
+}
+
+/**
+ * ディレクトリとその中身を再帰的に削除する関数
+ *
+ * @param string $dir 削除するディレクトリ
+ */
+function removeDirectory($dir) 
+{
+    if (!file_exists($dir)) {
+        return;
+    }
+    
+    $files = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($dir, RecursiveDirectoryIterator::SKIP_DOTS),
+        RecursiveIteratorIterator::CHILD_FIRST
+    );
+    
+    foreach ($files as $file) {
+        if ($file->isDir()) {
+            rmdir($file->getPathname());
+        } else {
+            unlink($file->getPathname());
+        }
+    }
+    
+    rmdir($dir);
+}
+
+// メイン処理
+if (isset($argv[1]) && $argv[1] === '--test') {
+    // テストモード
+    runTests();
+    exit(0);
+}
+
+if ($argc < 2) {
+    echo "使用方法: php functionSeparater.php <ディレクトリパス> [オプション]\n";
+    echo "オプション:\n";
+    echo "  --verbose        詳細な出力を表示\n";
+    echo "  --no-fallback    フォールバック処理を無効にする\n";
+    echo "  --memory-limit=N メモリ使用制限をNメガバイトに設定（デフォルト128）\n";
+    echo "  --test           テストを実行\n";
+    exit(1);
+}
+
+$sourceDir = $argv[1];
+$outputDir = getcwd() . '/output';
+$outputDirOnlyFunctions = $outputDir . '/functions_only';
+$outputDirWithoutFunctions = $outputDir . '/without_functions';
+
+// オプションの解析
+$options = [
+    'verbose' => false,
+    'fallback' => true,
+    'memory_limit_check' => true,
+    'memory_limit' => 128 // MB
+];
+
+for ($i = 2; $i < $argc; $i++) {
+    if ($argv[$i] === '--verbose') {
+        $options['verbose'] = true;
+    } elseif ($argv[$i] === '--no-fallback') {
+        $options['fallback'] = false;
+    } elseif (strpos($argv[$i], '--memory-limit=') === 0) {
+        $limit = (int) substr($argv[$i], 15);
+        if ($limit > 0) {
+            $options['memory_limit'] = $limit;
+        }
+    }
+}
+
+// 出力ディレクトリを作成
+if (!file_exists($outputDirOnlyFunctions)) {
+    mkdir($outputDirOnlyFunctions, 0777, true);
+}
+
+if (!file_exists($outputDirWithoutFunctions)) {
+    mkdir($outputDirWithoutFunctions, 0777, true);
+}
+
+echo "処理を開始します...\n";
+$stats = processDirectory($sourceDir, $outputDirOnlyFunctions, $outputDirWithoutFunctions, $options);
+echo "処理が完了しました。\n";
+echo "処理されたファイル: {$stats['total']}\n";
+echo "成功: {$stats['success']}\n";
+echo "スキップ: {$stats['skipped']}\n";
+echo "エラー: {$stats['error']}\n";
+echo "処理時間: " . round($stats['time'], 2) . "秒\n";
+echo "関数・クラス定義のみのファイル: {$outputDirOnlyFunctions}\n";
+echo "関数・クラス定義を除いたファイル: {$outputDirWithoutFunctions}\n";
