@@ -1,0 +1,30 @@
+use PhpParser\NodeVisitor\ParentConnectingVisitor;
+use PhpParser\NodeVisitor\NameResolver;
+
+/* ...中略… */
+
+/* === 解析ループ === */
+$parser = (new ParserFactory())->createForNewestSupportedVersion();
+
+/* ── 1 ファイルごと ───────────── */
+$trav = new NodeTraverser();
+/* 親リンクを張る → 名前解決 → ユーザー定義関数抽出 */
+$trav->addVisitor(new ParentConnectingVisitor());
+$trav->addVisitor(new NameResolver(null, ['preserveOriginalNames'=>true]));
+$vis  = new FuncVisitor($filePath, $defined);
+$trav->addVisitor($vis);
+/* ─────────────────────────── */
+
+/* === FuncVisitor での ClassMethod 名取得を以下のように修正 === */
+if ($n instanceof Node\Stmt\ClassMethod) {
+    // 親チェーンを遡って ClassLike を取得
+    $owner = $n;
+    while ($owner && !($owner instanceof Node\Stmt\ClassLike)) {
+        $owner = $owner->getAttribute('parent');
+    }
+    $className = $owner && $owner->hasAttribute('namespacedName')
+        ? $owner->namespacedName->toString()
+        : 'AnonymousClass';
+
+    $name = $className . '::' . $n->name;
+} else { /* Function_ と同じく */ }
