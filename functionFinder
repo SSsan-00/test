@@ -1,7 +1,6 @@
 <?php
 /**
  * CLI: php scan.php <TARGET_DIR> [<OUTFILE>]
- *
  * 依存   : nikic/php-parser, phpoffice/phpspreadsheet
  * PHP推奨: 8.1+
  */
@@ -10,11 +9,11 @@ declare(strict_types=1);
 
 require_once __DIR__ . '/vendor/autoload.php';
 
-use PhpParser\{Error, Node, NodeTraverser, NodeVisitorAbstract, ParserFactory};
+use PhpParser\{Error, Node, NodeTraverser, NodeVisitorAbstract, ParserFactory, NodeFinder};
 use PhpOffice\PhpSpreadsheet\Spreadsheet;
 use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 
-/* ---------- 1. 引数チェック ---------- */
+/* ---------- 引数チェック ---------- */
 if (($target = $argv[1] ?? null) === null) {
     fwrite(STDERR, "Usage: php scan.php <TARGET_DIR> [<OUTFILE>]\n");
     exit(1);
@@ -26,146 +25,138 @@ if ($targetDir === false || !is_dir($targetDir)) {
 }
 $outFile = $argv[2] ?? 'functions.xlsx';
 
-/* ---------- 2. ヘルパークラス ---------- */
+/* ---------- ヘルパー ---------- */
 final class PhpCleaner
 {
-    /** 開始タグ補完 */
+    /** 開始タグ補完 : ファイル内に `<?` が 1 つも無ければ先頭に挿入 */
     public static function completeStartTag(string $code): string
     {
-        $trimmed = ltrim($code);
-        if (str_starts_with($trimmed, '<?php')) return $code;
-        if (str_starts_with($trimmed, '<?'))    return preg_replace('/^<\?/', '<?php', $code, 1);
-        return "<?php\n" . $code;
+        return str_contains($code, '<?')
+            ? $code
+            : "<?php\n" . $code;
     }
-    /** コメント除去 */
+
+    /** コメント除去 : TOKEN_PARSE は **付けない** ＝ 構文チェックしない */
     public static function stripComments(string $code): string
     {
         $out = '';
-        foreach (token_get_all($code, TOKEN_PARSE) as $t) {
-            if (is_array($t)) {
-                [$id, $text] = $t;
+        foreach (token_get_all($code) as $tok) {
+            if (is_array($tok)) {
+                [$id, $text] = $tok;
                 if (in_array($id, [T_COMMENT, T_DOC_COMMENT], true)) continue;
                 $out .= $text;
             } else {
-                $out .= $t;
+                $out .= $tok;
             }
         }
         return $out;
     }
 }
 
-/* ---------- 3. AST ビジター ---------- */
+/* ---------- SQL を含む関数抽出ビジター ---------- */
 final class FuncVisitor extends NodeVisitorAbstract
 {
     /** @var array<int,array{file:string,func:string,calls:array<int,string>}> */
     public array $functions = [];
-    /** @var array<string,Node\FunctionLike> */
-    private array $funcBodies = [];
-    private ?string $currentFunc = null;
-    private string $file;
+
+    private ?string $current = null;
+    private string  $file;
+    /** @var array<string,array<int,string>> 呼び出し記録 */
+    private array $callsMap = [];
 
     public function __construct(string $file) { $this->file = $file; }
 
-    public function enterNode(Node $node)
+    public function enterNode(Node $n)
     {
-        if ($node instanceof Node\Stmt\Function_ || $node instanceof Node\Stmt\ClassMethod) {
-            $funcName = $node instanceof Node\Stmt\ClassMethod
-                ? ($node->getAttribute('parent')?->name->toString() ?? 'AnonymousClass') . '::' . $node->name->toString()
-                : $node->name->toString();
+        if ($n instanceof Node\Stmt\Function_ || $n instanceof Node\Stmt\ClassMethod) {
+            $name = $n instanceof Node\Stmt\ClassMethod
+                ? ($n->getAttribute('parent')?->namespacedName ?? 'AnonymousClass') . '::' . $n->name
+                : (string)$n->name;
 
-            $prev = $this->currentFunc;
-            $this->currentFunc = $funcName;
-            $node->setAttribute('prevFunc', $prev);
-            $this->funcBodies[$funcName] = $node;
+            // スタック
+            $n->setAttribute('prev', $this->current);
+            $this->current = $name;
         }
 
-        if ($this->currentFunc && $node instanceof Node\Expr\FuncCall) {
-            $called = $node->name instanceof Node\Name ? $node->name->toString() : '(dynamic)';
-            $body   = $this->funcBodies[$this->currentFunc];
-            $calls  = $body->getAttribute('calls') ?? [];
-            $calls[] = $called;
-            $body->setAttribute('calls', $calls);
+        // 関数呼び出し収集
+        if ($this->current && $n instanceof Node\Expr\FuncCall) {
+            $called = $n->name instanceof Node\Name ? $n->name->toString() : '(dynamic)';
+            $this->callsMap[$this->current][] = $called;
         }
     }
 
-    public function leaveNode(Node $node)
+    public function leaveNode(Node $n)
     {
-        if ($node instanceof Node\Stmt\Function_ || $node instanceof Node\Stmt\ClassMethod) {
-            if ($this->hasSql($node)) {
+        if ($n instanceof Node\Stmt\Function_ || $n instanceof Node\Stmt\ClassMethod) {
+            $name = $this->current;
+            if ($this->containsSql($n)) {
                 $this->functions[] = [
                     'file'  => $this->file,
-                    'func'  => $this->currentFunc,
-                    'calls' => array_values(array_unique($node->getAttribute('calls') ?? [])),
+                    'func'  => $name,
+                    'calls' => array_values(array_unique($this->callsMap[$name] ?? [])),
                 ];
             }
-            $this->currentFunc = $node->getAttribute('prevFunc');
+            // スタック戻し
+            $this->current = $n->getAttribute('prev');
         }
     }
 
-    private function hasSql(Node\FunctionLike $func): bool
+    /** NodeFinder で文字列リテラル検索 → SQL キーワード判定 */
+    private function containsSql(Node\FunctionLike $fn): bool
     {
-        $found = false;
+        $finder = new NodeFinder();
+        $strings = $finder->findInstanceOf($fn->getStmts() ?? [], Node\Scalar\String_::class);
+
         $re = '/\b(SELECT|INSERT|UPDATE|DELETE|REPLACE|WITH|MERGE)\b/i';
-        $sub = new NodeTraverser();
-        $sub->addVisitor(new class($found, $re) extends NodeVisitorAbstract {
-            private string $re; private bool $found;
-            public function __construct(bool &$found, string $re) { $this->found = &$found; $this->re = $re; }
-            public function enterNode(Node $n)
-            {
-                if ($n instanceof Node\Scalar\String_ && preg_match($this->re, $n->value)) {
-                    $this->found = true;
-                    return NodeTraverser::STOP_TRAVERSAL;
-                }
+        foreach ($strings as $s) {
+            if (preg_match($re, $s->value)) {
+                return true;
             }
-        });
-        $sub->traverse($func->getStmts() ?? []);
-        return $found;
+        }
+        return false;
     }
 }
 
-/* ---------- 4. 解析実行 ---------- */
-$parser  = (new ParserFactory())->createForNewestSupportedVersion();
-$rii     = new RecursiveIteratorIterator(
-             new RecursiveDirectoryIterator(
-                 $targetDir,
-                 RecursiveDirectoryIterator::SKIP_DOTS | RecursiveDirectoryIterator::FOLLOW_SYMLINKS
-             ));
-$results = [];            // 関数解析結果
-$errors  = [];            // パースエラー結果
+/* ---------- 解析ループ ---------- */
+$parser = (new ParserFactory())->createForNewestSupportedVersion();
+$rii    = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator(
+                $targetDir,
+                RecursiveDirectoryIterator::SKIP_DOTS | RecursiveDirectoryIterator::FOLLOW_SYMLINKS));
+
+$results = [];   // SQL を含む関数
+$errors  = [];   // パース不能ファイル
 
 foreach ($rii as $info) {
     if (!$info->isFile()) continue;
-    $path = $info->getPathname();
-    if (!preg_match('/\.(php|inc)$/i', $path)) continue;
+    if (!preg_match('/\.(php|inc)$/i', $info->getFilename())) continue;
 
-    $code = file_get_contents($path);
+    $code = file_get_contents($info->getPathname());
     if ($code === false) continue;
 
     $clean = PhpCleaner::stripComments(
-                 PhpCleaner::completeStartTag($code)
-             );
+                PhpCleaner::completeStartTag($code));
 
     try {
         $ast = $parser->parse($clean);
     } catch (Error $e) {
-        // ログへ追加して次のファイルへ
-        $errors[] = ['file' => $path, 'msg' => $e->getMessage()];
-        fwrite(STDERR, "[WARN] Parse error in {$path}\n");
+        $errors[] = ['file'=>$info->getPathname(), 'msg'=>$e->getMessage()];
+        fwrite(STDERR, "[WARN] parse error: {$info->getPathname()}\n");
         continue;
     }
 
     $trav = new NodeTraverser();
-    $vis  = new FuncVisitor($path);
+    $vis  = new FuncVisitor($info->getPathname());
     $trav->addVisitor($vis);
     $trav->traverse($ast);
 
     $results = array_merge($results, $vis->functions);
 }
 
-/* ---------- 5. Excel 出力 ---------- */
+/* ---------- Excel 出力 ---------- */
 $book = new Spreadsheet();
 
-/* 5-1. Functions シート */
+/* Functions シート */
 $funcSheet = $book->getActiveSheet();
 $funcSheet->setTitle('Functions with SQL');
 $funcSheet->fromArray(['ファイル名','関数名','呼んでいる関数'], null, 'A1');
@@ -177,21 +168,20 @@ foreach ($results as $row) {
     $funcSheet->setCellValue("C{$r}", implode(', ', $row['calls']));
     ++$r;
 }
-foreach (range('A','C') as $col) $funcSheet->getColumnDimension($col)->setAutoSize(true);
+foreach (range('A','C') as $c) $funcSheet->getColumnDimension($c)->setAutoSize(true);
 
-/* 5-2. Log シート（パースエラー） */
-$logSheet = $book->createSheet();
-$logSheet->setTitle('Log');
-$logSheet->fromArray(['ファイル名','エラーメッセージ'], null, 'A1');
-
+/* Log シート */
+$log = $book->createSheet();
+$log->setTitle('Log');
+$log->fromArray(['ファイル名','エラーメッセージ'], null, 'A1');
 $r = 2;
-foreach ($errors as $err) {
-    $logSheet->setCellValue("A{$r}", $err['file']);
-    $logSheet->setCellValue("B{$r}", $err['msg']);
+foreach ($errors as $e) {
+    $log->setCellValue("A{$r}", $e['file']);
+    $log->setCellValue("B{$r}", $e['msg']);
     ++$r;
 }
-foreach (range('A','B') as $col) $logSheet->getColumnDimension($col)->setAutoSize(true);
+foreach (range('A','B') as $c) $log->getColumnDimension($c)->setAutoSize(true);
 
 /* 保存 */
 (new Xlsx($book))->save($outFile);
-echo "Done! Results: {$outFile}\n";
+echo "Done → {$outFile}\n";
