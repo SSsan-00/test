@@ -1,0 +1,117 @@
+/**
+ * ベースディレクトリ配下の全ファイルを 1 回だけ走査し、
+ * basename をキーにしたインデックスを返す
+ *
+ * 例:  index.php => ['/var/www/app/index.php', '/var/www/tests/index.php']
+ *
+ * @param string $baseDir
+ * @return array<string, string[]>
+ */
+function buildFileIndex(string $baseDir): array {
+    $index = [];
+    $iter  = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($baseDir, RecursiveDirectoryIterator::SKIP_DOTS),
+        RecursiveIteratorIterator::LEAVES_ONLY
+    );
+    foreach ($iter as $file) {
+        if ($file->isFile()) {
+            $base = strtolower($file->getFilename());
+            $index[$base][] = $file->getRealPath();
+        }
+    }
+    return $index;
+}
+
+/**
+ * @param string $url
+ * @param string $baseDir
+ * @param array  $fileIndex buildFileIndex() の結果
+ * @return string 変換後パス群 or 'CHECK!'
+ */
+function resolveTargetFile(string $url, string $baseDir, array $fileIndex): string {
+    /* --- 変更①: キャッシュ --- */
+    static $cache = [];
+    if (isset($cache[$baseDir][$url])) {
+        return $cache[$baseDir][$url];
+    }
+
+    /* --- 変更②: 早期リターン（外部 URL） --- */
+    if (preg_match('#^(https?:)?//#i', $url)) {
+        return $cache[$baseDir][$url] = '';
+    }
+
+    /* 以降は元のロジックを簡略化し、ディレクトリ探索を削除 */
+    $candidatePaths = [];
+
+    // パラメータ・フラグメントを落とした純粋 URL
+    $cleanUrl = preg_replace('/[?#].*$/', '', $url);
+    $fileName = basename($cleanUrl);
+    $fileNameLower = strtolower($fileName);
+
+    // 1. basename マッチ（高速）
+    if (isset($fileIndex[$fileNameLower])) {
+        foreach ($fileIndex[$fileNameLower] as $p) {
+            $candidatePaths[] = $p;
+        }
+    }
+
+    // 2. 現フォルダ相対
+    $localPath = realpath($baseDir . '/' . $cleanUrl);
+    if ($localPath && is_file($localPath)) {
+        $candidatePaths[] = $localPath;
+    }
+
+    // ソート＆重複排除
+    $candidatePaths = array_values(array_unique($candidatePaths));
+
+    if (!$candidatePaths) {
+        return $cache[$baseDir][$url] = 'CHECK!';
+    }
+
+    /* 本家優先度処理を流用し、上位 5 件を返す */
+    $paths = array_map(
+        fn($p) => enhancedRelativePath($p, $baseDir),
+        array_slice($candidatePaths, 0, 5)
+    );
+    return $cache[$baseDir][$url] = implode(', ', $paths);
+}
+
+function generateExcelReport(array $accessPoints,
+                             array $allFiles,
+                             string $outputFile,
+                             string $baseDir,
+                             array $fileIndex) {
+
+    // （中略）
+
+        foreach ($accessPoints as $point) {
+            $url = $point['url'];
+            $srcDir = dirname($baseDir . '/' . $point['file']);
+
+            /* ★ 修正点: 既存キャッシュを利用しつつ高速に解決 */
+            $resolvedFile = resolveTargetFile($url, $srcDir, $fileIndex);
+
+            // （以下元のまま）
+
+// メイン処理 ------------------------
+echo "解析を開始: {$targetDir}\n";
+$targetExtensions = ['php', 'inc', 'html', 'js'];
+
+/* ★ 追加：ファイル名インデックスを先に構築 */
+echo "ファイルインデックスを構築中...\n";
+$fileIndex = buildFileIndex($targetDir);
+
+$files = findFiles($targetDir, $targetExtensions);
+$fileCount = count($files);
+echo "対象ファイル数: {$fileCount}\n";
+
+/* （中略） */
+
+// Excel 出力
+generateExcelReport(
+    $allAccessPoints,
+    $relativeFiles,
+    $outputFile,
+    $targetDir,
+    $fileIndex     // ← 追加
+);
