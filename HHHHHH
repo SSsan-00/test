@@ -1,116 +1,115 @@
 #!/usr/bin/env php
 <?php
 /**
- * Memory-friendly Function Call Finder
+ * Memory-friendly Function Call Finder (PhpSpreadsheet版)
  *
- * - 逐次ストリーム出力（OpenSpout）
- * - ファイル単位で Visitor/AST を即破棄
- * - 約 35 000 PHP ファイルでも Peak ≈ 70 MB
- *
- * requirements: nikic/php-parser ^5, openspout/openspout ^4
+ * requirements:
+ *   composer require nikic/php-parser:^5 phpoffice/phpspreadsheet:^2
  */
 
 declare(strict_types=1);
-ini_set('memory_limit', '512M');          // 上限は保険。70 MB 前後で推移
-
+ini_set('memory_limit', '512M');
 require_once __DIR__ . '/vendor/autoload.php';
 
 use PhpParser\{Node, ParserFactory, NodeTraverser};
 use PhpParser\NodeVisitor\NameResolver;
-use OpenSpout\Writer\Common\Creator\WriterEntityFactory;
-use OpenSpout\Common\Entity\Row;
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+use PhpOffice\PhpSpreadsheet\Settings;
+
+/* ---------- 0. PhpSpreadsheet 設定（最重要） ---------- */
+// 16 MB を超えたセルは一時ファイルに退避
+Settings::setCacheStorageMethod(
+    Settings::CACHE_TO_PHP_TEMP,
+    ['memoryCacheSize' => '16MB']
+);
 
 /* =========================================================
    1. 引数チェック
    ======================================================= */
 if ($argc < 2) {
-    fwrite(STDERR, "Usage: php funcCallFinder-light.php <DIR|FILE> [...] [out.xlsx]\n");
+    fwrite(STDERR, "Usage: php funcCallFinder-writeonly.php <DIR|FILE> [...] [out.xlsx]\n");
     exit(1);
 }
-$paths      = $argv;
-array_shift($paths);                      // スクリプト名を捨てる
-$outFile    = preg_match('/\.xlsx$/', end($paths)) ? array_pop($paths)
-           : 'function_calls_' . date('Ymd_His') . '.xlsx';
+$paths   = $argv;
+array_shift($paths);
+$outFile = preg_match('/\.xlsx$/i', end($paths))
+    ? array_pop($paths)
+    : 'function_calls_' . date('Ymd_His') . '.xlsx';
 
 /* =========================================================
-   2. XLSX ライター（OpenSpout）はストリームで開始
+   2. Write-Only Spreadsheet & ワークシート生成
    ======================================================= */
-$writer = WriterEntityFactory::createXLSXWriter();
-$writer->openToFile($outFile);            // バッファしない
-$writer->addRow(Row::fromValues(['ファイル名', '呼び出し関数', '呼び出し元', '引数', '備考']));
+$spreadsheet = new Spreadsheet(null, true);          // ← write-only mode
+$sheet       = $spreadsheet->getActiveSheet();
+$sheet->fromArray(['ファイル名','呼び出し関数','呼び出し元','引数','備考'], null, 'A1', true);
+$rowNum      = 1;                                    // 見出し行を書いたので 1
 
 /* =========================================================
-   3. コード解析クラス
+   3. 解析用 Visitor
    ======================================================= */
 class FunctionCallVisitor extends \PhpParser\NodeVisitorAbstract
 {
-    private string  $currentFunction = '';
-    private string  $currentFile    = '';
-    private array   $calls          = [];
-    private array   $builtins;
+    private string $currentFunc = '';
+    private string $file;
+    private array  $builtins;
+    private array  $rows = [];
 
     public function __construct(string $file)
     {
-        $this->currentFile = $file;
-        // 内部関数のみで十分（ユーザー定義は走査対象に出る）
+        $this->file     = $file;
         $this->builtins = get_defined_functions()['internal'];
     }
+    public function getRows(): array { return $this->rows; }
 
-    public function getCalls(): array      { return $this->calls; }
-
-    public function enterNode(Node $node)
+    public function enterNode(Node $n)
     {
-        if ($node instanceof Node\Stmt\Function_ ||
-            $node instanceof Node\Stmt\ClassMethod) {
-            $this->currentFunction = $node->name->toString();
-        } elseif ($node instanceof Node\Expr\FuncCall &&
-                  $node->name instanceof Node\Name) {
-            $this->record($node->name->toString(), $node->args);
-        } elseif (($node instanceof Node\Expr\StaticCall ||
-                   $node instanceof Node\Expr\MethodCall) &&
-                  $node->name instanceof Node\Identifier) {
-            $this->record($node->name->toString(), $node->args);
+        if ($n instanceof Node\Stmt\Function_ || $n instanceof Node\Stmt\ClassMethod) {
+            $this->currentFunc = $n->name->toString();
+            return;
         }
-    }
+        $isCall =
+              ($n instanceof Node\Expr\FuncCall    && $n->name   instanceof Node\Name)
+           || ($n instanceof Node\Expr\StaticCall  && $n->name   instanceof Node\Identifier)
+           || ($n instanceof Node\Expr\MethodCall  && $n->name   instanceof Node\Identifier);
 
-    public function leaveNode(Node $node)
-    {
-        if ($node instanceof Node\Stmt\Function_ ||
-            $node instanceof Node\Stmt\ClassMethod) {
-            $this->currentFunction = '';
-        }
-    }
+        if (!$isCall) return;
 
-    private function record(string $name, array $args): void
-    {
-        if (in_array($name, $this->builtins, true)) return;
+        $name = $n->name->toString();
+        if (in_array($name, $this->builtins, true)) return; // 内部関数は対象外
 
-        $isRecursive = $name === $this->currentFunction ? '再帰呼び出し' : '';
-        $this->calls[] = [
-            $this->currentFile,
+        $this->rows[] = [
+            $this->file,
             $this->short($name),
-            $this->currentFunction,
-            $this->argString($args),
-            $isRecursive,
+            $this->currentFunc,
+            $this->argsToString($n->args),
+            $name === $this->currentFunc ? '再帰呼び出し' : '',
         ];
     }
 
-    private function short(string $fqcn): string
+    public function leaveNode(Node $n)
     {
-        return strrpos($fqcn, '\\') !== false ? substr($fqcn, strrpos($fqcn, '\\') + 1) : $fqcn;
+        if ($n instanceof Node\Stmt\Function_ || $n instanceof Node\Stmt\ClassMethod) {
+            $this->currentFunc = '';
+        }
     }
 
-    private function argString(array $args): string
+    /* ---------- helper ---------- */
+    private function short(string $fqcn): string
     {
-        $out = [];
-        foreach ($args as $arg) {
-            $v = $arg->value;
-            $out[] = match (true) {
-                $v instanceof Node\Scalar\String_  => '"' . $v->value . '"',
-                $v instanceof Node\Scalar\LNumber  => (string)$v->value,
-                $v instanceof Node\Expr\Variable   => '$' . $v->name,
-                $v instanceof Node\Expr\Array_     => '[...]',
-                default                            => '...',
+        return strrpos($fqcn, '\\') !== false ? substr($fqcn, strrpos($fqcn,'\\')+1) : $fqcn;
+    }
+    private function argsToString(array $args): string
+    {
+        $out=[];
+        foreach ($args as $a) {
+            $v=$a->value;
+            $out[] = match(true){
+                $v instanceof Node\Scalar\String_ => '"'.$v->value.'"',
+                $v instanceof Node\Scalar\LNumber => (string)$v->value,
+                $v instanceof Node\Expr\Variable => '$'.$v->name,
+                $v instanceof Node\Expr\Array_   => '[...]',
+                default                          => '...',
             };
         }
         return implode(', ', $out);
@@ -118,66 +117,67 @@ class FunctionCallVisitor extends \PhpParser\NodeVisitorAbstract
 }
 
 /* =========================================================
-   4. 解析＆直書き出し
+   4. 解析本体
    ======================================================= */
 $parserFactory = new ParserFactory();
 
 foreach ($paths as $inPath) {
-
     $files = [];
+
     if (is_dir($inPath)) {
         $iter = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($inPath));
-        foreach ($iter as $fileInfo) {
-            if ($fileInfo->isFile() &&
-                in_array(strtolower($fileInfo->getExtension()), ['php', 'inc', 'html', 'js'], true)) {
-                $files[] = $fileInfo->getPathname();
+        foreach ($iter as $f) {
+            if ($f->isFile()
+                && in_array(strtolower($f->getExtension()), ['php','inc','html','js'], true)) {
+                $files[] = $f->getPathname();
             }
         }
     } elseif (is_file($inPath)) {
         $files[] = $inPath;
     } else {
-        fwrite(STDERR, "warning: path not found → {$inPath}\n");
+        fwrite(STDERR, "warning: {$inPath} not found\n");
         continue;
     }
 
+    /* ---- 個々のファイルを処理 ---- */
     foreach ($files as $file) {
-        // ------------- 4-A. コード読み込み（short open tag を補正） -------------
         $code = preg_replace('/<\?(?!php|=)/', '<?php ', file_get_contents($file));
 
-        // ------------- 4-B. パース（ファイル単位で Parser/Visitor を作成） ----
-        $parser     = $parserFactory->createForNewestSupportedVersion();
-        $visitor    = new FunctionCallVisitor($file);
+        $parser  = $parserFactory->createForNewestSupportedVersion();
+        $visitor = new FunctionCallVisitor($file);
 
         try {
             $ast = $parser->parse($code);
             if ($ast === null) continue;
 
-            $traverser = new NodeTraverser();
-            $traverser->addVisitor(new NameResolver());
-            // コメントと位置情報は削除してメモリ節約
-            $traverser->addVisitor(new class extends \PhpParser\NodeVisitorAbstract {
-                public function leaveNode(Node $n){ $n->setAttribute('comments', []); }
+            $tr = new NodeTraverser();
+            $tr->addVisitor(new NameResolver());
+            // コメントを捨てる
+            $tr->addVisitor(new class extends \PhpParser\NodeVisitorAbstract{
+                public function leaveNode(Node $n){ $n->setAttribute('comments',[]); }
             });
-            $traverser->addVisitor($visitor);
-            $traverser->traverse($ast);
+            $tr->addVisitor($visitor);
+            $tr->traverse($ast);
 
-            // ------------- 4-C. すぐ書き出し -------------
-            foreach ($visitor->getCalls() as $row) {
-                $writer->addRow(Row::fromValues($row));
+            /* ---- 見つけた行を即シートへ ---- */
+            foreach ($visitor->getRows() as $r) {
+                $sheet->fromArray($r, null, 'A' . ++$rowNum, true);
             }
 
         } catch (\PhpParser\Error $e) {
             fwrite(STDERR, "parse error in {$file}: {$e->getMessage()}\n");
         }
 
-        // ------------- 4-D. 明示的にメモリを解放 -------------
         unset($ast, $parser, $visitor, $code);
-        gc_collect_cycles();               // 大量ファイル時のメモリ返却を促進
+        gc_collect_cycles();
     }
 }
 
 /* =========================================================
-   5. 終了処理
+   5. 保存
    ======================================================= */
-$writer->close();
+$writer = new Xlsx($spreadsheet);
+$writer->setPreCalculateFormulas(false);      // 速度 & メモリ節約
+$writer->save($outFile);
+
 echo "解析完了 → {$outFile}\n";
