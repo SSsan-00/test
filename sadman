@@ -1,0 +1,816 @@
+<?php
+/**
+ * AccessFinder - 外部アクセス解析ツール
+ * 
+ * 解析対象のフォルダ内のphp, inc, html, jsファイルを再帰的に解析し、
+ * 外部アクセスしている箇所を検出してExcelに出力します。
+ */
+
+// エラー表示
+error_reporting(E_ALL);
+ini_set('display_errors', 1);
+// メモリ制限を緩和（大量のファイルを処理する場合）
+ini_set('memory_limit', '512M');
+
+// 必要なライブラリをインポート
+require 'vendor/autoload.php';
+
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+use PhpOffice\PhpSpreadsheet\Style\Fill;
+use PhpOffice\PhpSpreadsheet\Style\Border;
+use PhpOffice\PhpSpreadsheet\Style\Alignment;
+
+// メイン処理クラス
+class AccessFinder {
+    private $targetDir;
+    private $fileExtensions = ['php', 'inc', 'html', 'js'];
+    private $accessResults = [];
+    private $urlList = [];
+    private $variables = [];
+    private $fileCount = 0;
+    private $analyzedFiles = [];
+    private $documentRoot;
+    
+    /**
+     * コンストラクタ
+     * 
+     * @param string $targetDir 解析対象ディレクトリパス
+     */
+    public function __construct($targetDir) {
+        $this->targetDir = rtrim($targetDir, '/');
+        
+        // 対象ディレクトリの存在確認
+        if (!is_dir($this->targetDir)) {
+            die("エラー: 指定されたディレクトリが存在しません: {$this->targetDir}\n");
+        }
+
+        // ドキュメントルートの設定
+        $this->documentRoot = $this->targetDir;
+    }
+    
+    /**
+     * 解析を実行
+     */
+    public function analyze() {
+        echo "解析開始: {$this->targetDir}\n";
+        
+        // ファイルを再帰的に検索して解析
+        $this->scanDirectory($this->targetDir);
+        
+        echo "合計 {$this->fileCount} ファイルを解析しました\n";
+        
+        // 結果をエクセルに出力
+        $this->exportToExcel();
+        
+        echo "解析完了\n";
+    }
+    
+    /**
+     * ディレクトリを再帰的にスキャンし、対象ファイルを解析
+     * 
+     * @param string $dir スキャン対象ディレクトリ
+     */
+    private function scanDirectory($dir) {
+        $files = scandir($dir);
+        
+        foreach ($files as $file) {
+            if ($file === '.' || $file === '..') {
+                continue;
+            }
+            
+            $path = $dir . '/' . $file;
+            
+            if (is_dir($path)) {
+                // サブディレクトリを再帰的にスキャン
+                $this->scanDirectory($path);
+            } else {
+                // ファイル拡張子をチェック
+                $extension = pathinfo($path, PATHINFO_EXTENSION);
+                if (in_array(strtolower($extension), $this->fileExtensions)) {
+                    // 対象ファイルを解析
+                    $this->analyzeFile($path);
+                    $this->fileCount++;
+                }
+            }
+        }
+    }
+    
+    /**
+     * ファイルを解析して外部アクセスを検出
+     * 
+     * @param string $filePath 解析対象ファイルパス
+     */
+    private function analyzeFile($filePath) {
+        $relativePath = $this->getRelativePath($filePath);
+        echo "ファイル解析中: " . $relativePath . "\n";
+        
+        // 既に解析済みのファイルは再解析しない
+        if (in_array($filePath, $this->analyzedFiles)) {
+            return;
+        }
+        
+        $this->analyzedFiles[] = $filePath;
+        
+        // ファイル内容を読み込み
+        $content = file_get_contents($filePath);
+        
+        // PHPの開始タグが省略されている場合、補完
+        if (!preg_match('/^<\?php/i', $content) && pathinfo($filePath, PATHINFO_EXTENSION) === 'php') {
+            $content = '<?php ' . $content;
+        }
+        
+        // コメントを除去
+        $content = $this->removeComments($content);
+        
+        // PHPの変数を抽出
+        $this->extractVariables($content, $filePath);
+        
+        // 各種外部アクセスパターンを検索
+        $this->findFormActions($content, $filePath);
+        $this->findAnchorHrefs($content, $filePath);
+        $this->findIframeSrcs($content, $filePath);
+        $this->findDocumentActions($content, $filePath);
+        $this->findXmlHttpRequests($content, $filePath);
+        $this->findWindowOpen($content, $filePath);
+        $this->findWindowLocation($content, $filePath);
+        $this->findHttpHeaders($content, $filePath);
+        $this->findLinkSrcs($content, $filePath);
+        $this->findScriptSrcs($content, $filePath);
+        
+        // メモリ解放
+        unset($content);
+    }
+    
+    /**
+     * PHPの変数定義を抽出
+     * 
+     * @param string $content ファイル内容
+     * @param string $filePath ファイルパス
+     */
+    private function extractVariables($content, $filePath) {
+        // 変数の定義を検索 (シングルクォート)
+        if (preg_match_all('/\$([a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*)\s*=\s*\'([^\']*)\'(?:\s*;)?/i', $content, $matches)) {
+            for ($i = 0; $i < count($matches[0]); $i++) {
+                $varName = $matches[1][$i];
+                $varValue = $matches[2][$i];
+                
+                // ファイルごとに変数を保存
+                $this->variables[$filePath][$varName] = $varValue;
+            }
+        }
+        
+        // 変数の定義を検索 (ダブルクォート)
+        if (preg_match_all('/\$([a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*)\s*=\s*"([^"]*)"(?:\s*;)?/i', $content, $matches)) {
+            for ($i = 0; $i < count($matches[0]); $i++) {
+                $varName = $matches[1][$i];
+                $varValue = $matches[2][$i];
+                
+                // ファイルごとに変数を保存
+                $this->variables[$filePath][$varName] = $varValue;
+            }
+        }
+    }
+    
+    /**
+     * コメントを除去
+     * 
+     * @param string $content ファイル内容
+     * @return string コメントを除去した内容
+     */
+    private function removeComments($content) {
+        // HTMLコメント除去
+        $content = preg_replace('/<!--.*?-->/s', '', $content);
+        
+        // PHPコメント除去
+        $content = preg_replace('!/\*.*?\*/!s', '', $content);
+        $content = preg_replace('!//.*?$!m', '', $content);
+        $content = preg_replace('/#.*?$/m', '', $content);
+        
+        // JavaScriptコメント除去
+        $content = preg_replace('!/\*.*?\*/!s', '', $content);
+        $content = preg_replace('!//.*?$!m', '', $content);
+        
+        return $content;
+    }
+    
+    /**
+     * フォームアクションを検索
+     */
+    private function findFormActions($content, $filePath) {
+        if (preg_match_all('/<form[^>]*action=["\'](.*?)["\'][^>]*>/i', $content, $matches)) {
+            foreach ($matches[1] as $url) {
+                $resolvedUrl = $this->resolveVariableInUrl($url, $filePath);
+                $resolvedUrl = $this->resolveUrl($resolvedUrl, $filePath);
+                $this->addResult($filePath, 'action', $url, $resolvedUrl);
+            }
+        }
+    }
+    
+    /**
+     * アンカータグのhrefを検索
+     */
+    private function findAnchorHrefs($content, $filePath) {
+        if (preg_match_all('/<a[^>]*href=["\'](.*?)["\'][^>]*>/i', $content, $matches)) {
+            foreach ($matches[1] as $url) {
+                $resolvedUrl = $this->resolveVariableInUrl($url, $filePath);
+                $resolvedUrl = $this->resolveUrl($resolvedUrl, $filePath);
+                $this->addResult($filePath, 'href', $url, $resolvedUrl);
+            }
+        }
+    }
+    
+    /**
+     * iframeのsrcを検索
+     */
+    private function findIframeSrcs($content, $filePath) {
+        if (preg_match_all('/<iframe[^>]*src=["\'](.*?)["\'][^>]*>/i', $content, $matches)) {
+            foreach ($matches[1] as $url) {
+                $resolvedUrl = $this->resolveVariableInUrl($url, $filePath);
+                $resolvedUrl = $this->resolveUrl($resolvedUrl, $filePath);
+                $this->addResult($filePath, 'iframe', $url, $resolvedUrl);
+            }
+        }
+    }
+    
+    /**
+     * document.*.actionを検索
+     */
+    private function findDocumentActions($content, $filePath) {
+        if (preg_match_all('/document\.([\w]+)\.action\s*=\s*["\']([^"\']+)["\']/i', $content, $matches)) {
+            for ($i = 0; $i < count($matches[0]); $i++) {
+                $element = $matches[1][$i];
+                $url = $matches[2][$i];
+                $resolvedUrl = $this->resolveVariableInUrl($url, $filePath);
+                $resolvedUrl = $this->resolveUrl($resolvedUrl, $filePath);
+                $this->addResult($filePath, 'action', $url, $resolvedUrl);
+            }
+        }
+    }
+    
+    /**
+     * XMLHttpRequestを検索
+     */
+    private function findXmlHttpRequests($content, $filePath) {
+        // XMLHttpRequestのopenメソッドを検索（より正確なパターン）
+        if (preg_match_all('/(\w+)\.open\s*\(\s*["\'](?:GET|POST|PUT|DELETE)["\']\s*,\s*["\']([^"\']+)["\']/i', $content, $matches)) {
+            for ($i = 0; $i < count($matches[0]); $i++) {
+                $url = $matches[2][$i];
+                $resolvedUrl = $this->resolveVariableInUrl($url, $filePath);
+                $resolvedUrl = $this->resolveUrl($resolvedUrl, $filePath);
+                $this->addResult($filePath, 'XMLHttpRequest', $url, $resolvedUrl);
+            }
+        }
+        
+        // 変数を使用したXMLHttpRequestの呼び出しを検索
+        if (preg_match_all('/(\w+)\.open\s*\(\s*["\'](?:GET|POST|PUT|DELETE)["\']\s*,\s*([^,\)]+)/i', $content, $matches)) {
+            for ($i = 0; $i < count($matches[0]); $i++) {
+                $urlExpr = $matches[2][$i];
+                // 変数や式を含む可能性がある場合
+                if (strpos($urlExpr, '$') !== false || strpos($urlExpr, '+') !== false) {
+                    $resolvedUrl = $this->resolveVariableInUrl($urlExpr, $filePath);
+                    $resolvedUrl = $this->resolveUrl($resolvedUrl, $filePath);
+                    $this->addResult($filePath, 'XMLHttpRequest', $urlExpr, $resolvedUrl);
+                }
+            }
+        }
+    }
+    
+    /**
+     * window.openを検索
+     */
+    private function findWindowOpen($content, $filePath) {
+        // window.openの呼び出しを検索（より正確なパターン）
+        if (preg_match_all('/window\.open\s*\(\s*["\']([^"\']+)["\'](?:\s*,\s*["\'][^"\']*["\'])?(?:\s*,\s*["\'][^"\']*["\'])?\s*\)/i', $content, $matches)) {
+            foreach ($matches[1] as $url) {
+                $resolvedUrl = $this->resolveVariableInUrl($url, $filePath);
+                $resolvedUrl = $this->resolveUrl($resolvedUrl, $filePath);
+                $this->addResult($filePath, 'window.open', $url, $resolvedUrl);
+            }
+        }
+        
+        // 変数を使用したwindow.openの呼び出しを検索
+        if (preg_match_all('/window\.open\s*\(\s*([^,\)]+)(?:\s*,\s*[^,\)]+)?(?:\s*,\s*[^,\)]+)?\s*\)/i', $content, $matches)) {
+            foreach ($matches[1] as $urlExpr) {
+                // 変数や式を含む可能性がある場合
+                if (strpos($urlExpr, '$') !== false || strpos($urlExpr, '+') !== false) {
+                    $resolvedUrl = $this->resolveVariableInUrl($urlExpr, $filePath);
+                    $resolvedUrl = $this->resolveUrl($resolvedUrl, $filePath);
+                    $this->addResult($filePath, 'window.open', $urlExpr, $resolvedUrl);
+                }
+            }
+        }
+    }
+    
+    /**
+     * window.locationを検索
+     */
+    private function findWindowLocation($content, $filePath) {
+        if (preg_match_all('/window\.location(?:\.href)?\s*=\s*["\']([^"\']+)["\']/i', $content, $matches)) {
+            foreach ($matches[1] as $url) {
+                $resolvedUrl = $this->resolveVariableInUrl($url, $filePath);
+                $resolvedUrl = $this->resolveUrl($resolvedUrl, $filePath);
+                $this->addResult($filePath, 'window.location', $url, $resolvedUrl);
+            }
+        }
+    }
+    
+    /**
+     * HTTPヘッダーLocationを検索
+     */
+    private function findHttpHeaders($content, $filePath) {
+        if (preg_match_all('/header\s*\(\s*["\']Location:\s*([^"\']+)["\']/i', $content, $matches)) {
+            foreach ($matches[1] as $url) {
+                $resolvedUrl = $this->resolveVariableInUrl($url, $filePath);
+                $resolvedUrl = $this->resolveUrl($resolvedUrl, $filePath);
+                $this->addResult($filePath, 'header', $url, $resolvedUrl);
+            }
+        }
+    }
+    
+    /**
+     * linkタグのsrcを検索
+     */
+    private function findLinkSrcs($content, $filePath) {
+        if (preg_match_all('/<link[^>]*href=["\'](.*?)["\'][^>]*>/i', $content, $matches)) {
+            foreach ($matches[1] as $url) {
+                $resolvedUrl = $this->resolveVariableInUrl($url, $filePath);
+                $resolvedUrl = $this->resolveUrl($resolvedUrl, $filePath);
+                $this->addResult($filePath, 'link', $url, $resolvedUrl);
+            }
+        }
+    }
+    
+    /**
+     * scriptタグのsrcを検索
+     */
+    private function findScriptSrcs($content, $filePath) {
+        if (preg_match_all('/<script[^>]*src=["\'](.*?)["\'][^>]*>/i', $content, $matches)) {
+            foreach ($matches[1] as $url) {
+                $resolvedUrl = $this->resolveVariableInUrl($url, $filePath);
+                $resolvedUrl = $this->resolveUrl($resolvedUrl, $filePath);
+                $this->addResult($filePath, 'script', $url, $resolvedUrl);
+            }
+        }
+    }
+    
+    /**
+     * URLに含まれるPHP変数を解決
+     * 
+     * @param string $url URL文字列
+     * @param string $filePath 現在のファイルパス
+     * @return string 変数を解決したURL
+     */
+    private function resolveVariableInUrl($url, $filePath) {
+        $resolvedUrl = $url;
+        
+        // PHPの変数埋め込み構文を検出
+        if (preg_match_all('/\<\?=\s*\$([a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*)\s*\?>/i', $url, $matches)) {
+            for ($i = 0; $i < count($matches[0]); $i++) {
+                $fullMatch = $matches[0][$i];
+                $varName = $matches[1][$i];
+                
+                // ファイル内で定義された変数を探す
+                if (isset($this->variables[$filePath][$varName])) {
+                    $varValue = $this->variables[$filePath][$varName];
+                    $resolvedUrl = str_replace($fullMatch, $varValue, $resolvedUrl);
+                }
+            }
+        }
+        
+        // 単純な変数参照を検出 ($varの形式)
+        if (preg_match_all('/\$([a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*)/i', $url, $matches)) {
+            for ($i = 0; $i < count($matches[0]); $i++) {
+                $fullMatch = $matches[0][$i];
+                $varName = $matches[1][$i];
+                
+                // ファイル内で定義された変数を探す
+                if (isset($this->variables[$filePath][$varName])) {
+                    $varValue = $this->variables[$filePath][$varName];
+                    $resolvedUrl = str_replace($fullMatch, $varValue, $resolvedUrl);
+                }
+            }
+        }
+        
+        // 変数解決後のURLに対して相対パスの解決とクエリパラメータの除去を行う
+        if ($resolvedUrl !== $url) {
+            // クエリパラメータとフラグメントを分離
+            $urlParts = explode('#', $resolvedUrl);
+            $urlWithoutFragment = $urlParts[0];
+            
+            $urlParts = explode('?', $urlWithoutFragment);
+            $basePath = $urlParts[0];
+            
+            // 相対パスの解決
+            if (strpos($basePath, '/') !== 0 && !preg_match('/^(https?:\/\/|\/\/|mailto:|tel:)/i', $basePath)) {
+                $currentDir = dirname($filePath);
+                $resolvedPath = $this->resolveRelativePath($basePath, $currentDir);
+                $resolvedUrl = $resolvedPath;
+            }
+        }
+        
+        return $resolvedUrl;
+    }
+    
+    /**
+     * 相対パスを解決
+     * 
+     * @param string $path 対象パス
+     * @param string $currentDir 現在のディレクトリ
+     * @return string 解決後のパス
+     */
+    private function resolveRelativePath($path, $currentDir) {
+        // パスの正規化
+        $path = str_replace('\\', '/', $path);
+        $currentDir = str_replace('\\', '/', $currentDir);
+        
+        // ./で始まるパスを正規化
+        $path = preg_replace('/^\.\//', '', $path);
+        
+        // パスを分解
+        $parts = explode('/', $path);
+        $resolvedParts = [];
+        
+        // 現在のディレクトリの深さを計算
+        $currentDepth = substr_count($currentDir, '/');
+        
+        foreach ($parts as $part) {
+            if ($part === '..') {
+                // 親ディレクトリに移動
+                if (!empty($resolvedParts)) {
+                    array_pop($resolvedParts);
+                }
+            } elseif ($part === '.' || $part === '') {
+                // 現在のディレクトリまたは空の部分は無視
+                continue;
+            } else {
+                $resolvedParts[] = $part;
+            }
+        }
+        
+        // 解決後のパスを構築
+        $resolvedPath = implode('/', $resolvedParts);
+        
+        // 同じファイル名が複数の場所に存在する可能性を考慮
+        if ($this->isDuplicateFileName($resolvedPath)) {
+            // ファイルの実際の場所を特定
+            $actualPath = $this->findActualFilePath($resolvedPath);
+            if ($actualPath !== null) {
+                return $actualPath;
+            }
+        }
+        
+        // パスがtargetDir内にあるか確認
+        $fullPath = $currentDir . '/' . $resolvedPath;
+        if (strpos($fullPath, $this->targetDir) === 0) {
+            return $this->getRelativePath($fullPath);
+        }
+        
+        return $resolvedPath;
+    }
+    
+    /**
+     * URLを解決し、相対パスの場合は実際のファイルパスに変換
+     * 
+     * @param string $url 解決対象URL
+     * @param string $currentFilePath 現在のファイルパス
+     * @return string 解決後のURL
+     */
+    private function resolveUrl($url, $currentFilePath) {
+        // クエリパラメータとフラグメントを分離
+        $urlParts = explode('#', $url);
+        $urlWithoutFragment = $urlParts[0];
+        
+        $urlParts = explode('?', $urlWithoutFragment);
+        $basePath = $urlParts[0];
+        
+        // 文字列連結の可能性がある場合、最後の部分のみを抽出
+        if (preg_match('/["\']([^"\']+\.(?:php|html|js|css|inc))["\']/', $basePath, $matches)) {
+            $basePath = $matches[1];
+        }
+        
+        // 絶対URLや外部URLの場合はそのまま返す
+        if (preg_match('/^(https?:\/\/|\/\/|mailto:|tel:)/i', $basePath)) {
+            return $url;
+        }
+        
+        // PHPの変数が含まれている場合
+        if (strpos($basePath, '<?') !== false || strpos($basePath, '${') !== false || strpos($basePath, '$') !== false) {
+            return $url . " (変数を含むため解決できません)";
+        }
+        
+        // アンカーリンクのみの場合はそのまま返す
+        if (strpos($basePath, '#') === 0) {
+            return $url;
+        }
+        
+        // 現在のファイルのディレクトリを取得
+        $currentDir = dirname($currentFilePath);
+        
+        // パスの種類に応じて解決
+        if (strpos($basePath, '/') === 0) {
+            // ドキュメントルートからの絶対パス
+            $targetPath = $this->documentRoot . $basePath;
+            
+            // ファイルが存在しない場合、相対パスとしても試す
+            if (!file_exists($targetPath)) {
+                $relativePath = $currentDir . $basePath;
+                if (file_exists($relativePath)) {
+                    return $this->getRelativePath($relativePath);
+                }
+            }
+        } else {
+            // 相対パスの解決
+            $resolvedPath = $this->resolveRelativePath($basePath, $currentDir);
+            $targetPath = $currentDir . '/' . $resolvedPath;
+            
+            // ファイルが存在しない場合、親ディレクトリを遡って試す
+            if (!file_exists($targetPath)) {
+                $parentDir = dirname($currentDir);
+                while ($parentDir !== $this->targetDir && $parentDir !== dirname($parentDir)) {
+                    $testPath = $parentDir . '/' . $resolvedPath;
+                    if (file_exists($testPath)) {
+                        return $this->getRelativePath($testPath);
+                    }
+                    $parentDir = dirname($parentDir);
+                }
+            }
+        }
+        
+        // ファイルが存在するか確認
+        if (file_exists($targetPath)) {
+            $resolvedPath = $this->getRelativePath($targetPath);
+            
+            // 解決後のURLに../が残っている場合は再度解決を試みる
+            if (strpos($resolvedPath, '../') !== false) {
+                $resolvedPath = $this->resolveRelativePath($resolvedPath, $this->targetDir);
+            }
+            
+            return $resolvedPath;
+        } else {
+            // 拡張子がない場合、対象拡張子を試す
+            if (!pathinfo($basePath, PATHINFO_EXTENSION)) {
+                foreach ($this->fileExtensions as $ext) {
+                    $testPath = $targetPath . '.' . $ext;
+                    if (file_exists($testPath)) {
+                        $resolvedPath = $this->getRelativePath($testPath);
+                        
+                        // 解決後のURLに../が残っている場合は再度解決を試みる
+                        if (strpos($resolvedPath, '../') !== false) {
+                            $resolvedPath = $this->resolveRelativePath($resolvedPath, $this->targetDir);
+                        }
+                        
+                        return $resolvedPath;
+                    }
+                }
+            }
+            
+            // 対応するファイルが見つからなかった場合
+            return $url . " (ファイルが見つかりません)";
+        }
+    }
+    
+    /**
+     * 外部URLかどうかを判定
+     * 
+     * @param string $url URL
+     * @return bool 外部URLならtrue
+     */
+    private function isExternalUrl($url) {
+        return preg_match('/^(https?:\/\/|\/\/|mailto:|tel:)/i', $url) === 1;
+    }
+    
+    /**
+     * URLからmodeパラメータを抽出
+     * 
+     * @param string $url URL
+     * @return string modeパラメータ値
+     */
+    private function extractModeParam($url) {
+        // 文字列連結の可能性がある場合、最後の部分のみを抽出
+        if (preg_match('/["\']([^"\']+\.(?:php|html|js|css|inc))["\'](?:\s*\+\s*["\']\?mode=([^"\']+)["\'])?/i', $url, $matches)) {
+            if (isset($matches[2])) {
+                return $matches[2];
+            }
+        }
+        
+        // 通常のクエリパラメータ形式を検出
+        if (preg_match('/[?&]mode=([^&#]+)/', $url, $matches)) {
+            return $matches[1];
+        }
+        
+        // 文字列連結で構築されたURLを検出
+        if (preg_match('/["\']([^"\']+)["\']\s*\+\s*["\']\?mode=([^"\']+)["\']/i', $url, $matches)) {
+            return $matches[2];
+        }
+        
+        // 変数を使用した文字列連結を検出
+        if (preg_match('/\$\w+\s*\+\s*["\']\?mode=([^"\']+)["\']/i', $url, $matches)) {
+            return $matches[1];
+        }
+        
+        return '';
+    }
+    
+    /**
+     * 解析対象ディレクトリからの相対パスを取得
+     * 
+     * @param string $path 対象パス
+     * @return string 相対パス
+     */
+    private function getRelativePath($path) {
+        // パスの正規化
+        $path = str_replace('\\', '/', $path);
+        $targetDir = str_replace('\\', '/', $this->targetDir);
+        
+        // パスがtargetDir内にあるか確認
+        if (strpos($path, $targetDir) === 0) {
+            $relativePath = substr($path, strlen($targetDir) + 1);
+            
+            // パスを正規化（余分な/を除去）
+            $parts = array_filter(explode('/', $relativePath), function($part) {
+                return $part !== '';
+            });
+            
+            return implode('/', $parts);
+        }
+        
+        // パスがtargetDir外の場合、相対パスとして解決
+        return $this->resolveRelativePath($path, $targetDir);
+    }
+    
+    /**
+     * 解析結果を追加
+     * 
+     * @param string $filePath ファイルパス
+     * @param string $type アクセスタイプ
+     * @param string $url 元のURL
+     * @param string $resolvedUrl 解決後のURL
+     */
+    private function addResult($filePath, $type, $url, $resolvedUrl) {
+        $relativePath = $this->getRelativePath($filePath);
+        
+        // 解決後のURLに../が残っている場合は再度解決を試みる
+        if (strpos($resolvedUrl, '../') !== false) {
+            $resolvedUrl = $this->resolveRelativePath($resolvedUrl, $this->targetDir);
+        }
+        
+        // クエリパラメータとフラグメントを除去
+        $urlParts = explode('#', $resolvedUrl);
+        $urlWithoutFragment = $urlParts[0];
+        $urlParts = explode('?', $urlWithoutFragment);
+        $resolvedUrl = $urlParts[0];
+        
+        $this->accessResults[] = [
+            'filePath' => $relativePath,
+            'type' => $type,
+            'url' => $url,
+            'resolvedUrl' => $resolvedUrl,
+            'modeParam' => $this->extractModeParam($url)
+        ];
+        
+        // URLリストにも追加（解決したURLが外部リンクでない場合）
+        if (!$this->isExternalUrl($resolvedUrl)) {
+            $this->urlList[$resolvedUrl] = [
+                'url' => $resolvedUrl,
+                'source' => $relativePath,
+                'type' => $type
+            ];
+        }
+    }
+    
+    /**
+     * 結果をエクセルに出力
+     */
+    private function exportToExcel() {
+        $spreadsheet = new Spreadsheet();
+        
+        // 外部アクセス解析結果シート
+        $accessSheet = $spreadsheet->getActiveSheet();
+        $accessSheet->setTitle('外部アクセス解析');
+        
+        // ヘッダー行のスタイル設定
+        $headerStyle = [
+            'font' => [
+                'bold' => true,
+                'color' => ['rgb' => 'FFFFFF'],
+            ],
+            'fill' => [
+                'fillType' => Fill::FILL_SOLID,
+                'startColor' => ['rgb' => '4472C4'],
+            ],
+            'borders' => [
+                'allBorders' => [
+                    'borderStyle' => Border::BORDER_THIN,
+                ],
+            ],
+            'alignment' => [
+                'horizontal' => Alignment::HORIZONTAL_CENTER,
+            ],
+        ];
+        
+        // ヘッダー行
+        $accessSheet->setCellValue('A1', 'ファイルパス');
+        $accessSheet->setCellValue('B1', 'タイプ');
+        $accessSheet->setCellValue('C1', '元URL');
+        $accessSheet->setCellValue('D1', '解決後URL');
+        $accessSheet->setCellValue('E1', 'modeパラメータ');
+        
+        $accessSheet->getStyle('A1:E1')->applyFromArray($headerStyle);
+        
+        // カラム幅の設定
+        $accessSheet->getColumnDimension('A')->setWidth(30);
+        $accessSheet->getColumnDimension('B')->setWidth(15);
+        $accessSheet->getColumnDimension('C')->setWidth(40);
+        $accessSheet->getColumnDimension('D')->setWidth(40);
+        $accessSheet->getColumnDimension('E')->setWidth(15);
+        
+        // データ行
+        $row = 2;
+        foreach ($this->accessResults as $result) {
+            $accessSheet->setCellValue('A' . $row, $result['filePath']);
+            $accessSheet->setCellValue('B' . $row, $result['type']);
+            $accessSheet->setCellValue('C' . $row, $result['url']);
+            $accessSheet->setCellValue('D' . $row, $result['resolvedUrl']);
+            $accessSheet->setCellValue('E' . $row, $result['modeParam']);
+            
+            $row++;
+        }
+        
+        // エクセルファイルを保存
+        $outputFile = 'access_analysis_' . date('Y-m-d_H-i-s') . '.xlsx';
+        $writer = new Xlsx($spreadsheet);
+        $writer->save($outputFile);
+        
+        echo "結果をエクセルファイルに出力しました: {$outputFile}\n";
+    }
+
+    /**
+     * 同じファイル名が複数の場所に存在するか確認
+     * 
+     * @param string $path 対象パス
+     * @return bool 重複がある場合はtrue
+     */
+    private function isDuplicateFileName($path) {
+        $fileName = basename($path);
+        $count = 0;
+        
+        $iterator = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($this->targetDir)
+        );
+        
+        foreach ($iterator as $file) {
+            if ($file->isFile() && $file->getFilename() === $fileName) {
+                $count++;
+                if ($count > 1) {
+                    return true;
+                }
+            }
+        }
+        
+        return false;
+    }
+    
+    /**
+     * ファイルの実際の場所を特定
+     * 
+     * @param string $path 対象パス
+     * @return string|null 実際のファイルパス、見つからない場合はnull
+     */
+    private function findActualFilePath($path) {
+        $fileName = basename($path);
+        $possiblePaths = [];
+        
+        $iterator = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($this->targetDir)
+        );
+        
+        foreach ($iterator as $file) {
+            if ($file->isFile() && $file->getFilename() === $fileName) {
+                $relativePath = $this->getRelativePath($file->getPathname());
+                $possiblePaths[] = $relativePath;
+            }
+        }
+        
+        // 最も短いパスを選択（通常、最も直接的なパス）
+        if (!empty($possiblePaths)) {
+            usort($possiblePaths, function($a, $b) {
+                return substr_count($a, '/') - substr_count($b, '/');
+            });
+            return $possiblePaths[0];
+        }
+        
+        return null;
+    }
+}
+
+// コマンドライン引数を処理
+if ($argc < 2) {
+    echo "使用方法: php accessFinder.php <解析対象ディレクトリパス>\n";
+    exit(1);
+}
+
+$targetDir = $argv[1];
+$finder = new AccessFinder($targetDir);
+$finder->analyze();
+
