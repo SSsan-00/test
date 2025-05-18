@@ -1,0 +1,478 @@
+<?php
+
+ini_set('memory_limit', '256M');
+
+require_once __DIR__ . '/vendor/autoload.php';
+
+use PhpParser\Node;
+use PhpParser\NodeFinder;
+use PhpParser\ParserFactory;
+use PhpParser\NodeTraverser;
+use PhpParser\NodeVisitor\NameResolver;
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+use PhpOffice\PhpSpreadsheet\Style\Alignment;
+
+// 進捗表示用クラス
+class ProgressBar {
+    private $total;
+    private $current = 0;
+    private $lastPercentage = 0;
+    private $startTime;
+    private $barWidth = 50;
+
+    public function __construct($total) {
+        $this->total = $total;
+        $this->startTime = microtime(true);
+    }
+
+    public function update($current = null) {
+        if ($current !== null) {
+            $this->current = $current;
+        } else {
+            $this->current++;
+        }
+
+        $percentage = min(100, floor(($this->current / $this->total) * 100));
+        
+        // 前回と同じパーセンテージなら更新しない（出力を減らす）
+        if ($percentage == $this->lastPercentage && $percentage != 100) {
+            return;
+        }
+        
+        $this->lastPercentage = $percentage;
+        
+        // 経過時間と推定残り時間を計算
+        $elapsed = microtime(true) - $this->startTime;
+        $estimatedTotal = $this->current > 0 ? $elapsed * $this->total / $this->current : 0;
+        $remaining = $estimatedTotal - $elapsed;
+        
+        // プログレスバーを構築
+        $done = floor($this->barWidth * ($percentage / 100));
+        $todo = $this->barWidth - $done;
+        $bar = str_repeat("=", $done) . ">" . str_repeat(" ", $todo);
+        
+        // 時間表示を整形
+        $elapsedFormatted = $this->formatTime($elapsed);
+        $remainingFormatted = $this->formatTime($remaining);
+        
+        // 進捗バーを出力
+        printf("\r[%s] %3d%% (%d/%d) 経過: %s 残り: %s ", 
+            $bar, $percentage, $this->current, $this->total,
+            $elapsedFormatted, $remainingFormatted);
+        
+        if ($percentage == 100) {
+            echo PHP_EOL;
+        }
+        
+        // 出力バッファをフラッシュして、すぐに表示されるようにする
+        flush();
+    }
+    
+    private function formatTime($seconds) {
+        if ($seconds < 60) {
+            return sprintf("%.1fs", $seconds);
+        } elseif ($seconds < 3600) {
+            $min = floor($seconds / 60);
+            $sec = $seconds % 60;
+            return sprintf("%dm%02ds", $min, $sec);
+        } else {
+            $hour = floor($seconds / 3600);
+            $min = floor(($seconds % 3600) / 60);
+            return sprintf("%dh%02dm", $hour, $min);
+        }
+    }
+}
+
+// コメント除去用のビジター
+class CommentRemover extends \PhpParser\NodeVisitorAbstract
+{
+    public function leaveNode(Node $node)
+    {
+        // コメントを除去
+        $node->setAttribute('comments', []);
+        return $node;
+    }
+}
+
+class FunctionCallVisitor extends \PhpParser\NodeVisitorAbstract
+{
+    private $currentFile;
+    private $currentFunction;
+    private $functionCalls = [];
+    private $builtinFunctions;
+    private $definedFunctions = [];
+    private $baseDir;
+    private $callCount = 0;
+    private $maxBufferSize = 1000; // バッファサイズの上限
+
+    public function __construct($baseDir = '')
+    {
+        $this->builtinFunctions = get_defined_functions();
+        $this->builtinFunctions = array_merge(
+            $this->builtinFunctions['internal'],
+            $this->builtinFunctions['user']
+        );
+        $this->baseDir = $baseDir;
+    }
+
+    public function setCurrentFile($file)
+    {
+        // ベースディレクトリからの相対パスに変換
+        if ($this->baseDir && strpos($file, $this->baseDir) === 0) {
+            $this->currentFile = substr($file, strlen($this->baseDir));
+            // 先頭のスラッシュを削除
+            $this->currentFile = ltrim($this->currentFile, '/');
+        } else {
+            $this->currentFile = $file;
+        }
+    }
+
+    private function getArgumentString($args) {
+        $argStrings = [];
+        foreach ($args as $arg) {
+            if ($arg->value instanceof Node\Scalar\String_) {
+                $argStrings[] = '"' . $arg->value->value . '"';
+            } elseif ($arg->value instanceof Node\Scalar\LNumber) {
+                $argStrings[] = $arg->value->value;
+            } elseif ($arg->value instanceof Node\Expr\Variable) {
+                $argStrings[] = '$' . $arg->value->name;
+            } elseif ($arg->value instanceof Node\Expr\Array_) {
+                $argStrings[] = '[...]';
+            } else {
+                $argStrings[] = '...';
+            }
+        }
+        return implode(', ', $argStrings);
+    }
+
+    public function enterNode(Node $node)
+    {
+        if ($node instanceof Node\Stmt\Function_) {
+            $this->currentFunction = $node->name->toString();
+            $this->definedFunctions[] = $this->currentFunction;
+        } elseif ($node instanceof Node\Stmt\ClassMethod) {
+            $this->currentFunction = $node->name->toString();
+            $this->definedFunctions[] = $this->currentFunction;
+        } elseif ($node instanceof Node\Expr\FuncCall) {
+            if ($node->name instanceof Node\Name) {
+                $functionName = $node->name->toString();
+                if (!in_array($functionName, $this->builtinFunctions)) {
+                    $shortName = $this->getShortName($functionName);
+                    $context = $this->currentFunction ?: "main";
+                    $isRecursive = ($functionName === $this->currentFunction) ? "再帰呼び出し" : "";
+                    $this->functionCalls[] = [
+                        'file' => $this->currentFile,
+                        'function' => $shortName,
+                        'context' => $context,
+                        'is_recursive' => $isRecursive,
+                        'arguments' => $this->getArgumentString($node->args)
+                    ];
+                    $this->callCount++;
+                }
+            }
+        } elseif ($node instanceof Node\Expr\StaticCall) {
+            if ($node->class instanceof Node\Name && $node->name instanceof Node\Identifier) {
+                $methodName = $node->name->toString();
+                
+                $context = $this->currentFunction ?: "main";
+                $isRecursive = ($methodName === $this->currentFunction) ? "再帰呼び出し" : "";
+                
+                $this->functionCalls[] = [
+                    'file' => $this->currentFile,
+                    'function' => $methodName,
+                    'context' => $context,
+                    'is_recursive' => $isRecursive,
+                    'arguments' => $this->getArgumentString($node->args)
+                ];
+                $this->callCount++;
+            }
+        } elseif ($node instanceof Node\Expr\MethodCall) {
+            if ($node->name instanceof Node\Identifier) {
+                $methodName = $node->name->toString();
+                
+                $context = $this->currentFunction ?: "main";
+                $isRecursive = ($methodName === $this->currentFunction) ? "再帰呼び出し" : "";
+                
+                $this->functionCalls[] = [
+                    'file' => $this->currentFile,
+                    'function' => $methodName,
+                    'context' => $context,
+                    'is_recursive' => $isRecursive,
+                    'arguments' => $this->getArgumentString($node->args)
+                ];
+                $this->callCount++;
+            }
+        }
+    }
+
+    /**
+     * 完全修飾名から短い名前を取得
+     * 
+     * @param string $name
+     * @return string
+     */
+    private function getShortName($name) {
+        if (strpos($name, '\\') !== false) {
+            $parts = explode('\\', $name);
+            return end($parts);
+        }
+        return $name;
+    }
+
+    public function leaveNode(Node $node)
+    {
+        if ($node instanceof Node\Stmt\Function_ || $node instanceof Node\Stmt\ClassMethod) {
+            $this->currentFunction = null;
+        }
+    }
+
+    public function getFunctionCalls()
+    {
+        $calls = $this->functionCalls;
+        // バッファサイズの上限に達したらバッファをクリア
+        if ($this->callCount >= $this->maxBufferSize) {
+            $this->functionCalls = [];
+            $this->callCount = 0;
+        }
+        return $calls;
+    }
+}
+
+function processFile($file, $parser, $visitor, $callback = null)
+{
+    // ファイルを読み取り、euc-jpなどのエンコーディングに対応
+    $code = file_get_contents($file);
+    
+    // エンコーディングの検出と変換
+    $encoding = mb_detect_encoding($code, ['UTF-8', 'EUC-JP', 'SJIS-win'], true);
+    if ($encoding && $encoding !== 'UTF-8') {
+        $code = mb_convert_encoding($code, 'UTF-8', $encoding);
+    }
+    
+    // 短縮タグを通常のPHPタグに変換
+    $code = preg_replace('/<\?(?!php|=)/', '<?php ', $code);
+    
+    try {
+        $ast = $parser->parse($code);
+        if ($ast === null) {
+            return [];
+        }
+
+        $visitor->setCurrentFile($file);
+        $traverser = new NodeTraverser();
+        $traverser->addVisitor(new NameResolver());
+        $traverser->addVisitor(new CommentRemover()); // コメント除去を追加
+        $traverser->addVisitor($visitor);
+        $traverser->traverse($ast);
+
+        $calls = $visitor->getFunctionCalls();
+        
+        // コールバックがある場合は呼び出す
+        if ($callback !== null && !empty($calls)) {
+            $callback($calls);
+        }
+        
+        return $calls;
+    } catch (\PhpParser\Error $e) {
+        echo "Error parsing file {$file}: {$e->getMessage()}\n";
+        return [];
+    }
+}
+
+// 処理対象のファイル数をカウント
+function countProcessableFiles($directory)
+{
+    $count = 0;
+    $iterator = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($directory)
+    );
+
+    foreach ($iterator as $file) {
+        if ($file->isFile()) {
+            $extension = strtolower($file->getExtension());
+            if (in_array($extension, ['php', 'inc', 'html', 'js'])) {
+                $count++;
+            }
+        }
+    }
+    
+    return $count;
+}
+
+function scanDirectory($directory, $baseDir = '', $callback = null, $progressBar = null)
+{
+    $parser = (new ParserFactory)->createForNewestSupportedVersion();
+    $visitor = new FunctionCallVisitor($baseDir);
+    $results = [];
+    $fileCount = 0;
+
+    $iterator = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($directory)
+    );
+
+    foreach ($iterator as $file) {
+        if ($file->isFile()) {
+            $extension = strtolower($file->getExtension());
+            if (in_array($extension, ['php', 'inc', 'html', 'js'])) {
+                $functionCalls = processFile($file->getPathname(), $parser, $visitor, $callback);
+                
+                // コールバックがない場合だけ結果を蓄積
+                if ($callback === null && !empty($functionCalls)) {
+                    $results = array_merge($results, $functionCalls);
+                }
+                
+                $fileCount++;
+                
+                // 進捗バーの更新
+                if ($progressBar) {
+                    $progressBar->update($fileCount);
+                }
+                
+                // 100ファイルごとにメモリ使用量を出力（デバッグ用）
+                if ($fileCount % 100 === 0) {
+                    $memoryUsage = round(memory_get_usage() / 1024 / 1024, 2);
+                    if (!$progressBar) {
+                        echo "Processed {$fileCount} files. Memory usage: {$memoryUsage} MB\n";
+                    }
+                }
+            }
+        }
+    }
+
+    return $results;
+}
+
+function createExcel($results, $outputFile)
+{
+    $spreadsheet = new Spreadsheet();
+    $sheet = $spreadsheet->getActiveSheet();
+
+    // ヘッダー設定（順番変更）
+    $sheet->setCellValue('A1', 'ファイル名');
+    $sheet->setCellValue('B1', '呼び出し関数');
+    $sheet->setCellValue('C1', '引数');
+    $sheet->setCellValue('D1', '呼び出し元');
+    $sheet->setCellValue('E1', '備考');
+    $sheet->getStyle('A1:E1')->getFont()->setBold(true);
+
+    // 列幅の自動調整
+    $sheet->getColumnDimension('A')->setAutoSize(true);
+    $sheet->getColumnDimension('B')->setAutoSize(true);
+    $sheet->getColumnDimension('C')->setAutoSize(true);
+    $sheet->getColumnDimension('D')->setAutoSize(true);
+    $sheet->getColumnDimension('E')->setAutoSize(true);
+
+    return [$spreadsheet, $sheet];
+}
+
+function processDirectoriesStreaming($paths, $outputFile)
+{
+    // まずスプレッドシートを初期化
+    list($spreadsheet, $sheet) = createExcel([], $outputFile);
+    $row = 2;
+    
+    // チャンク処理のコールバック
+    $writeCallback = function($calls) use (&$row, $sheet) {
+        foreach ($calls as $call) {
+            $sheet->setCellValue('A' . $row, $call['file']);
+            $sheet->setCellValue('B' . $row, $call['function']);
+            $sheet->setCellValue('C' . $row, $call['arguments']);
+            $sheet->setCellValue('D' . $row, $call['context']);
+            $sheet->setCellValue('E' . $row, $call['is_recursive']);
+            $row++;
+        }
+        
+        // 行を増やしすぎるとメモリを消費するので、定期的にガベージコレクション
+        if ($row % 1000 === 0) {
+            gc_collect_cycles();
+        }
+    };
+    
+    // 合計ファイル数を計算（進捗バー用）
+    $totalFiles = 0;
+    $dirCount = count($paths);
+    echo "解析対象のファイル数をカウント中...\n";
+    
+    foreach ($paths as $index => $path) {
+        if (is_dir($path)) {
+            $fileCount = countProcessableFiles($path);
+            $totalFiles += $fileCount;
+            echo "ディレクトリ {$path}: {$fileCount}ファイル (" . ($index + 1) . "/{$dirCount})\n";
+        } elseif (is_file($path)) {
+            $totalFiles++;
+        }
+    }
+    
+    echo "合計 {$totalFiles} ファイルを処理します\n";
+    
+    // 進捗バーの初期化
+    $progressBar = new ProgressBar($totalFiles);
+    $processedFiles = 0;
+    
+    foreach ($paths as $path) {
+        if (is_dir($path)) {
+            // ディレクトリの場合は再帰的にスキャン
+            $baseDir = rtrim($path, '/\\') . DIRECTORY_SEPARATOR;
+            // 結果を直接ファイルに書き出すストリーミング処理
+            scanDirectory($path, $baseDir, $writeCallback, $progressBar);
+        } elseif (is_file($path)) {
+            // 単一ファイルの場合
+            $parser = (new ParserFactory)->createForNewestSupportedVersion();
+            $baseDir = dirname($path) . DIRECTORY_SEPARATOR;
+            $visitor = new FunctionCallVisitor($baseDir);
+            $functionCalls = processFile($path, $parser, $visitor);
+            if (!empty($functionCalls)) {
+                $writeCallback($functionCalls);
+            }
+            $progressBar->update(++$processedFiles);
+        } else {
+            echo "警告: 指定されたパスが存在しません: {$path}\n";
+        }
+    }
+    
+    echo "\n関数呼び出し解析を完了しました。Excelファイルを生成中...\n";
+    
+    // ファイルに保存
+    $writer = new Xlsx($spreadsheet);
+    $writer->save($outputFile);
+    
+    // 結果情報を表示
+    $rowCount = $row - 2; // ヘッダー行を除く
+    $fileSize = round(filesize($outputFile) / 1024, 2);
+    echo "合計 {$rowCount} 個の関数呼び出しを検出しました。\n";
+    echo "ファイルサイズ: {$fileSize} KB\n";
+    
+    // メモリ解放
+    $spreadsheet->disconnectWorksheets();
+    unset($spreadsheet);
+    gc_collect_cycles();
+    
+    $memoryPeak = round(memory_get_peak_usage() / 1024 / 1024, 2);
+    echo "最大メモリ使用量: {$memoryPeak} MB\n";
+}
+
+// メイン処理
+if ($argc < 2) {
+    echo "使用方法: php funcCallFinder.php <ディレクトリまたはファイルパス> [出力ファイル名]\n";
+    exit(1);
+}
+
+// 最後の引数が.xlsxで終わっていれば、それを出力ファイル名とする
+$lastArg = $argv[$argc - 1];
+if (preg_match('/\.xlsx$/', $lastArg)) {
+    $outputFile = $lastArg;
+    $pathArgs = array_slice($argv, 1, $argc - 2);
+} else {
+    $outputFile = 'function_calls_' . date('Ymd_His') . '.xlsx';
+    $pathArgs = array_slice($argv, 1);
+}
+
+// ストリーミングモードで処理
+$startTime = microtime(true);
+processDirectoriesStreaming($pathArgs, $outputFile);
+$endTime = microtime(true);
+$processTime = round($endTime - $startTime, 2);
+
+echo "解析が完了しました。結果は {$outputFile} に保存されました。\n";
+echo "総処理時間: {$processTime} 秒\n";
