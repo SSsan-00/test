@@ -1,266 +1,159 @@
 #!/usr/bin/env php
 <?php
 /**
- * query-crud-extractor.php
- * ------------------------------------------------------------------
- *  - 指定ディレクトリを再帰走査し PHP/INC ファイルを収集
- *  - nikic/php-parser で AST を構築し、関数・メソッドごとに
- *      文字列連結を解決して SQL を静的復元
- *  - 正規表現で CRUD とテーブル名を抽出
- *      * FROM / JOIN                                → R
- *      * WITH 句内 SELECT の FROM                  → R（@cte 付与）
- *      * サブクエリ  (...) SELECT ... FROM          → R（@sub 付与）
- *      * INSERT INTO                                → C
- *      * UPDATE                                     → U
- *      * DELETE FROM                                → D
- *  - 「File-CRUD」シートと「Log」シートを Excel 出力
- *
- * usage:
- *     php query-crud-extractor.php <TARGET_DIR> [<OUT.xlsx>]
- *
- * requirements:
- *     nikic/php-parser ^5
- *     phpoffice/phpspreadsheet ^2
- * ------------------------------------------------------------------
+ * query-crud-extractor.php  –  JOIN / WITH / サブクエリ 対応版
+ * requirements: nikic/php-parser ^5, phpoffice/phpspreadsheet ^2
  */
 
 declare(strict_types=1);
 require_once __DIR__ . '/vendor/autoload.php';
 
 use PhpParser\{Error, Node, NodeTraverser, NodeVisitorAbstract, ParserFactory, NodeFinder};
-use PhpParser\Node\Expr\{Assign, AssignOp\Concat as AssignConcat, BinaryOp\Concat, Variable};
+use PhpParser\Node\Expr\Assign;
+use PhpParser\Node\Expr\AssignOp\Concat as AssignConcat;
+use PhpParser\Node\Expr\BinaryOp\Concat as BinConcat;
+use PhpParser\Node\Expr\Variable;
 use PhpOffice\PhpSpreadsheet\Spreadsheet;
 use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 
-/* =========================================================
-   0.  コマンドライン引数チェック
-   ======================================================= */
-$targetDir = $argv[1] ?? null;
-if (!$targetDir) {
-    fwrite(STDERR, "Usage: php query-crud-extractor.php <DIR> [<OUT.xlsx>]\n");
-    exit(1);
-}
-$targetDir = realpath($targetDir);
-if ($targetDir === false || !is_dir($targetDir)) {
-    fwrite(STDERR, "Error: '{$argv[1]}' is not a directory.\n");
-    exit(1);
-}
+/* ---------- 0. 引数確認 ---------- */
+$dir = $argv[1] ?? null;
+if (!$dir) { fwrite(STDERR, "Usage: php query-crud-extractor.php <DIR> [<OUT.xlsx>]\n"); exit(1); }
+$dir = realpath($dir);
+if (!$dir || !is_dir($dir)) { fwrite(STDERR, "Error: '{$argv[1]}' is not a directory\n"); exit(1); }
 $outFile = $argv[2] ?? 'file-crud.xlsx';
 
-/* =========================================================
-   1.  初期化
-   ======================================================= */
-$parser     = (new ParserFactory())->createForNewestSupportedVersion();
-$nodeFinder = new NodeFinder();
-$results    = [];   // [file, function, table, C, R, U, D]
-$log        = [];   // [file, function, type, detail]
+/* ---------- 1. 準備 ---------- */
+$parser  = (new ParserFactory())->createForNewestSupportedVersion();
+$finder  = new NodeFinder();
+$results = [];
+$log     = [];
 
-/* ---------------------------------------------------------
-   文字列連結を静的に復元する再帰関数
-   ------------------------------------------------------ */
-$resolve = function(Node $expr) use (&$resolve): string {
+/* ---- 1-a 文字列連結を解決（再帰クロージャ） ---- */
+$resolve = function(Node $e) use (&$resolve): string {
     /* 文字列リテラル */
-    if ($expr instanceof Node\Scalar\String_)      return $expr->value;
-    if ($expr instanceof Node\Scalar\LNumber
-        || $expr instanceof Node\Scalar\DNumber)  return (string)$expr->value;
+    if ($e instanceof Node\Scalar\String_
+     || $e instanceof Node\Scalar\LNumber
+     || $e instanceof Node\Scalar\DNumber) return (string)$e->value;
 
-    /* "文字列 {$var}" 形式 */
-    if ($expr instanceof Node\Scalar\Encapsed) {
-        $tmp = '';
-        foreach ($expr->parts as $p) $tmp .= $resolve($p);
-        return $tmp;
+    /* "str {$var}" */
+    if ($e instanceof Node\Scalar\Encapsed) {
+        $s = '';
+        foreach ($e->parts as $p) $s .= $resolve($p);
+        return $s;
     }
 
-    /* 連結演算子 */
-    if ($expr instanceof BinaryOp\Concat) {
-        return $resolve($expr->left) . $resolve($expr->right);
-    }
+    /* 連結式 */
+    if ($e instanceof BinConcat) return $resolve($e->left) . $resolve($e->right);
 
-    /* 変数はプレースホルダ化して残す */
-    if ($expr instanceof Variable && is_string($expr->name)) {
-        return '{{' . $expr->name . '}}';
-    }
+    /* 変数 → プレースホルダー */
+    if ($e instanceof Variable && is_string($e->name)) return '{{'.$e->name.'}}';
 
-    /* 未対応式は汎用プレースホルダ */
+    /* その他式 */
     return '{{expr}}';
 };
 
-/* ---------------------------------------------------------
-   CRUD 行を results[] にユニーク追加するヘルパ
-   ------------------------------------------------------ */
-$addCrud = function(string $file, string $func, string $table, string $crud) use (&$results) {
-    $row = [
-        $file,
-        $func,
-        $table,
-        $crud === 'C' ? '○' : '',
-        $crud === 'R' ? '○' : '',
-        $crud === 'U' ? '○' : '',
-        $crud === 'D' ? '○' : '',
+/* ---- 1-b 結果行追加ヘルパ（重複排除） ---- */
+$add = function(string $file, string $func, string $tbl, string $crud) use (&$results) {
+    $row = [$file,$func,$tbl,
+        $crud==='C'?'○':'',
+        $crud==='R'?'○':'',
+        $crud==='U'?'○':'',
+        $crud==='D'?'○':'',
     ];
-    /* 重複防止 */
-    if (!in_array($row, $results, true)) $results[] = $row;
+    if (!in_array($row,$results,true)) $results[] = $row;
 };
 
-/* =========================================================
-   2.  ディレクトリ再帰走査 → ファイルごとの解析処理
-   ======================================================= */
-$rii = new RecursiveIteratorIterator(
-    new RecursiveDirectoryIterator(
-        $targetDir,
-        FilesystemIterator::SKIP_DOTS | FilesystemIterator::FOLLOW_SYMLINKS
-    )
-);
-foreach ($rii as $fileInfo) {
-    if (!preg_match('/\.(php|inc)$/i', $fileInfo->getFilename())) continue;
+/* ---------- 2. ファイルを再帰処理 ---------- */
+$it = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($dir,
+            FilesystemIterator::SKIP_DOTS | FilesystemIterator::FOLLOW_SYMLINKS));
 
-    $code      = file_get_contents($fileInfo->getPathname());
-    $shortName = $fileInfo->getFilename();
+foreach ($it as $f) {
+    if (!preg_match('/\.(php|inc)$/i', $f->getFilename())) continue;
+    $code = file_get_contents($f->getPathname());
+    try { $ast = $parser->parse($code); }
+    catch (Error $e) { $log[] = [$f->getFilename(),'','PARSE_ERROR',$e->getMessage()]; continue; }
 
-    /* ---------- 2-1  AST 生成 ---------- */
-    try {
-        $ast = $parser->parse($code);
-    } catch (Error $e) {
-        $log[] = [$shortName, '', 'PARSE_ERROR', $e->getMessage()];
-        continue;
-    }
-
-    /* ---------- 2-2  関数 / メソッド を収集 ---------- */
+    /* 2-a 関数 / メソッド収集 */
     $collector = new class extends NodeVisitorAbstract {
-        public array $funcs = [];           // [node, name]
-        private array $classStack = [];
-
-        public function enterNode(Node $node) {
-            if ($node instanceof Node\Stmt\Class_) {
-                $this->classStack[] = $node->name->toString();
-            }
-            if ($node instanceof Node\Stmt\Function_) {
-                $this->funcs[] = [$node, $node->name->toString()];
-            }
-            if ($node instanceof Node\Stmt\ClassMethod) {
-                $class = end($this->classStack) ?: '';
-                $name  = ($class ? $class . '::' : '') . $node->name->toString();
-                $this->funcs[] = [$node, $name];
+        public array $funcs = [];
+        private array $cls = [];
+        public function enterNode(Node $n) {
+            if ($n instanceof Node\Stmt\Class_)    $this->cls[] = $n->name->toString();
+            if ($n instanceof Node\Stmt\Function_) $this->funcs[] = [$n,$n->name->toString()];
+            if ($n instanceof Node\Stmt\ClassMethod) {
+                $c = end($this->cls); $this->funcs[] = [$n, ($c?$c.'::':'').$n->name->toString()];
             }
         }
-        public function leaveNode(Node $node) {
-            if ($node instanceof Node\Stmt\Class_) array_pop($this->classStack);
-        }
+        public function leaveNode(Node $n) { if ($n instanceof Node\Stmt\Class_) array_pop($this->cls); }
     };
-    $tr = new NodeTraverser();
-    $tr->addVisitor($collector);
-    $tr->traverse($ast);
+    (new NodeTraverser)->addVisitor($collector)->traverse($ast);
 
-    /* ---------- 2-3  各関数を解析 ---------- */
-    foreach ($collector->funcs as [$funcNode, $funcName]) {
+    /* 2-b 各関数を解析 */
+    foreach ($collector->funcs as [$func,$funcName]) {
+        /* 変数 => 静的SQL */
+        $sqlMap = [];
 
-        /* 変数 => 復元済み SQL（関数内スコープ） */
-        $sqlVars = [];
-
-        /* ***** (A) 変数への代入 / 連結を収集 ***** */
-        $buildMap = new class($sqlVars, $resolve) extends NodeVisitorAbstract {
-            private array &$map;
-            private $resolve;
-            public function __construct(array &$map, callable $resolve) {
-                $this->map = &$map; $this->resolve = $resolve;
-            }
-            public function leaveNode(Node $n) {
-                /* $var = '...' */
-                if ($n instanceof Assign
-                    && $n->var instanceof Variable
-                    && is_string($n->var->name)) {
-                    $this->map[$n->var->name] = ($this->resolve)($n->expr);
-                }
-                /* $var .= '...' */
-                if ($n instanceof AssignConcat
-                    && $n->var instanceof Variable
-                    && is_string($n->var->name)) {
-                    $name = $n->var->name;
-                    $this->map[$name] = ($this->map[$name] ?? '')
-                                      . ($this->resolve)($n->expr);
+        /* 代入・連結を追跡 */
+        $tr = new NodeTraverser();
+        $tr->addVisitor(new class($sqlMap,$resolve) extends NodeVisitorAbstract {
+            private array &$m; private $r;
+            public function __construct(array &$m,$r){$this->m=&$m;$this->r=$r;}
+            public function leaveNode(Node $n){
+                if ($n instanceof Assign && $n->var instanceof Variable && is_string($n->var->name))
+                    $this->m[$n->var->name] = ($this->r)($n->expr);
+                if ($n instanceof AssignConcat && $n->var instanceof Variable && is_string($n->var->name)){
+                    $k=$n->var->name; $this->m[$k]=($this->m[$k]??'').($this->r)($n->expr);
                 }
             }
-        };
-        $tr2 = new NodeTraverser();
-        $tr2->addVisitor($buildMap);
-        $tr2->traverse($funcNode->getStmts() ?? []);
+        });
+        $tr->traverse($func->getStmts()??[]);
 
-        /* ***** (B) 呼び出し箇所を走査し SQL 変数を検出 ***** */
-        $calls = (new NodeFinder())->findInstanceOf($funcNode, Node\Arg::class);
-        foreach ($calls as $arg) {
-            $v = $arg->value;
-            if ($v instanceof Variable && is_string($v->name) && isset($sqlVars[$v->name])) {
-                $sqlRaw = $sqlVars[$v->name];
+        /* 呼び出し時に使われた SQL 変数を解析 */
+        foreach ($finder->findInstanceOf($func, Node\Arg::class) as $arg){
+            $v=$arg->value;
+            if(!($v instanceof Variable) || !is_string($v->name) || !isset($sqlMap[$v->name])) continue;
+            $sqlRaw=$sqlMap[$v->name];
 
-                /* --------------------------------------------
-                   (C)  SQL 正規化：コメント除去・多重空白→1
-                   ------------------------------------------ */
-                $sql = preg_replace('#--.*?$|/\*.*?\*/#ms', ' ', $sqlRaw);
-                $sql = preg_replace('/\s+/', ' ', $sql);
+            /* 正規化 */
+            $sql=preg_replace('#--.*?$|/\*.*?\*/#ms',' ',$sqlRaw);
+            $sql=preg_replace('/\s+/',' ',$sql);
 
-                /* --------------------------------------------
-                   (D)  CRUD & テーブル抽出
-                   ------------------------------------------ */
-                /* 1. C  INSERT INTO  ------------------------ */
-                if (preg_match_all('/\bINSERT\s+INTO\s+[`"\[]?([a-zA-Z0-9_.]+)[`"\]]?/i',
-                                   $sql, $m))
-                    foreach ($m[1] as $t) $addCrud($shortName, $funcName, $t, 'C');
+            /* CRUD 抽出 */
+            if (preg_match_all('/\bINSERT\s+INTO\s+[`"\[]?([a-zA-Z0-9_.]+)[`"\]]?/i',$sql,$m))
+                foreach($m[1] as $t) $add($f->getFilename(),$funcName,$t,'C');
 
-                /* 2. U  UPDATE  ----------------------------- */
-                if (preg_match_all('/\bUPDATE\s+[`"\[]?([a-zA-Z0-9_.]+)[`"\]]?/i',
-                                   $sql, $m))
-                    foreach ($m[1] as $t) $addCrud($shortName, $funcName, $t, 'U');
+            if (preg_match_all('/\bUPDATE\s+[`"\[]?([a-zA-Z0-9_.]+)[`"\]]?/i',$sql,$m))
+                foreach($m[1] as $t) $add($f->getFilename(),$funcName,$t,'U');
 
-                /* 3. D  DELETE FROM  ------------------------ */
-                if (preg_match_all('/\bDELETE\s+FROM\s+[`"\[]?([a-zA-Z0-9_.]+)[`"\]]?/i',
-                                   $sql, $m))
-                    foreach ($m[1] as $t) $addCrud($shortName, $funcName, $t, 'D');
+            if (preg_match_all('/\bDELETE\s+FROM\s+[`"\[]?([a-zA-Z0-9_.]+)[`"\]]?/i',$sql,$m))
+                foreach($m[1] as $t) $add($f->getFilename(),$funcName,$t,'D');
 
-                /* 4. R  FROM / JOIN ------------------------- */
-                if (preg_match_all('/\bFROM\s+[`"\[]?([a-zA-Z0-9_.]+)[`"\]]?/i',
-                                   $sql, $m))
-                    foreach ($m[1] as $t) $addCrud($shortName, $funcName, $t, 'R');
+            if (preg_match_all('/\bFROM\s+[`"\[]?([a-zA-Z0-9_.]+)[`"\]]?/i',$sql,$m))
+                foreach($m[1] as $t) $add($f->getFilename(),$funcName,$t,'R');
 
-                if (preg_match_all('/\bJOIN\s+[`"\[]?([a-zA-Z0-9_.]+)[`"\]]?/i',
-                                   $sql, $m))
-                    foreach ($m[1] as $t) $addCrud($shortName, $funcName, $t, 'R');
+            if (preg_match_all('/\bJOIN\s+[`"\[]?([a-zA-Z0-9_.]+)[`"\]]?/i',$sql,$m))
+                foreach($m[1] as $t) $add($f->getFilename(),$funcName,$t,'R');
 
-                /* 5. R  WITH句 内部 FROM -------------------- */
-                if (preg_match_all('/\bWITH\s+[a-zA-Z0-9_]+\s+AS\s*\(\s*SELECT\b.*?\bFROM\s+[`"\[]?([a-zA-Z0-9_.]+)[`"\]]?/is',
-                                   $sql, $m))
-                    foreach ($m[1] as $t) $addCrud($shortName, $funcName, $t . '@cte', 'R');
+            if (preg_match_all('/\bWITH\s+[a-zA-Z0-9_]+\s+AS\s*\(\s*SELECT\b.*?\bFROM\s+[`"\[]?([a-zA-Z0-9_.]+)[`"\]]?/is',$sql,$m))
+                foreach($m[1] as $t) $add($f->getFilename(),$funcName,$t.'@cte','R');
 
-                /* 6. R  サブクエリ SELECT ------------------- */
-                if (preg_match_all('/\(\s*SELECT\b.*?\bFROM\s+[`"\[]?([a-zA-Z0-9_.]+)[`"\]]?/is',
-                                   $sql, $m))
-                    foreach ($m[1] as $t) $addCrud($shortName, $funcName, $t . '@sub', 'R');
-
-                /* ログ：テーブルが1つも取れなかった場合 */
-                if (!preg_match('/\b(SELECT|INSERT|UPDATE|DELETE)\b/i', $sqlRaw)) {
-                    $log[] = [$shortName, $funcName, 'NO_SQL_KEYWORD', $sqlRaw];
-                } elseif (!preg_match('/\bFROM\b|\bINTO\b|\bUPDATE\b|\bDELETE\b/i', $sql)) {
-                    $log[] = [$shortName, $funcName, 'TABLE_NOT_DETECTED', $sqlRaw];
-                }
-            }
+            if (preg_match_all('/\(\s*SELECT\b.*?\bFROM\s+[`"\[]?([a-zA-Z0-9_.]+)[`"\]]?/is',$sql,$m))
+                foreach($m[1] as $t) $add($f->getFilename(),$funcName,$t.'@sub','R');
         }
     }
 }
 
-/* =========================================================
-   3.  Excel 生成
-   ======================================================= */
-$book = new Spreadsheet();
-$sheet = $book->getActiveSheet();
-$sheet->setTitle('File-CRUD');
-$sheet->fromArray(['file', 'function', 'table', 'C', 'R', 'U', 'D'], null, 'A1');
-$sheet->fromArray($results, null, 'A2');
+/* ---------- 3. Excel 出力 ---------- */
+$book=new Spreadsheet();
+$sheet=$book->getActiveSheet(); $sheet->setTitle('File-CRUD');
+$sheet->fromArray(['file','function','table','C','R','U','D'],null,'A1');
+$sheet->fromArray($results,null,'A2');
 
-$logSheet = $book->createSheet();
-$logSheet->setTitle('Log');
-$logSheet->fromArray(['file', 'function', 'type', 'detail'], null, 'A1');
-$logSheet->fromArray($log, null, 'A2');
+$logS=$book->createSheet(); $logS->setTitle('Log');
+$logS->fromArray(['file','function','type','detail'],null,'A1');
+$logS->fromArray($log,null,'A2');
 
-$writer = new Xlsx($book);
-$writer->save($outFile);
-
-printf("✔ 完了：%d 行を %s に出力しました\n", count($results), $outFile);
+(new Xlsx($book))->save($outFile);
+printf("✔ 出力完了：%d 行 -> %s\n",count($results),$outFile);
