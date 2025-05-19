@@ -1,0 +1,282 @@
+<?php
+require 'vendor/autoload.php';
+
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+use PhpOffice\PhpSpreadsheet\Style\Alignment;
+use PhpOffice\PhpSpreadsheet\Style\Border;
+
+class IncludeAnalyzer {
+    private $spreadsheet;
+    private $sheet;
+    private $row = 2;
+    private $baseDir;
+    private $targetExtensions = ['php', 'inc', 'js', 'html'];
+    private $results = [];
+    private $fileCache = [];
+
+    public function __construct($baseDir) {
+        $this->spreadsheet = new Spreadsheet();
+        $this->sheet = $this->spreadsheet->getActiveSheet();
+        $this->baseDir = rtrim($baseDir, '/');
+        $this->setupHeaders();
+    }
+
+    private function setupHeaders() {
+        $headers = ['ファイル名', 'インクルードタイプ', 'インクルードパス'];
+        $this->sheet->fromArray($headers, NULL, 'A1');
+        
+        $headerStyle = [
+            'font' => ['bold' => true],
+            'alignment' => ['horizontal' => Alignment::HORIZONTAL_CENTER],
+            'borders' => [
+                'allBorders' => ['borderStyle' => Border::BORDER_THIN]
+            ],
+            'fill' => [
+                'fillType' => \PhpOffice\PhpSpreadsheet\Style\Fill::FILL_SOLID,
+                'startColor' => ['rgb' => 'CCCCCC']
+            ]
+        ];
+        
+        $this->sheet->getStyle('A1:C1')->applyFromArray($headerStyle);
+        $this->sheet->freezePane('A2');
+    }
+
+    private function removeComments($content) {
+        // 文字列内のコメントを保護
+        $strings = [];
+        $content = preg_replace_callback(
+            '/(["\'])(?:\\\\.|(?!\\1).)*\\1/',
+            function($match) use (&$strings) {
+                $key = '###STRING' . count($strings) . '###';
+                $strings[$key] = $match[0];
+                return $key;
+            },
+            $content
+        );
+
+        // 複数行コメントを除去
+        $content = preg_replace('/\/\*[\s\S]*?\*\//', '', $content);
+
+        // 単一行コメントを除去
+        $content = preg_replace('/\/\/.*$/m', '', $content);
+
+        // 文字列を元に戻す
+        foreach ($strings as $key => $value) {
+            $content = str_replace($key, $value, $content);
+        }
+
+        return $content;
+    }
+
+    public function analyzeDirectory($directory) {
+        $iterator = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($directory)
+        );
+        foreach ($iterator as $file) {
+            if ($file->isFile() && in_array(strtolower($file->getExtension()), $this->targetExtensions)) {
+                $this->analyzeFile($file->getPathname());
+            }
+        }
+    }
+
+    public function analyzeFile($filePath) {
+        if (!file_exists($filePath)) {
+            return;
+        }
+
+        $content = file_get_contents($filePath);
+        $content = $this->removeComments($content);
+        
+        // PHPのインクルード関数パターン
+        $phpPatterns = [
+            '/(include|require|include_once|require_once)\s*[\'"]([^\'"]+)[\'"]/',  // 通常のインクルード
+            '/(include|require|include_once|require_once)\s*\(\s*(?:__DIR__|__FILE__|dirname\(__FILE__\))(?:\s*\.\s*(?:__DIR__|__FILE__|dirname\(__FILE__\)))*\s*\.\s*[\'"]([^\'"]+)[\'"]\)/',  // マジック定数を使用
+            '/(include|require|include_once|require_once)\s*\(\s*\$[a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*\s*\.\s*[\'"]([^\'"]+)[\'"]\)/'  // 変数を使用
+        ];
+        
+        // PHPのインクルード関数の解析
+        foreach ($phpPatterns as $pattern) {
+            if (preg_match_all($pattern, $content, $matches, PREG_SET_ORDER)) {
+                foreach ($matches as $match) {
+                    $includeType = $match[1];
+                    $includePath = $match[2];
+                    $this->addIncludeInfo($filePath, $includeType, $includePath);
+                }
+            }
+        }
+    }
+
+    private function fileExists($path) {
+        if (isset($this->fileCache[$path])) {
+            return $this->fileCache[$path];
+        }
+        $exists = file_exists($path);
+        $this->fileCache[$path] = $exists;
+        return $exists;
+    }
+
+    private function getRelativePath($filePath) {
+        // 解析対象フォルダからの相対パスに変換
+        $relativePath = str_replace($this->baseDir . '/', '', $filePath);
+        
+        // 解析対象フォルダ外のファイルの場合
+        if (strpos($filePath, $this->baseDir) !== 0) {
+            // 解析対象フォルダからの相対パスを生成
+            $relativePath = 'external/' . basename($filePath);
+        } else {
+            // パスを階層ごとに分割
+            $pathParts = explode('/', $relativePath);
+            if (count($pathParts) > 1) {
+                // 最後のファイル名を取得
+                $fileName = array_pop($pathParts);
+                // 残りのパスを取得（解析対象フォルダの直下のフォルダまで）
+                $remainingPath = implode('/', array_slice($pathParts, 0, 1));
+                $relativePath = $remainingPath . '/' . $fileName;
+            }
+        }
+        
+        return $relativePath;
+    }
+
+    private function resolveIncludePath($sourceFile, $includePath) {
+        $sourceDir = dirname($sourceFile);
+        
+        // 変数を使用したパスの場合
+        if (preg_match('/\$[a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*\s*\.\s*[\'"]([^\'"]+)[\'"]/', $includePath, $matches)) {
+            $includePath = $matches[1];  // 変数部分を除去してパス部分のみを取得
+        }
+        
+        // マジック定数の処理
+        if (strpos($includePath, '__DIR__') !== false || strpos($includePath, '__FILE__') !== false) {
+            $includePath = str_replace(['__DIR__', '__FILE__'], dirname($sourceFile), $includePath);
+        }
+        
+        // 絶対パスの場合
+        if (strpos($includePath, '/') === 0) {
+            $absolutePath = realpath($includePath);
+            if ($absolutePath === false || !$this->fileExists($absolutePath)) {
+                return 'external/' . basename($includePath) . ' [ファイルが存在しません]';
+            }
+            return $this->getRelativePath($absolutePath);
+        }
+        
+        // 現在のディレクトリを参照する場合
+        if (strpos($includePath, './') === 0) {
+            $includePath = substr($includePath, 2);
+        }
+        
+        // 親ディレクトリを参照する場合
+        $parentCount = 0;
+        while (strpos($includePath, '../') === 0) {
+            $parentCount++;
+            $includePath = substr($includePath, 3);
+            $sourceDir = dirname($sourceDir);
+        }
+        
+        // パスを結合して実際のファイルの場所を確認
+        $absolutePath = realpath($sourceDir . '/' . $includePath);
+        
+        if ($absolutePath === false || !$this->fileExists($absolutePath)) {
+            // 親フォルダの情報を保持
+            $parentDir = dirname($includePath);
+            if ($parentDir !== '.' && $parentDir !== '') {
+                return $parentDir . '/' . basename($includePath) . ' [ファイルが存在しません]';
+            }
+            return $includePath . ' [ファイルが存在しません]';
+        }
+        
+        // 実際のファイルの場所から相対パスを生成
+        $relativePath = str_replace($this->baseDir . '/', '', $absolutePath);
+        
+        // 解析対象フォルダ外のファイルの場合
+        if (strpos($absolutePath, $this->baseDir) !== 0) {
+            return 'external/' . basename($absolutePath);
+        }
+        
+        return $relativePath;
+    }
+
+    private function addIncludeInfo($sourceFile, $includeType, $includePath) {
+        $relativePath = $this->getRelativePath($sourceFile);
+        $resolvedIncludePath = $this->resolveIncludePath($sourceFile, $includePath);
+        
+        // ファイルの存在確認
+        $fileExists = !strpos($resolvedIncludePath, '[ファイルが存在しません]');
+        
+        $this->sheet->setCellValue('A' . $this->row, $relativePath);
+        $this->sheet->setCellValue('B' . $this->row, $includeType);
+        $this->sheet->setCellValue('C' . $this->row, $resolvedIncludePath);
+        
+        // 存在しないファイルの場合は背景色を設定
+        if (!$fileExists) {
+            $this->sheet->getStyle('C' . $this->row)->getFill()
+                ->setFillType(\PhpOffice\PhpSpreadsheet\Style\Fill::FILL_SOLID)
+                ->getStartColor()->setRGB('FFCCCC');
+        }
+        
+        // 結果を配列にも保存
+        $this->results[] = [
+            'ファイル名' => $relativePath,
+            'インクルードタイプ' => $includeType,
+            'インクルードパス' => $resolvedIncludePath,
+            'ファイル存在' => $fileExists
+        ];
+        
+        $this->row++;
+    }
+
+    public function save($outputPath) {
+        $writer = new Xlsx($this->spreadsheet);
+        $writer->save($outputPath);
+    }
+    
+    public function getResults() {
+        return $this->results;
+    }
+    
+    public function printResults($limit = 10) {
+        echo str_pad('ファイル名', 30) . ' | ' . str_pad('インクルードタイプ', 15) . ' | ' . 'インクルードパス' . PHP_EOL;
+        echo str_repeat('-', 80) . PHP_EOL;
+        
+        $count = 0;
+        foreach ($this->results as $result) {
+            if ($count >= $limit) break;
+            echo str_pad($result['ファイル名'], 30) . ' | ' 
+                . str_pad($result['インクルードタイプ'], 15) . ' | ' 
+                . $result['インクルードパス'] . PHP_EOL;
+            $count++;
+        }
+        
+        if (count($this->results) > $limit) {
+            echo '... 他 ' . (count($this->results) - $limit) . ' 件のインクルードが見つかりました。' . PHP_EOL;
+        }
+    }
+}
+
+// コマンドライン引数の処理
+$options = getopt('', ['dir:', 'output:', 'verbose::']);
+
+// 解析対象ディレクトリの設定
+$baseDir = isset($options['dir']) ? $options['dir'] : __DIR__;
+
+// 出力ファイル名の設定
+$outputFile = isset($options['output']) ? $options['output'] : 'include_analysis.xlsx';
+
+// 詳細表示フラグ
+$verbose = isset($options['verbose']);
+
+try {
+    $analyzer = new IncludeAnalyzer($baseDir);
+    $analyzer->analyzeDirectory($baseDir);
+    $analyzer->save($outputFile);
+    echo "分析が完了し、{$outputFile}に保存されました。\n";
+    
+    if ($verbose) {
+        echo "\n解析結果のサンプル:\n";
+        $analyzer->printResults(20);
+    }
+} catch (Exception $e) {
+    echo "エラーが発生しました: " . $e->getMessage() . "\n";
+    exit(1);
+}
