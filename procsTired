@@ -1,0 +1,312 @@
+<?php
+
+require 'vendor/autoload.php';
+
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+
+// メモリ制限の設定（必要に応じて調整）
+ini_set('memory_limit', '256M');
+
+// 進捗モニタリング用のクラス
+class ProgressMonitor {
+    private $startTime;
+    private $totalFiles;
+    private $processedFiles;
+    private $foundProcedures;
+    private $lastUpdateTime;
+    private $updateInterval = 1; // 更新間隔（秒）
+
+    public function __construct($totalFiles) {
+        $this->startTime = microtime(true);
+        $this->totalFiles = $totalFiles;
+        $this->processedFiles = 0;
+        $this->foundProcedures = [];
+        $this->lastUpdateTime = $this->startTime;
+    }
+
+    public function update($file, $procedures) {
+        $this->processedFiles++;
+        foreach ($procedures as $procedure) {
+            if (!isset($this->foundProcedures[$procedure])) {
+                $this->foundProcedures[$procedure] = 0;
+            }
+            $this->foundProcedures[$procedure]++;
+        }
+
+        $currentTime = microtime(true);
+        if ($currentTime - $this->lastUpdateTime >= $this->updateInterval) {
+            $this->displayProgress($file);
+            $this->lastUpdateTime = $currentTime;
+        }
+    }
+
+    private function displayProgress($currentFile) {
+        $elapsedTime = microtime(true) - $this->startTime;
+        $progress = ($this->processedFiles / $this->totalFiles) * 100;
+        $estimatedTotalTime = $elapsedTime / ($this->processedFiles / $this->totalFiles);
+        $remainingTime = $estimatedTotalTime - $elapsedTime;
+        $filesPerSecond = $this->processedFiles / $elapsedTime;
+
+        echo "\033[2J\033[;H"; // 画面クリア
+        echo "=== 処理進捗状況 ===\n";
+        echo "現在のファイル: " . basename($currentFile) . "\n";
+        echo "進捗: " . number_format($progress, 2) . "% ({$this->processedFiles}/{$this->totalFiles})\n";
+        echo "経過時間: " . $this->formatTime($elapsedTime) . "\n";
+        echo "残り時間: " . $this->formatTime($remainingTime) . "\n";
+        echo "処理速度: " . number_format($filesPerSecond, 2) . " ファイル/秒\n";
+        echo "検出されたストアドプロシージャ数: " . count($this->foundProcedures) . "\n";
+        echo "メモリ使用量: " . $this->formatMemory(memory_get_usage()) . "\n";
+        echo "==================\n";
+    }
+
+    private function formatMemory($bytes) {
+        $units = ['B', 'KB', 'MB', 'GB'];
+        $bytes = max($bytes, 0);
+        $pow = floor(($bytes ? log($bytes) : 0) / log(1024));
+        $pow = min($pow, count($units) - 1);
+        $bytes /= pow(1024, $pow);
+        return round($bytes, 2) . ' ' . $units[$pow];
+    }
+
+    public function formatTime($seconds) {
+        $hours = floor($seconds / 3600);
+        $minutes = floor(($seconds % 3600) / 60);
+        $seconds = $seconds % 60;
+        return sprintf("%02d:%02d:%02d", $hours, $minutes, $seconds);
+    }
+
+    public function getFinalStats() {
+        return [
+            'totalFiles' => $this->totalFiles,
+            'processedFiles' => $this->processedFiles,
+            'foundProcedures' => $this->foundProcedures,
+            'totalTime' => microtime(true) - $this->startTime
+        ];
+    }
+}
+
+// 新しいスプレッドシートを作成
+$spreadsheet = new Spreadsheet();
+$sheet = $spreadsheet->getActiveSheet();
+
+// ヘッダーを設定
+$headers = [
+    'A1' => 'ファイル名',
+    'B1' => 'ストアド名',
+    'C1' => 'テーブル名',
+    'D1' => 'CRUD'
+];
+
+// ヘッダーを書き込み
+foreach ($headers as $cell => $value) {
+    $sheet->setCellValue($cell, $value);
+}
+
+// ヘッダーのスタイル設定
+$headerStyle = [
+    'font' => [
+        'bold' => true,
+    ],
+    'alignment' => [
+        'horizontal' => \PhpOffice\PhpSpreadsheet\Style\Alignment::HORIZONTAL_CENTER,
+    ],
+    'borders' => [
+        'allBorders' => [
+            'borderStyle' => \PhpOffice\PhpSpreadsheet\Style\Border::BORDER_THIN,
+        ],
+    ],
+    'fill' => [
+        'fillType' => \PhpOffice\PhpSpreadsheet\Style\Fill::FILL_SOLID,
+        'startColor' => [
+            'rgb' => 'E0E0E0',
+        ],
+    ],
+];
+
+$sheet->getStyle('A1:D1')->applyFromArray($headerStyle);
+
+// 列幅の自動調整
+foreach (range('A', 'D') as $col) {
+    $sheet->getColumnDimension($col)->setAutoSize(true);
+}
+
+// 固定ヘッダーの設定
+// コメントアウトを解除すると固定ヘッダーが有効になります
+/*
+$sheet->freezePane('A2');
+*/
+
+// データ追加用の関数
+function addData($sheet, $row, $fileName, $storedName) {
+    $sheet->setCellValue('A' . $row, $fileName);
+    $sheet->setCellValue('B' . $row, $storedName);
+    // テーブル名とCRUDは空欄のまま
+    $sheet->setCellValue('C' . $row, '');
+    $sheet->setCellValue('D' . $row, '');
+}
+
+// 許可された拡張子のリスト
+$allowedExtensions = ['inc', 'php', 'html', 'js'];
+
+// ストアドプロシージャ名のリストを読み込む
+function loadStoredProcedures($filePath) {
+    if (!file_exists($filePath)) {
+        echo "警告: ストアドプロシージャリストファイル {$filePath} が見つかりません。\n";
+        return [];
+    }
+    
+    $procedures = [];
+    $handle = fopen($filePath, 'r');
+    if ($handle) {
+        while (($line = fgets($handle)) !== false) {
+            $line = trim($line);
+            if (!empty($line)) {
+                $procedures[] = $line;
+            }
+        }
+        fclose($handle);
+    }
+    return $procedures;
+}
+
+// ファイルからストアドプロシージャを抽出する関数
+function extractStoredProcedures($filePath, $storedProcedures) {
+    $foundProcedures = [];
+    $handle = fopen($filePath, 'r');
+    
+    if ($handle) {
+        $buffer = '';
+        $bufferSize = 8192; // 8KBのバッファ
+        
+        while (!feof($handle)) {
+            $buffer .= fread($handle, $bufferSize);
+            
+            // コメントの除去
+            $buffer = preg_replace('/\/\/.*$/m', '', $buffer); // 1行コメント
+            $buffer = preg_replace('/\/\*.*?\*\//s', '', $buffer); // 複数行コメント
+            $buffer = preg_replace('/<!--.*?-->/s', '', $buffer); // HTMLコメント
+            
+            // バッファ内で各ストアドプロシージャを検索
+            foreach ($storedProcedures as $procedure) {
+                if (!in_array($procedure, $foundProcedures)) {
+                    $patterns = [
+                        // 引数付きの呼び出し
+                        '/\b' . preg_quote($procedure, '/') . '\s*\(/i',
+                        // 配列のキーとして使用
+                        '/[\'"\[]\s*' . preg_quote($procedure, '/') . '\s*[\'"]\s*\]?/i',
+                        // 文字列として使用
+                        '/[\'"]\s*' . preg_quote($procedure, '/') . '\s*[\'"]/i'
+                    ];
+
+                    foreach ($patterns as $pattern) {
+                        if (preg_match($pattern, $buffer)) {
+                            $foundProcedures[] = $procedure;
+                            break;
+                        }
+                    }
+                }
+            }
+            
+            // バッファの後半部分を保持（行の途中で切れないように）
+            $lastNewline = strrpos($buffer, "\n");
+            if ($lastNewline !== false) {
+                $buffer = substr($buffer, $lastNewline + 1);
+            }
+        }
+        fclose($handle);
+    }
+    
+    return $foundProcedures;
+}
+
+// 再帰的にファイルを走査する関数
+function scanDirectory($dir, $baseDir, $allowedExtensions) {
+    $files = [];
+    $iterator = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($dir, RecursiveDirectoryIterator::SKIP_DOTS)
+    );
+    
+    foreach ($iterator as $file) {
+        if ($file->isFile()) {
+            $extension = strtolower(pathinfo($file->getFilename(), PATHINFO_EXTENSION));
+            if (in_array($extension, $allowedExtensions)) {
+                // ベースディレクトリからの相対パスを取得
+                $relativePath = str_replace($baseDir . '/', '', $file->getPathname());
+                $files[] = $relativePath;
+            }
+        }
+    }
+    
+    return $files;
+}
+
+// プロシージャ名とファイルのマッピング
+$procToFile = [];
+$baseDir = 'src'; // 走査するベースディレクトリ
+
+// ベースディレクトリが存在するか確認
+if (!file_exists($baseDir)) {
+    echo "警告: ベースディレクトリ {$baseDir} が見つかりません。\n";
+    exit(1);
+}
+
+// ストアドプロシージャリストを読み込む
+$storedProcedures = loadStoredProcedures('input/procs.txt');
+if (empty($storedProcedures)) {
+    echo "警告: ストアドプロシージャリストが空です。\n";
+    exit(1);
+}
+
+// ファイル一覧を取得
+$files = scanDirectory($baseDir, $baseDir, $allowedExtensions);
+
+// 進捗モニターの初期化
+$monitor = new ProgressMonitor(count($files));
+
+// 各ファイルからストアドプロシージャを抽出
+$currentRow = 2; // 2行目からデータを開始
+$foundProcedures = [];
+
+foreach ($files as $file) {
+    $fullPath = $baseDir . '/' . $file;
+    $procedures = extractStoredProcedures($fullPath, $storedProcedures);
+    
+    foreach ($procedures as $procedure) {
+        if (!isset($foundProcedures[$procedure])) {
+            $foundProcedures[$procedure] = [];
+        }
+        $foundProcedures[$procedure][] = $file;
+    }
+    
+    // 進捗の更新
+    $monitor->update($file, $procedures);
+}
+
+// 最終統計の取得
+$stats = $monitor->getFinalStats();
+
+// 抽出したストアドプロシージャをエクセルに出力
+foreach ($foundProcedures as $procedure => $files) {
+    foreach ($files as $file) {
+        addData($sheet, $currentRow++, $file, $procedure);
+    }
+}
+
+// 出力ディレクトリの確認と作成
+$outputDir = 'output';
+if (!file_exists($outputDir)) {
+    mkdir($outputDir, 0777, true);
+}
+
+// ファイルの保存
+$writer = new Xlsx($spreadsheet);
+$outputFile = $outputDir . '/template_' . date('Ymd_His') . '.xlsx';
+$writer->save($outputFile);
+
+// 最終結果の表示
+echo "\n=== 処理完了 ===\n";
+echo "処理したファイル数: {$stats['processedFiles']}\n";
+echo "検出されたストアドプロシージャ数: " . count($stats['foundProcedures']) . "\n";
+echo "総処理時間: " . $monitor->formatTime($stats['totalTime']) . "\n";
+echo "テンプレートファイルが作成されました: " . $outputFile . "\n";
