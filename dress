@@ -1,0 +1,729 @@
+<?php
+/**
+ * CRUD Analyzer - 静的の解析でSQLクエリの操作を分析するツール
+ * 
+ * 解析対象のフォルダ内のphp, inc, html, jsファイルを再帰的に静的解析を行い、
+ * 解析結果をエクセル出力するCLIツール
+ */
+
+require 'vendor/autoload.php';
+
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+
+/**
+ * カスタムノードビジターインターフェイス
+ */
+interface MyNodeVisitor
+{
+    public function beforeTraverse(array $nodes);
+    public function enterNode($node);
+    public function leaveNode($node);
+    public function afterTraverse(array $nodes);
+}
+
+/**
+ * カスタムノードビジター基底クラス
+ */
+abstract class AbstractNodeVisitor implements MyNodeVisitor
+{
+    public function beforeTraverse(array $nodes) {
+        return $nodes;
+    }
+    
+    public function enterNode($node) {
+        return $node;
+    }
+    
+    public function leaveNode($node) {
+        return $node;
+    }
+    
+    public function afterTraverse(array $nodes) {
+        return $nodes;
+    }
+}
+
+/**
+ * SQLクエリ解析用のノードビジター
+ */
+class SqlQueryVisitor extends AbstractNodeVisitor
+{
+    // 収集したクエリ情報
+    private $queries = [];
+    
+    // 現在の関数コンテキスト
+    private $currentFunction = 'main';
+    
+    /**
+     * 各ノードを訪問して解析
+     */
+    public function enterNode($node)
+    {
+        // 関数定義を検出
+        if (isset($node->getType) && $node->getType() === 'Stmt_Function') {
+            $this->currentFunction = $node->name->toString();
+        }
+        // クラスメソッド定義を検出
+        else if (isset($node->getType) && $node->getType() === 'Stmt_ClassMethod') {
+            $className = '';
+            if (isset($node->getAttribute('parent')->namespacedName)) {
+                $className = $node->getAttribute('parent')->namespacedName->toString() . '::';
+            } else if (isset($node->getAttribute('parent')->name)) {
+                $className = $node->getAttribute('parent')->name->toString() . '::';
+            }
+            
+            $this->currentFunction = $className . $node->name->toString();
+            
+            if ($node->isStatic()) {
+                $this->currentFunction .= '(static)';
+            }
+        }
+        // 文字列が含まれる可能性のある変数代入を検出
+        else if (isset($node->getType) && $node->getType() === 'Expr_Assign') {
+            if (isset($node->expr->getType)) {
+                $exprType = $node->expr->getType();
+                if ($exprType === 'Scalar_String' || $exprType === 'Expr_BinaryOp_Concat') {
+                    $this->processAssignment($node);
+                }
+            }
+        }
+        
+        return $node;
+    }
+    
+    /**
+     * ノードを離れるときの処理
+     */
+    public function leaveNode($node)
+    {
+        // 関数またはメソッドを抜ける際に関数コンテキストをリセット
+        if ((isset($node->getType) && $node->getType() === 'Stmt_Function') || 
+            (isset($node->getType) && $node->getType() === 'Stmt_ClassMethod')) {
+            $this->currentFunction = 'main';
+        }
+        
+        return $node;
+    }
+    
+    /**
+     * 変数代入を処理
+     */
+    private function processAssignment($node)
+    {
+        $value = '';
+        
+        // 文字列リテラルの場合
+        if (isset($node->expr->getType) && $node->expr->getType() === 'Scalar_String') {
+            $value = $node->expr->value;
+        }
+        // 連結演算の場合（再帰的に処理）
+        else if (isset($node->expr->getType) && $node->expr->getType() === 'Expr_BinaryOp_Concat') {
+            $value = $this->processConcatOperation($node->expr);
+        }
+        
+        // SQLクエリと思われる文字列を検出
+        if (!empty($value) && $this->isSqlQuery($value)) {
+            $this->queries[] = [
+                'query' => $value,
+                'function' => $this->currentFunction
+            ];
+        }
+    }
+    
+    /**
+     * 連結演算を再帰的に処理
+     */
+    private function processConcatOperation($node)
+    {
+        $left = '';
+        $right = '';
+        
+        // 左側
+        if (isset($node->left->getType) && $node->left->getType() === 'Scalar_String') {
+            $left = $node->left->value;
+        } else if (isset($node->left->getType) && $node->left->getType() === 'Expr_BinaryOp_Concat') {
+            $left = $this->processConcatOperation($node->left);
+        }
+        
+        // 右側
+        if (isset($node->right->getType) && $node->right->getType() === 'Scalar_String') {
+            $right = $node->right->value;
+        } else if (isset($node->right->getType) && $node->right->getType() === 'Expr_BinaryOp_Concat') {
+            $right = $this->processConcatOperation($node->right);
+        }
+        
+        return $left . $right;
+    }
+    
+    /**
+     * 文字列がSQLクエリかどうかを判定
+     */
+    private function isSqlQuery($str)
+    {
+        $sqlKeywords = [
+            'SELECT', 'INSERT', 'UPDATE', 'DELETE', 
+            'CREATE', 'DROP', 'TRUNCATE', 'WITH'
+        ];
+        
+        foreach ($sqlKeywords as $keyword) {
+            if (stripos($str, $keyword) === 0) {
+                return true;
+            }
+        }
+        
+        return false;
+    }
+    
+    /**
+     * 収集したクエリ情報を取得
+     */
+    public function getQueries()
+    {
+        return $this->queries;
+    }
+}
+
+/**
+ * 名前解決ビジター
+ */
+class NameResolver extends AbstractNodeVisitor
+{
+    public function enterNode($node)
+    {
+        // カスタム名前解決ロジック
+        // 簡易的なスタブ実装
+        return $node;
+    }
+}
+
+class CrudAnalyzer {
+    // 解析対象の拡張子
+    private $fileExtensions = ['php', 'inc', 'html', 'js'];
+    
+    // ビューの一覧
+    private $views = [];
+    
+    // 解析結果
+    private $crudResults = [];
+    
+    // パーサー設定
+    private $parser = null;
+    private $traverser = null;
+    
+    /**
+     * コンストラクタ
+     */
+    public function __construct() {
+        // PHPのパーサー処理を簡易的に実装
+        // このバージョンのライブラリではPHP-Parserの機能を簡易的に使用
+        $this->traverser = new \stdClass();
+        $this->traverser->visitors = [];
+        
+        $this->traverser->addVisitor = function($visitor) {
+            $this->traverser->visitors[] = $visitor;
+        };
+        
+        $this->traverser->traverse = function($code) {
+            foreach ($this->traverser->visitors as $visitor) {
+                $visitor->beforeTraverse($code);
+                
+                foreach ($code as $node) {
+                    $visitor->enterNode($node);
+                    $visitor->leaveNode($node);
+                }
+                
+                $visitor->afterTraverse($code);
+            }
+        };
+        
+        // inputフォルダからビューの一覧を読み込む
+        $this->loadViews();
+    }
+    
+    /**
+     * ビューの一覧をロードする
+     */
+    private function loadViews() {
+        // views.txtの読み込み
+        if (file_exists('input/views.txt')) {
+            $this->views = array_filter(array_map('trim', file('input/views.txt')));
+        }
+    }
+    
+    /**
+     * 指定されたフォルダを再帰的に解析する
+     * 
+     * @param string $directory 解析対象のディレクトリパス
+     */
+    public function analyzeDirectory($directory) {
+        if (!is_dir($directory)) {
+            die("Error: Directory '$directory' does not exist\n");
+        }
+        
+        // ディレクトリを再帰的に走査
+        $this->scanDirectory($directory);
+        
+        // 結果をExcelファイルに出力
+        $this->exportToExcel();
+    }
+    
+    /**
+     * ディレクトリを再帰的に走査してファイルを解析
+     * 
+     * @param string $directory 対象ディレクトリ
+     * @param string $basePath 基準パス（相対パス計算用）
+     */
+    private function scanDirectory($directory, $basePath = '') {
+        $files = scandir($directory);
+        
+        foreach ($files as $file) {
+            if ($file === '.' || $file === '..') {
+                continue;
+            }
+            
+            $path = $directory . '/' . $file;
+            $relativePath = $basePath ? $basePath . '/' . $file : $file;
+            
+            if (is_dir($path)) {
+                // ディレクトリの場合は再帰呼び出し
+                $this->scanDirectory($path, $relativePath);
+            } else {
+                // ファイルの場合は拡張子を確認して解析
+                $extension = pathinfo($path, PATHINFO_EXTENSION);
+                if (in_array(strtolower($extension), $this->fileExtensions)) {
+                    $this->analyzeFile($path, $relativePath);
+                }
+            }
+        }
+    }
+    
+    /**
+     * ファイルの解析
+     * 
+     * @param string $filePath ファイルパス
+     * @param string $relativePath 相対パス
+     */
+    private function analyzeFile($filePath, $relativePath) {
+        $content = file_get_contents($filePath);
+        
+        // PHPが含まれていない場合はスキップ
+        if (strpos($content, '<?') === false && strpos($content, '<?php') === false) {
+            return;
+        }
+        
+        // PHPの開始タグが省略されている場合は補完
+        if (strpos($content, '<?php') === false && strpos($content, '<?') !== false) {
+            $content = str_replace('<?', '<?php', $content);
+        }
+        
+        // コードの前処理
+        $content = $this->cleanupCode($content);
+        
+        // PHP-Parserが失敗するケースがあるので、代わりに正規表現ベースの解析を使用
+        $this->fallbackAnalyze($content, $relativePath);
+    }
+    
+    /**
+     * コードのクリーンアップ処理
+     * 
+     * @param string $code PHPコード
+     * @return string 前処理後のコード
+     */
+    private function cleanupCode($code) {
+        // コメントの削除
+        $code = preg_replace('!/\*.*?\*/!s', '', $code);
+        $code = preg_replace('!//.*?$!m', '', $code);
+        
+        // 文字列連結の解決
+        // 複数回の文字列連結を解決
+        do {
+            $previousCode = $code;
+            // 変数を含む文字列連結を解決
+            $code = preg_replace_callback(
+                '/(\$[a-zA-Z0-9_]+)\s*=\s*(["\'].*?["\'])\s*;\s*\1\s*\.=\s*(["\'].*?["\'])\s*;/s',
+                function($matches) {
+                    $var = $matches[1];
+                    $str1 = substr($matches[2], 1, -1);  // 最初と最後のクォートを除去
+                    $str2 = substr($matches[3], 1, -1);  // 最初と最後のクォートを除去
+                    return "$var = \"$str1$str2\";";     // 連結した文字列を1つの代入文に変換
+                },
+                $code
+            );
+            
+            // 変数を含む文字列連結を解決
+            $code = preg_replace_callback(
+                '/(\$[a-zA-Z0-9_]+)\s*=\s*(["\'].*?["\'])\s*;\s*\1\s*\.=\s*(\$[a-zA-Z0-9_]+)\s*;/s',
+                function($matches) {
+                    $var = $matches[1];
+                    $str1 = substr($matches[2], 1, -1);  // 最初と最後のクォートを除去
+                    $var2 = $matches[3];
+                    return "$var = \"$str1\" . $var2;";  // 変数を含む連結を変換
+                },
+                $code
+            );
+        } while ($previousCode !== $code);  // 変更がなくなるまで繰り返す
+        
+        return $code;
+    }
+    
+    /**
+     * フォールバック解析（すべての解析に使用）
+     * 
+     * @param string $code PHPコード
+     * @param string $relativePath ファイルの相対パス
+     */
+    private function fallbackAnalyze($code, $relativePath) {
+        // 正規表現でSQLクエリを抽出
+        $this->extractSqlQueries($code, $relativePath);
+        
+        // 関数定義を抽出して解析
+        $this->extractFunctions($code, $relativePath);
+    }
+    
+    /**
+     * 正規表現でSQLクエリを抽出
+     * 
+     * @param string $code PHPコード
+     * @param string $relativePath ファイルの相対パス
+     */
+    private function extractSqlQueries($code, $relativePath) {
+        // SQL文を含む可能性のある変数定義とクエリを抽出
+        preg_match_all('/\$[a-zA-Z0-9_]+\s*=\s*[\'"](SELECT|INSERT|UPDATE|DELETE|DROP|CREATE|TRUNCATE|WITH).*?[\'"];/is', $code, $matches);
+        
+        if (!empty($matches[0])) {
+            foreach ($matches[0] as $sqlMatch) {
+                // SQLの種類を特定
+                $this->analyzeSqlQuery($sqlMatch, $relativePath, 'main');
+            }
+        }
+    }
+    
+    /**
+     * 正規表現で関数定義を抽出
+     * 
+     * @param string $code PHPコード
+     * @param string $relativePath ファイルの相対パス
+     */
+    private function extractFunctions($code, $relativePath) {
+        // 関数定義を抽出
+        preg_match_all('/function\s+([a-zA-Z0-9_]+)\s*\([^)]*\)\s*{(.*?)}/is', $code, $matches, PREG_SET_ORDER);
+        
+        if (!empty($matches)) {
+            foreach ($matches as $match) {
+                $functionName = $match[1];
+                $functionBody = $match[2];
+                
+                // 関数内のSQLクエリを抽出
+                preg_match_all('/\$[a-zA-Z0-9_]+\s*=\s*[\'"](SELECT|INSERT|UPDATE|DELETE|DROP|CREATE|TRUNCATE|WITH).*?[\'"];/is', $functionBody, $sqlMatches);
+                
+                if (!empty($sqlMatches[0])) {
+                    foreach ($sqlMatches[0] as $sqlMatch) {
+                        $this->analyzeSqlQuery($sqlMatch, $relativePath, $functionName);
+                    }
+                }
+            }
+        }
+        
+        // クラスメソッド定義も抽出
+        preg_match_all('/class\s+([a-zA-Z0-9_]+)\s*{(.*?)}/is', $code, $classMatches, PREG_SET_ORDER);
+        
+        if (!empty($classMatches)) {
+            foreach ($classMatches as $classMatch) {
+                $className = $classMatch[1];
+                $classBody = $classMatch[2];
+                
+                // メソッド定義を抽出
+                preg_match_all('/function\s+([a-zA-Z0-9_]+)\s*\([^)]*\)\s*{(.*?)}/is', $classBody, $methodMatches, PREG_SET_ORDER);
+                
+                if (!empty($methodMatches)) {
+                    foreach ($methodMatches as $methodMatch) {
+                        $methodName = $methodMatch[1];
+                        $methodBody = $methodMatch[2];
+                        $fullMethodName = $className . '::' . $methodName;
+                        
+                        // メソッド内のSQLクエリを抽出
+                        preg_match_all('/\$[a-zA-Z0-9_]+\s*=\s*[\'"](SELECT|INSERT|UPDATE|DELETE|DROP|CREATE|TRUNCATE|WITH).*?[\'"];/is', $methodBody, $sqlMatches);
+                        
+                        if (!empty($sqlMatches[0])) {
+                            foreach ($sqlMatches[0] as $sqlMatch) {
+                                $this->analyzeSqlQuery($sqlMatch, $relativePath, $fullMethodName);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    /**
+     * SQLクエリを解析してCRUD操作を特定
+     * 
+     * @param string $sqlQuery SQLクエリ
+     * @param string $filePath ファイルパス
+     * @param string $functionName 関数名
+     */
+    private function analyzeSqlQuery($sqlQuery, $filePath, $functionName) {
+        // sqlQueryから実際のSQLを抽出
+        if (preg_match('/[\'"]([^\'"]*)[\'"]/is', $sqlQuery, $matches)) {
+            $sql = $matches[1];
+        } else {
+            $sql = $sqlQuery;
+        }
+        
+        // 操作フラグ
+        $createOp = false;
+        $readOp = false;
+        $updateOp = false;
+        $deleteOp = false;
+        $tableInfo = [];
+        
+        // SELECT文の解析
+        if (preg_match('/SELECT.*?FROM\s+([a-zA-Z0-9_,\s]+)/is', $sql, $matches)) {
+            $tables = explode(',', $matches[1]);
+            foreach ($tables as $table) {
+                $table = trim($table);
+                if (!empty($table)) {
+                    // エイリアスを取り除く
+                    if (strpos($table, ' ') !== false) {
+                        $parts = explode(' ', $table);
+                        $table = trim($parts[0]);
+                    }
+                    $tableInfo[$table]['R'] = true;
+                    $readOp = true;
+                }
+            }
+        }
+        
+        // JOINの解析
+        if (preg_match_all('/JOIN\s+([a-zA-Z0-9_]+)/is', $sql, $matches)) {
+            foreach ($matches[1] as $table) {
+                $table = trim($table);
+                if (!empty($table)) {
+                    $tableInfo[$table]['R'] = true;
+                    $readOp = true;
+                }
+            }
+        }
+        
+        // INSERT文の解析
+        if (preg_match('/INSERT\s+INTO\s+([a-zA-Z0-9_]+)/is', $sql, $matches)) {
+            $table = trim($matches[1]);
+            $tableInfo[$table]['C'] = true;
+            $createOp = true;
+        }
+        
+        // UPDATE文の解析
+        if (preg_match('/UPDATE\s+([a-zA-Z0-9_]+)/is', $sql, $matches)) {
+            $table = trim($matches[1]);
+            $tableInfo[$table]['U'] = true;
+            $updateOp = true;
+        }
+        
+        // DELETE文の解析
+        if (preg_match('/DELETE\s+FROM\s+([a-zA-Z0-9_]+)/is', $sql, $matches)) {
+            $table = trim($matches[1]);
+            $tableInfo[$table]['D'] = true;
+            $deleteOp = true;
+        }
+        
+        // SELECT INTO TEMP文の解析
+        if (preg_match('/SELECT.*?INTO\s+TEMP\s+([a-zA-Z0-9_]+)\s+FROM\s+([a-zA-Z0-9_]+)/is', $sql, $matches)) {
+            $tempTable = trim($matches[1]);
+            $sourceTable = trim($matches[2]);
+            $tableInfo[$tempTable]['C'] = true;
+            $tableInfo[$tempTable]['temp'] = true;
+            $tableInfo[$sourceTable]['R'] = true;
+            $createOp = true;
+            $readOp = true;
+        }
+        
+        // CREATE TEMP TABLE文の解析
+        if (preg_match('/CREATE\s+TEMP\s+TABLE\s+([a-zA-Z0-9_]+)\s+AS\s+SELECT.*?FROM\s+([a-zA-Z0-9_]+)/is', $sql, $matches)) {
+            $tempTable = trim($matches[1]);
+            $sourceTable = trim($matches[2]);
+            $tableInfo[$tempTable]['C'] = true;
+            $tableInfo[$tempTable]['temp'] = true;
+            $tableInfo[$sourceTable]['R'] = true;
+            $createOp = true;
+            $readOp = true;
+        }
+        
+        // DROP TABLE文の解析
+        if (preg_match('/DROP\s+TABLE\s+([a-zA-Z0-9_]+)/is', $sql, $matches)) {
+            $table = trim($matches[1]);
+            $tableInfo[$table]['D'] = true;
+            $deleteOp = true;
+        }
+        
+        // TRUNCATE文の解析
+        if (preg_match('/TRUNCATE\s+([a-zA-Z0-9_]+)/is', $sql, $matches)) {
+            $table = trim($matches[1]);
+            $tableInfo[$table]['D'] = true;
+            $deleteOp = true;
+        }
+        
+        // WITH（CTE）の解析
+        if (preg_match_all('/WITH\s+([a-zA-Z0-9_]+)\s+AS\s+\((.*?)\)/is', $sql, $matches, PREG_SET_ORDER)) {
+            foreach ($matches as $match) {
+                $cteTable = trim($match[1]);
+                $cteQuery = $match[2];
+                
+                $tableInfo[$cteTable]['C'] = true;
+                $tableInfo[$cteTable]['temp'] = true;
+                $tableInfo[$cteTable]['R'] = true;
+                $createOp = true;
+                $readOp = true;
+                
+                // CTEのクエリも解析して内部のテーブルを特定
+                if (preg_match('/SELECT.*?FROM\s+([a-zA-Z0-9_]+)/is', $cteQuery, $innerMatches)) {
+                    $innerTable = trim($innerMatches[1]);
+                    $tableInfo[$innerTable]['R'] = true;
+                    $readOp = true;
+                }
+            }
+        }
+        
+        // サブクエリの解析
+        if (preg_match_all('/\(SELECT.*?FROM\s+([a-zA-Z0-9_]+)/is', $sql, $matches)) {
+            foreach ($matches[1] as $table) {
+                $table = trim($table);
+                if (!empty($table)) {
+                    $tableInfo[$table]['R'] = true;
+                    $readOp = true;
+                }
+            }
+        }
+        
+        // 結果を追加
+        foreach ($tableInfo as $table => $operations) {
+            // ビューかどうかを確認
+            $isView = in_array($table, $this->views);
+            $isTemp = isset($operations['temp']) && $operations['temp'];
+            
+            $this->addCrudResult(
+                $filePath, 
+                $functionName, 
+                $table, 
+                $isView, 
+                $isTemp,
+                isset($operations['C']) && $operations['C'],
+                isset($operations['R']) && $operations['R'],
+                isset($operations['U']) && $operations['U'],
+                isset($operations['D']) && $operations['D']
+            );
+        }
+    }
+    
+    /**
+     * CRUD結果を追加
+     * 
+     * @param string $filePath ファイルパス
+     * @param string $functionName 関数名
+     * @param string $table テーブル名
+     * @param bool $isView ビューかどうか
+     * @param bool $isTemp 一時テーブルかどうか
+     * @param bool $createOp Create操作があるか
+     * @param bool $readOp Read操作があるか
+     * @param bool $updateOp Update操作があるか
+     * @param bool $deleteOp Delete操作があるか
+     */
+    private function addCrudResult($filePath, $functionName, $table, $isView, $isTemp, $createOp, $readOp, $updateOp, $deleteOp) {
+        // テーブル名に注針をつける
+        $tableName = $table;
+        $notes = [];
+        
+        if ($isView) {
+            $notes[] = 'view';
+        }
+        
+        if ($isTemp) {
+            $notes[] = 'temp';
+        }
+        
+        if (!empty($notes)) {
+            $tableName .= '@' . implode(',', $notes);
+        }
+        
+        // 重複チェック（同じファイル、同じ関数、同じテーブルの場合は既存の操作をマージ）
+        foreach ($this->crudResults as $key => $result) {
+            if ($result['file'] === $filePath && 
+                $result['function'] === $functionName && 
+                $result['table'] === $tableName) {
+                
+                // 既存の操作とマージ
+                $this->crudResults[$key]['C'] = $this->crudResults[$key]['C'] || $createOp;
+                $this->crudResults[$key]['R'] = $this->crudResults[$key]['R'] || $readOp;
+                $this->crudResults[$key]['U'] = $this->crudResults[$key]['U'] || $updateOp;
+                $this->crudResults[$key]['D'] = $this->crudResults[$key]['D'] || $deleteOp;
+                return;
+            }
+        }
+        
+        // 新しく追加
+        $this->crudResults[] = [
+            'file' => $filePath,
+            'function' => $functionName,
+            'table' => $tableName,
+            'C' => $createOp,
+            'R' => $readOp,
+            'U' => $updateOp,
+            'D' => $deleteOp
+        ];
+    }
+    
+    /**
+     * 解析結果をExcelファイルに出力
+     */
+    private function exportToExcel() {
+        // Excelファイルの作成
+        $spreadsheet = new Spreadsheet();
+        $sheet = $spreadsheet->getActiveSheet();
+        $sheet->setTitle('CRUD図');
+        
+        // ヘッダーの設定
+        $sheet->setCellValue('A1', 'ファイル名');
+        $sheet->setCellValue('B1', '関数名');
+        $sheet->setCellValue('C1', 'テーブル名');
+        $sheet->setCellValue('D1', 'C');
+        $sheet->setCellValue('E1', 'R');
+        $sheet->setCellValue('F1', 'U');
+        $sheet->setCellValue('G1', 'D');
+        
+        // データの書き込み
+        $row = 2;
+        foreach ($this->crudResults as $result) {
+            $sheet->setCellValue('A' . $row, $result['file']);
+            $sheet->setCellValue('B' . $row, $result['function']);
+            $sheet->setCellValue('C' . $row, $result['table']);
+            $sheet->setCellValue('D' . $row, $result['C'] ? '✓' : '');
+            $sheet->setCellValue('E' . $row, $result['R'] ? '✓' : '');
+            $sheet->setCellValue('F' . $row, $result['U'] ? '✓' : '');
+            $sheet->setCellValue('G' . $row, $result['D'] ? '✓' : '');
+            $row++;
+        }
+        
+        // カラム幅の自動調整
+        foreach (range('A', 'G') as $col) {
+            $sheet->getColumnDimension($col)->setAutoSize(true);
+        }
+        
+        // outputディレクトリの確認と作成
+        if (!is_dir('output')) {
+            mkdir('output', 0777, true);
+        }
+        
+        // ファイルの保存
+        $writer = new Xlsx($spreadsheet);
+        $writer->save('output/crud_analysis.xlsx');
+        
+        echo "解析完了。結果は output/crud_analysis.xlsx に保存されました\n";
+    }
+}
+
+// CLIの引数からターゲットディレクトリを取得
+$targetDir = isset($argv[1]) ? $argv[1] : 'test';
+
+// 解析実行
+$analyzer = new CrudAnalyzer();
+$analyzer->analyzeDirectory($targetDir);
