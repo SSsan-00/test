@@ -1,30 +1,251 @@
-use PhpParser\NodeVisitor\ParentConnectingVisitor;
-use PhpParser\NodeVisitor\NameResolver;
+#!/usr/bin/env php
+<?php
+/**
+ * include_scanner_static.php   (2025-05-20 版)
+ * -----------------------------------------------------------------
+ * AST で include/require を解析し、パースに失敗したセグメントは
+ * 正規表現でフォールバック抽出する CLI ツール。
+ *
+ * 使い方:
+ *   php include_scanner_static.php <DIR> [<OUTFILE>] [--progress-step=50]
+ *
+ * 依存:
+ *   composer require nikic/php-parser phpoffice/phpspreadsheet
+ * -----------------------------------------------------------------
+ */
 
-/* ...中略… */
+declare(strict_types=1);
+require_once __DIR__ . '/vendor/autoload.php';
 
-/* === 解析ループ === */
-$parser = (new ParserFactory())->createForNewestSupportedVersion();
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+use PhpParser\{Node, NodeTraverser, NodeVisitorAbstract, ParserFactory, NodeFinder};
+use PhpParser\Node\Expr;
 
-/* ── 1 ファイルごと ───────────── */
-$trav = new NodeTraverser();
-/* 親リンクを張る → 名前解決 → ユーザー定義関数抽出 */
-$trav->addVisitor(new ParentConnectingVisitor());
-$trav->addVisitor(new NameResolver(null, ['preserveOriginalNames'=>true]));
-$vis  = new FuncVisitor($filePath, $defined);
-$trav->addVisitor($vis);
-/* ─────────────────────────── */
+/*==============================================================
+ * 0. 便利関数・定数
+ *============================================================*/
+const TARGET_EXTS = ['php', 'inc', 'html', 'js'];
 
-/* === FuncVisitor での ClassMethod 名取得を以下のように修正 === */
-if ($n instanceof Node\Stmt\ClassMethod) {
-    // 親チェーンを遡って ClassLike を取得
-    $owner = $n;
-    while ($owner && !($owner instanceof Node\Stmt\ClassLike)) {
-        $owner = $owner->getAttribute('parent');
+/** 解析対象フォルダからの相対パス */
+function relPath(string $file, string $base): string
+{
+    $base = rtrim(realpath($base) ?: $base, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR;
+    $file = realpath($file) ?: $file;
+    return ltrim(str_replace($base, '', $file), DIRECTORY_SEPARATOR);
+}
+
+/** PHP/INC で開始タグが無ければ補完 */
+function ensurePhpStartTag(string $code, string $ext): string
+{
+    if (!in_array($ext, ['php', 'inc'], true)) {
+        return $code;
     }
-    $className = $owner && $owner->hasAttribute('namespacedName')
-        ? $owner->namespacedName->toString()
-        : 'AnonymousClass';
+    return str_contains($code, '<?') ? $code : "<?php\n" . $code;
+}
 
-    $name = $className . '::' . $n->name;
-} else { /* Function_ と同じく */ }
+/** 連結・__DIR__ 等を簡易評価（失敗時 null） */
+function evalIncludeExpr(Node\Expr $expr, string $filePath): ?string
+{
+    return match (true) {
+        $expr instanceof Node\Scalar\String_           => $expr->value,
+        $expr instanceof Expr\ConstFetch               => match (strtolower($expr->name->toString())) {
+                                                            '__dir__'  => dirname($filePath),
+                                                            '__file__' => $filePath,
+                                                            default    => null,
+                                                         },
+        $expr instanceof Expr\FuncCall &&
+        $expr->name instanceof Node\Name &&
+        strtolower($expr->name->toString()) === 'dirname' &&
+        isset($expr->args[0])                          => ($v = evalIncludeExpr($expr->args[0]->value, $filePath)) ? dirname($v) : null,
+        $expr instanceof Expr\BinaryOp\Concat          => ($l = evalIncludeExpr($expr->left, $filePath))
+                                                          !== null && ($r = evalIncludeExpr($expr->right, $filePath)) !== null
+                                                          ? ($l . $r) : null,
+        default                                         => null,
+    };
+}
+
+/** include タイプ文字列に変換 */
+function includeType(int $token): string
+{
+    return match ($token) {
+        T_INCLUDE      => 'include',
+        T_INCLUDE_ONCE => 'include_once',
+        T_REQUIRE      => 'require',
+        T_REQUIRE_ONCE => 'require_once',
+        default        => 'include',
+    };
+}
+
+/* ---------- 正規表現フォールバック ---------- */
+
+/** コメント除去（ざっくり版） */
+function stripComments(string $code): string
+{
+    $code = preg_replace('#/\*.*?\*/#s', '', $code);
+    $code = preg_replace('#(^|\h)//.*$#m', '$1', $code);
+    $code = preg_replace('#(^|\h)\#.*$#m',  '$1', $code);
+    return $code ?? '';
+}
+
+/** 正規表現で include/require を抽出 */
+function extractIncludesRegex(string $code): array
+{
+    $code = stripComments($code);
+    $re =
+        '/\b(include(?:_once)?|require(?:_once)?)' .
+        '\s*(?:\(\s*([^)]+?)\s*\)|\s*([^;]+?))\s*;/i';
+    preg_match_all($re, $code, $m, PREG_SET_ORDER);
+
+    $out = [];
+    foreach ($m as $hit) {
+        $expr = trim($hit[2] !== '' ? $hit[2] : $hit[3]);
+        $out[] = [
+            'type'   => strtolower($hit[1]),
+            'target' => trim($expr, '\'"'),
+        ];
+    }
+    return $out;
+}
+
+/*==============================================================
+ * 1. CLI 引数
+ *============================================================*/
+$baseDir = $argv[1] ?? null;
+if (!$baseDir) {
+    fwrite(STDERR, "Usage: php include_scanner_static.php <DIR> [<OUTFILE>] [--progress-step=N]\n");
+    exit(1);
+}
+$baseDir = realpath($baseDir);
+if ($baseDir === false || !is_dir($baseDir)) {
+    fwrite(STDERR, "Error: '{$argv[1]}' is not a directory.\n");
+    exit(1);
+}
+$outFile = $argv[2] ?? 'includes.xlsx';
+$progressStep = 50;
+foreach ($argv as $arg) {
+    if (preg_match('/^--progress-step=(\d+)$/', $arg, $m)) {
+        $progressStep = max(1, (int)$m[1]);
+    }
+}
+
+/*==============================================================
+ * 2. ファイル総数カウント（進捗用）
+ *============================================================*/
+$rii = new RecursiveIteratorIterator(
+    new RecursiveDirectoryIterator(
+        $baseDir,
+        FilesystemIterator::SKIP_DOTS | FilesystemIterator::FOLLOW_SYMLINKS
+    )
+);
+$total = 0;
+foreach ($rii as $f) {
+    if ($f->isFile() && in_array(strtolower($f->getExtension()), TARGET_EXTS, true)) {
+        $total++;
+    }
+}
+if ($total === 0) {
+    fwrite(STDERR, "No target files.\n");
+    exit(1);
+}
+
+/*==============================================================
+ * 3. Excel 準備（逐次書込み）
+ *============================================================*/
+$sheet  = (new Spreadsheet())->getActiveSheet()->setTitle('Includes');
+$sheet->fromArray(['ファイル名', 'インクルードタイプ', 'インクルードファイル'], null, 'A1');
+$sheet->getStyle('A1:C1')->getFont()->setBold(true);
+$row = 2;
+
+/*==============================================================
+ * 4. AST 解析 + フォールバック
+ *============================================================*/
+$parser     = (new ParserFactory())->createForNewestSupportedVersion();
+$finder     = new NodeFinder();
+$processed  = 0;
+$rii->rewind();
+
+foreach ($rii as $fileInfo) {
+    if (!$fileInfo->isFile()) continue;
+    $ext = strtolower($fileInfo->getExtension());
+    if (!in_array($ext, TARGET_EXTS, true)) continue;
+
+    $processed++;
+    if ($processed === 1 || $processed % $progressStep === 0 || $processed === $total) {
+        $pct = number_format($processed / $total * 100, 1);
+        echo "[{$processed}/{$total}] {$pct}%  {$fileInfo->getFilename()}\n";
+    }
+
+    $code = file_get_contents($fileInfo->getPathname());
+    if ($code === false) continue;
+
+    // 開始タグ保管
+    $code = ensurePhpStartTag($code, $ext);
+
+    /* ---- セグメント分割 (HTML/JS は <?php ... ?> 単位) ---- */
+    $segments = ($ext === 'html' || $ext === 'js')
+        ? (preg_match_all('/<\?(?:php)?(.*?)\?>/is', $code, $m) ? $m[1] : [])
+        : [$code];
+
+    $dup = []; // 重複排除
+    foreach ($segments as $seg) {
+        foreach (scanSegment($seg, $fileInfo->getPathname(), $parser, $finder) as $inc) {
+            $key = $inc['type'] . '|' . $inc['target'];
+            if (isset($dup[$key])) continue;
+            $dup[$key] = true;
+
+            /* --- Excel へ書き込み --- */
+            $sheet->setCellValue("A{$row}", relPath($fileInfo->getPathname(), $baseDir));
+            $sheet->setCellValue("B{$row}", $inc['type']);
+            $sheet->setCellValue("C{$row}", $inc['target']);
+            $row++;
+        }
+    }
+}
+
+/* 列幅自動調整 */
+foreach (range('A', 'C') as $col) {
+    $sheet->getColumnDimension($col)->setAutoSize(true);
+}
+
+/* 保存 */
+(new Xlsx($sheet->getParent()))->save($outFile);
+echo "Done. rows: " . ($row - 2) . "  -> {$outFile}\n";
+
+/*==============================================================
+ * 5. セグメント解析 (AST → regex フォールバック)
+ *============================================================*/
+function scanSegment(string $code, string $filePath, $parser, $finder): array
+{
+    /* ---------- 1) AST 解析 ---------- */
+    try {
+        $ast = $parser->parse($code);
+        if ($ast !== null) {
+            $incs = [];
+            /** @var Expr\Include_[] $nodes */
+            $nodes = $finder->findInstanceOf($ast, Expr\Include_::class);
+            foreach ($nodes as $node) {
+                $kindToken = $node->getAttribute('kind') ?? T_INCLUDE;
+                $type = includeType($kindToken);
+
+                $val  = evalIncludeExpr($node->expr, $filePath);
+                $expr = $val ?? (new PhpParser\PrettyPrinter\Standard())->prettyPrintExpr($node->expr);
+                $expr = trim($expr, '\'"');      // 引用符除去
+
+                // 相対パス解決
+                if ($val !== null && str_starts_with(realpath($val) ?: $val, dirname($filePath))) {
+                    $expr = relPath(realpath($val) ?: $val, dirname($filePath));
+                }
+                $incs[] = ['type' => $type, 'target' => $expr];
+            }
+            if ($incs !== []) {
+                return $incs;   // ここで終了＝AST 成功
+            }
+        }
+    } catch (\PhpParser\Error) {
+        // 解析失敗 → フォールバックへ
+    }
+
+    /* ---------- 2) 正規表現 フォールバック ---------- */
+    return extractIncludesRegex($code);
+}
