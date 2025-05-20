@@ -1,0 +1,215 @@
+#!/usr/bin/env php
+<?php
+/**
+ * include_scanner.php  – v2 (regex fallback)
+ * -------------------------------------------------------------
+ * 1) token_get_all で include/require を抽出
+ * 2) 見つからなければ / 取りこぼしが無いか
+ *    コメント除去済みコードを正規表現で再走査
+ * -------------------------------------------------------------
+ * 使い方:
+ *   php include_scanner.php <TARGET_DIR> [<OUTFILE>]
+ * -------------------------------------------------------------
+ */
+
+declare(strict_types=1);
+require_once __DIR__ . '/vendor/autoload.php';
+
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+
+/* ============================================================
+ * 0. 定数・共通ユーティリティ
+ * ========================================================== */
+const TARGET_EXTS = ['php', 'inc', 'html', 'js'];
+
+/** 相対パス化 */
+function relPath(string $file, string $base): string
+{
+    $realBase = realpath($base) ?: $base;
+    $realFile = realpath($file) ?: $file;
+    return ltrim(str_replace($realBase, '', $realFile), DIRECTORY_SEPARATOR);
+}
+
+/** PHP/INC に開始タグが無ければ付加 */
+function ensurePhpStartTag(string $code, string $ext): string
+{
+    if (!in_array($ext, ['php', 'inc'], true)) {
+        return $code;
+    }
+    return str_starts_with(ltrim($code), '<?') ? $code : "<?php\n{$code}";
+}
+
+/** コメント除去（token_get_all で安全に消す） */
+function stripComments(string $code): string
+{
+    $out = '';
+    foreach (token_get_all($code, TOKEN_PARSE) as $tok) {
+        if (is_array($tok)) {
+            if (in_array($tok[0], [T_COMMENT, T_DOC_COMMENT], true)) {
+                continue;
+            }
+            $out .= $tok[1];
+        } else {
+            $out .= $tok;
+        }
+    }
+    return $out;
+}
+
+/** ---------- 1) トークン解析版 -----------------------------------
+ * return array<array{type:string,target:string}>
+ */
+function extractIncludesByToken(string $code): array
+{
+    $tokens  = token_get_all($code, TOKEN_PARSE);
+    $count   = count($tokens);
+    $results = [];
+
+    for ($i = 0; $i < $count; $i++) {
+        if (!is_array($tokens[$i])) continue;
+        $type = match ($tokens[$i][0]) {
+            T_INCLUDE       => 'include',
+            T_INCLUDE_ONCE  => 'include_once',
+            T_REQUIRE       => 'require',
+            T_REQUIRE_ONCE  => 'require_once',
+            default         => null,
+        };
+        if ($type === null) continue;
+
+        // 空白／コメント／改行をスキップ
+        $j = $i + 1;
+        while ($j < $count && (
+            (is_array($tokens[$j]) &&
+             in_array($tokens[$j][0], [T_WHITESPACE, T_COMMENT, T_DOC_COMMENT], true)) ||
+            $tokens[$j] === "\n"
+        )) $j++;
+
+        // 括弧・式トークンをセミコロンまで収集
+        $expr = '';
+        $paren = 0;
+        for ($k = $j; $k < $count; $k++) {
+            $tok = $tokens[$k];
+            if (is_array($tok) && in_array($tok[0], [T_COMMENT, T_DOC_COMMENT], true)) continue;
+
+            if ($tok === '(')      $paren++;
+            elseif ($tok === ')')  $paren--;
+
+            $expr .= is_array($tok) ? $tok[1] : $tok;
+
+            if ($tok === ';' && $paren === 0) break;
+        }
+        $expr = trim($expr, " \t\n\r;");
+
+        if ($expr !== '') {
+            $results[] = ['type' => $type, 'target' => $expr];
+        }
+        $i = $k;  // 次の解析開始位置
+    }
+    return $results;
+}
+
+/** ---------- 2) 正規表現版（フォールバック） ----------------------
+ * return array<array{type:string,target:string}>
+ */
+function extractIncludesByRegex(string $code): array
+{
+    $code   = stripComments($code);   // 文字列内を壊さずコメント除去
+    $regex  =
+        '/\b(include(?:_once)?|require(?:_once)?)' .   // 1: type
+        '\s*' .
+        '(?:\(\s*([^)]+?)\s*\)|\s*([^;]+?))' .         // 2 or 3: expr
+        '\s*;/' .
+        'is';
+    preg_match_all($regex, $code, $m, PREG_SET_ORDER);
+
+    $results = [];
+    foreach ($m as $hit) {
+        $type  = strtolower($hit[1]);
+        $expr  = trim($hit[2] !== '' ? $hit[2] : $hit[3]);
+        $results[] = ['type' => $type, 'target' => $expr];
+    }
+    return $results;
+}
+
+/* ============================================================
+ * 1. 引数チェック
+ * ========================================================== */
+$baseDir = $argv[1] ?? null;
+if ($baseDir === null) {
+    fwrite(STDERR, "Usage: php include_scanner.php <TARGET_DIR> [<OUTFILE>]\n");
+    exit(1);
+}
+$baseDir = realpath($baseDir);
+if ($baseDir === false || !is_dir($baseDir)) {
+    fwrite(STDERR, "Error: '{$argv[1]}' is not a directory.\n");
+    exit(1);
+}
+$outFile = $argv[2] ?? 'includes.xlsx';
+
+/* ============================================================
+ * 2. ディレクトリ走査
+ * ========================================================== */
+$records = [];
+$rii = new RecursiveIteratorIterator(
+    new RecursiveDirectoryIterator(
+        $baseDir,
+        FilesystemIterator::SKIP_DOTS | FilesystemIterator::FOLLOW_SYMLINKS
+    )
+);
+
+foreach ($rii as $fileInfo) {
+    if (!$fileInfo->isFile()) continue;
+
+    $ext = strtolower($fileInfo->getExtension());
+    if (!in_array($ext, TARGET_EXTS, true)) continue;
+
+    $code = file_get_contents($fileInfo->getPathname());
+    if ($code === false) continue;
+
+    $code = ensurePhpStartTag($code, $ext);
+
+    /* --- ① token ベース --- */
+    $incsTok = extractIncludesByToken($code);
+
+    /* --- ② 正規表現ベース (fallback 兼 取りこぼし補完) --- */
+    $incsRe  = extractIncludesByRegex($code);
+
+    /* --- ③ 重複排除して統合 --- */
+    $uniq = [];
+    foreach (array_merge($incsTok, $incsRe) as $inc) {
+        $key = $inc['type'] . '|' . $inc['target'];
+        if (!isset($uniq[$key])) $uniq[$key] = $inc;
+    }
+
+    foreach ($uniq as $inc) {
+        $records[] = [
+            'file'   => relPath($fileInfo->getPathname(), $baseDir),
+            'type'   => $inc['type'],
+            'target' => $inc['target'],
+        ];
+    }
+}
+
+/* ============================================================
+ * 3. Excel 出力
+ * ========================================================== */
+$spreadsheet = new Spreadsheet();
+$sheet       = $spreadsheet->getActiveSheet()->setTitle('Includes');
+
+$sheet->fromArray(['ファイル名', 'インクルードタイプ', 'インクルードファイル'], null, 'A1');
+$sheet->getStyle('A1:C1')->getFont()->setBold(true);
+
+$row = 2;
+foreach ($records as $rec) {
+    $sheet->setCellValue("A{$row}", $rec['file']);
+    $sheet->setCellValue("B{$row}", $rec['type']);
+    $sheet->setCellValue("C{$row}", $rec['target']);
+    $row++;
+}
+foreach (range('A', 'C') as $col) {
+    $sheet->getColumnDimension($col)->setAutoSize(true);
+}
+
+(new Xlsx($spreadsheet))->save($outFile);
+echo "[OK] " . count($records) . " 件を書き込みました: {$outFile}\n";
