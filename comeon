@@ -1,0 +1,324 @@
+#!/usr/bin/env php
+<?php
+/**
+ * CRUD Analyzer v2.1
+ * ------------------------------------------------------------------
+ *  - PHP/INC/HTML/JS ファイルを再帰的に解析
+ *  - 各「ファイル／関数(メソッド)／テーブル」の CRUD を静的判定
+ *  - テーブル注釈（@view, @temp …）は専用列に分離
+ *  - 結果を Excel (output/crud_analysis.xlsx) へ出力
+ *
+ * 2025-05-21                                                   MIT
+ * ------------------------------------------------------------------
+ * usage: php crudAnalyzer.php <TARGET_DIR>
+ */
+
+declare(strict_types=1);
+require_once __DIR__ . '/vendor/autoload.php';
+
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+
+/* =========================================================
+   0. 設定値
+   ======================================================= */
+const EXT_PATTERN  = '/\.(php|inc|html?|js)$/i'; // 対象拡張子
+const SQL_KWD_HEAD = '(SELECT|INSERT|UPDATE|DELETE|CREATE|DROP|TRUNCATE|WITH|MERGE)';
+date_default_timezone_set('Asia/Tokyo');
+
+/* =========================================================
+   1. 引数・前準備
+   ======================================================= */
+$targetDir = $argv[1] ?? '';
+if (!$targetDir || !is_dir($targetDir = realpath($targetDir))) {
+    fwrite(STDERR, "Usage: php crudAnalyzer.php <TARGET_DIR>\n");
+    exit(1);
+}
+
+/* ビュー一覧（ある場合のみ） */
+$views = file_exists($vf = __DIR__ . '/input/views.txt')
+       ? array_map('strtolower', array_map('trim', file($vf)))
+       : [];
+
+/* =========================================================
+   2. 解析対象ファイル数を先にカウント（進捗用）
+   ======================================================= */
+$total = iterator_count(
+    new RegexIterator(
+        new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($targetDir, FilesystemIterator::SKIP_DOTS)
+        ),
+        EXT_PATTERN, RegexIterator::GET_MATCH
+    )
+);
+if (!$total) { echo "対象ファイルが見つかりません\n"; exit; }
+
+/* 進捗バー用変数 */
+$done = 0;
+$start = microtime(true);
+$last  = $start;
+
+/* =========================================================
+   3. CRUD 結果格納用ハッシュ
+   ======================================================= */
+$crud = []; // key: file|func|table → array{file,func,table,note,C,R,U,D}
+
+/* =========================================================
+   4. メイン走査
+   ======================================================= */
+$iter = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($targetDir, FilesystemIterator::SKIP_DOTS)
+        );
+foreach ($iter as $fileInfo) {
+    if (!$fileInfo->isFile() || !preg_match(EXT_PATTERN, $fileInfo->getFilename())) continue;
+
+    $rel = substr($fileInfo->getPathname(), strlen($targetDir)+1);
+    analyzeFile($fileInfo->getPathname(), $rel, $crud, $views);
+
+    /* ---- 進捗表示 ---- */
+    $done++;
+    $now = microtime(true);
+    $interval = $total > 300 ? 1.0 : 0.5;     // 多ファイル時は 1s 更新
+    if ($now - $last >= $interval || $done === $total) {
+        $rate = $done / $total;
+        $eta  = $rate ? ($now - $start) / $rate - ($now - $start) : 0;
+        printf("\r[%6.2f%%] %d / %d | elapsed %ds | ETA %ds",
+            $rate*100, $done, $total, (int)($now-$start), (int)$eta
+        );
+        $last = $now;
+    }
+}
+echo PHP_EOL;
+
+/* =========================================================
+   5. Excel 出力
+   ======================================================= */
+exportExcel($crud);
+echo "解析完了 → output/crud_analysis.xlsx\n";
+
+/* =========================================================
+   ─────────  以下 関数定義  ─────────
+   ======================================================= */
+
+/**
+ * 個別ファイルを解析
+ */
+function analyzeFile(string $abs, string $rel, array &$crud, array $views): void
+{
+    /* ---------- ファイル全体を読み込み ---------- */
+    $src = file_get_contents($abs);
+    if ($src === false) return;
+
+    /* --- 開始タグ補完 (<? → <?php) --- */
+    $src = preg_replace('/<\?(?!php|=)/i', '<?php', $src);
+
+    /* --- コメント削除（粗いが高速：巨大ファイル対策） --- */
+    $src = preg_replace(['!/\*.*?\*/!s','!//.*?$!m'], '', $src);
+
+    /* ---------- 関数／メソッド抽出 ---------- */
+    foreach (extractFunctions($src) as [$fname, $body]) {
+        scanSql($body, $rel, $fname, $crud, $views);
+    }
+    /* グローバル領域も忘れず解析 */
+    scanSql($src, $rel, 'main', $crud, $views);
+}
+
+/**
+ * ブレースカウンタで関数(メソッド)本体を抜き出す
+ * @return list<array{string,string}>
+ */
+function extractFunctions(string $code): array
+{
+    $pairs = [];
+    $len = strlen($code);
+    $i = 0;
+
+    while (($i = stripos($code, 'function', $i)) !== false) {
+        if ($i && ctype_alnum($code[$i-1])) { $i++; continue; }
+
+        /* 関数名を取得 */
+        if (!preg_match('/\Gfunction\s+(&\s*)?([a-zA-Z0-9_]+)\s*\(/A', $code, $m, 0, $i)) { $i++; continue; }
+        $fname = $m[2];
+        $pos = $i + strlen($m[0]);
+
+        /* { の位置を探す */
+        $brace = strpos($code, '{', $pos);
+        if ($brace === false) { $i++; continue; }
+
+        /* 対応 } を探す */
+        $depth = 1; $j = $brace + 1;
+        while ($depth && $j < $len) {
+            if ($code[$j] === '{')       $depth++;
+            elseif ($code[$j] === '}')   $depth--;
+            $j++;
+        }
+        if ($depth) { $i++; continue; }
+
+        $body = substr($code, $brace+1, $j - $brace - 2);
+        $pairs[] = [$fname, $body];
+
+        $i = $j;
+    }
+
+    /* クラスも同様に再帰解析 */
+    $i = 0;
+    while (($i = stripos($code, 'class', $i)) !== false) {
+        if ($i && ctype_alnum($code[$i-1])) { $i++; continue; }
+        if (!preg_match('/\Gclass\s+([a-zA-Z0-9_]+)/A', $code, $m, 0, $i)) { $i++; continue; }
+        $cls  = $m[1];
+        $brace = strpos($code, '{', $i + strlen($m[0]));
+        if ($brace === false) { $i++; continue; }
+
+        $depth = 1; $j = $brace + 1;
+        while ($depth && $j < $len) {
+            if ($code[$j] === '{')       $depth++;
+            elseif ($code[$j] === '}')   $depth--;
+            $j++;
+        }
+        if ($depth) { $i++; continue; }
+
+        $classBody = substr($code, $brace+1, $j - $brace - 2);
+        foreach (extractFunctions($classBody) as [$mtd, $mbody]) {
+            $pairs[] = ["{$cls}::{$mtd}", $mbody];
+        }
+        $i = $j;
+    }
+    return $pairs;
+}
+
+/**
+ * SQL 文抽出 → CRUD 判定
+ */
+function scanSql(string $code, string $file, string $func,
+                 array &$crud, array $views): void
+{
+    /* === 1) 文字列連結を解決 ========================================= */
+    $vars = [];      // [$name => sqlFragment]
+    $pending = [];   // 2 パス目で解決する「変数→変数」連結
+
+    $lines = preg_split('/\r?\n/', $code);
+    foreach ($lines as $ln) {
+        /* 単純代入 */
+        if (preg_match('/^\s*\$([a-zA-Z0-9_]+)\s*=\s*(?:[\'"])(.+?)(?:[\'"])\s*;?/s', $ln, $m)) {
+            $vars[$m[1]] = $m[2];
+        }
+        /* .= 文字列 */
+        elseif (preg_match('/^\s*\$([a-zA-Z0-9_]+)\s*\.\=\s*(?:[\'"])(.+?)(?:[\'"])\s*;?/s', $ln, $m)) {
+            $vars[$m[1]] = ($vars[$m[1]] ?? '') . $m[2];
+        }
+        /* .= 変数 */
+        elseif (preg_match('/^\s*\$([a-zA-Z0-9_]+)\s*\.\=\s*\$([a-zA-Z0-9_]+)\s*;?/', $ln, $m)) {
+            $pending[] = [$m[1], $m[2]]; // 後で解決
+        }
+    }
+    /* ---- 変数→変数 連結を解決 ---- */
+    foreach ($pending as [$dst, $src]) {
+        $vars[$dst] = ($vars[$dst] ?? '') . ($vars[$src] ?? '');
+    }
+
+    /* === 2) SQL 文候補を列挙 ========================================= */
+    $sqls = [];
+
+    /* a) 直接クォート */
+    if (preg_match_all('/[\'"]\s*' . SQL_KWD_HEAD . '\b.*?[\'"]/is', $code, $m))
+        foreach ($m[0] as $raw) $sqls[] = trim($raw, "\"' ");
+
+    /* b) HEREDOC/NOWDOC */
+    if (preg_match_all('/<<<[\'"]?([A-Z_][A-Z0-9_]*)[\'"]?\R(.*?)\R\1;/is', $code, $m, PREG_SET_ORDER))
+        foreach ($m as $x) if (preg_match('/^' . SQL_KWD_HEAD . '\b/is', $x[2])) $sqls[] = $x[2];
+
+    /* c) 変数 */
+    foreach ($vars as $v)
+        if (preg_match('/^' . SQL_KWD_HEAD . '\b/is', $v)) $sqls[] = $v;
+
+    /* === 3) 各 SQL → CRUD =========================================== */
+    foreach ($sqls as $sql) {
+        $sqlU = strtoupper($sql);
+        $tables = [];
+
+        /* SELECT / JOIN / サブクエリ */
+        if (preg_match_all('/FROM\s+([a-zA-Z0-9_]+)/', $sqlU, $mm))
+            foreach ($mm[1] as $t) $tables[$t]['R'] = true;
+        if (preg_match_all('/(?:LEFT|RIGHT|FULL|INNER)?\s*JOIN\s+([a-zA-Z0-9_]+)/', $sqlU, $mm))
+            foreach ($mm[1] as $t) $tables[$t]['R'] = true;
+
+        /* INSERT (INSERT … SELECT にも対応) */
+        if (preg_match('/INSERT\s+INTO\s+([a-zA-Z0-9_]+)/', $sqlU, $mm))
+            $tables[$mm[1]]['C'] = true;
+
+        /* UPDATE */
+        if (preg_match('/UPDATE\s+([a-zA-Z0-9_]+)/', $sqlU, $mm))
+            $tables[$mm[1]]['U'] = true;
+
+        /* DELETE */
+        if (preg_match('/DELETE\s+FROM\s+([a-zA-Z0-9_]+)/', $sqlU, $mm))
+            $tables[$mm[1]]['D'] = true;
+
+        /* MERGE INTO xyz USING … WHEN MATCHED THEN UPDATE WHEN NOT MATCHED THEN INSERT ... */
+        if (preg_match('/MERGE\s+INTO\s+([a-zA-Z0-9_]+)/', $sqlU, $mm)) {
+            $tables[$mm[1]]['C'] = true;
+            $tables[$mm[1]]['U'] = true;
+        }
+
+        /* CREATE TEMP TABLE / SELECT INTO TEMP */
+        if (preg_match('/CREATE\s+TEMP\s+TABLE\s+([a-zA-Z0-9_]+)/', $sqlU, $mm))
+            $tables[$mm[1]] += ['C'=>true,'temp'=>true];
+        if (preg_match('/SELECT .*? INTO\s+TEMP\s+([a-zA-Z0-9_]+)/', $sqlU, $mm))
+            $tables[$mm[1]] += ['C'=>true,'temp'=>true];
+
+        /* DROP / TRUNCATE */
+        if (preg_match('/(?:DROP|TRUNCATE)\s+TABLE\s+([a-zA-Z0-9_]+)/', $sqlU, $mm))
+            $tables[$mm[1]]['D'] = true;
+
+        /* WITH (CTE) */
+        if (preg_match_all('/WITH\s+([a-zA-Z0-9_]+)\s+AS\s*\(/', $sqlU, $mm))
+            foreach ($mm[1] as $cte) $tables[$cte] += ['C'=>true,'R'=>true,'temp'=>true];
+
+        /* ---- 結果に登録 ---- */
+        foreach ($tables as $tbl => $ops) {
+            $note = [];
+            if (in_array(strtolower($tbl), $views)) $note[] = '@view';
+            if (!empty($ops['temp']))              $note[] = '@temp';
+
+            $key = "$file|$func|$tbl|" . implode(',', $note);
+            if (!isset($crud[$key])) {
+                $crud[$key] = [
+                    'file' => $file,
+                    'func' => $func,
+                    'table'=> $tbl,
+                    'note' => implode(',', $note),
+                    'C'=>false,'R'=>false,'U'=>false,'D'=>false
+                ];
+            }
+            foreach (['C','R','U','D'] as $c)
+                if (!empty($ops[$c])) $crud[$key][$c] = true;
+        }
+    }
+}
+
+/**
+ * Excel 出力
+ */
+function exportExcel(array $crud): void
+{
+    $xlsx = new Spreadsheet();
+    $sheet = $xlsx->getActiveSheet()->setTitle('CRUD図');
+
+    /* ヘッダー */
+    $header = ['A'=>'ファイル','B'=>'関数','C'=>'テーブル','D'=>'注釈','E'=>'C','F'=>'R','G'=>'U','H'=>'D'];
+    foreach ($header as $col=>$txt) $sheet->setCellValue("$col1", $txt);
+
+    /* データ行 */
+    $row = 2;
+    foreach ($crud as $r) {
+        $sheet->fromArray([
+            $r['file'],$r['func'],$r['table'],$r['note'],
+            $r['C']?'✓':'',$r['R']?'✓':'',$r['U']?'✓':'',$r['D']?'✓':''
+        ], null, "A{$row}");
+        $row++;
+    }
+    foreach (range('A','H') as $col) $sheet->getColumnDimension($col)->setAutoSize(true);
+
+    if (!is_dir('output')) mkdir('output', 0777, true);
+    (new Xlsx($xlsx))->save('output/crud_analysis.xlsx');
+}
