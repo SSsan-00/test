@@ -1,0 +1,468 @@
+<?php
+
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Style\Alignment;
+use PhpOffice\PhpSpreadsheet\Style\Border;
+use PhpOffice\PhpSpreadsheet\Style\Fill;
+use PhpOffice\PhpSpreadsheet\Style\Font;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+use PhpOffice\PhpSpreadsheet\Cell\DataValidation;
+
+/**
+ * エクセル出力を担当するクラス
+ * 
+ * このクラスは以下の処理を担当します：
+ * 1. エクセルファイルの作成
+ *    - スプレッドシートの初期化
+ *    - プロパティの設定
+ *    - シートの作成と設定
+ * 
+ * 2. CRUD解析結果の出力
+ *    - ヘッダー行の設定
+ *    - データの入力
+ *    - CRUD操作のフラグ設定
+ *    - 注釈の付与
+ * 
+ * 3. スタイル設定
+ *    - ヘッダー行のスタイル
+ *    - データ行のスタイル
+ *    - 条件付き書式（ビュー、一時テーブル、未解決）
+ *    - 罫線とセルサイズの調整
+ * 
+ * 4. テーブル横断CRUD図の作成
+ *    - クロス集計シートの作成
+ *    - テーブル×関数のマトリックス作成
+ *    - 集計結果の表示
+ * 
+ * 5. ファイル操作
+ *    - 出力ディレクトリの確認と作成
+ *    - ファイル名の生成
+ *    - エクセルファイルの保存
+ * 
+ * 6. デバッグ機能
+ *    - 詳細な処理ログ
+ *    - 出力状態の表示
+ */
+class ExcelExporter {
+    private $verbose = false;
+    
+    /**
+     * コンストラクタ
+     *
+     * @param bool $verbose 詳細表示モード
+     */
+    public function __construct(bool $verbose = false) {
+        $this->verbose = $verbose;
+    }
+    
+    /**
+     * 解析結果をエクセルに出力
+     *
+     * @param array $results 解析結果
+     * @param array $views ビューリスト
+     * @return string 生成されたファイルパス
+     */
+    public function export(array $results, array $views = []) {
+        // 出力ディレクトリの確認
+        $outputDir = __DIR__ . '/../output';
+        if (!is_dir($outputDir)) {
+            mkdir($outputDir, 0777, true);
+        }
+        
+        // スプレッドシートの作成
+        $spreadsheet = new Spreadsheet();
+        $spreadsheet->getProperties()
+            ->setCreator('SQL解析ツール')
+            ->setLastModifiedBy('SQL解析ツール')
+            ->setTitle('SQL CRUD解析結果')
+            ->setDescription('データベーステーブルのCRUD操作解析結果');
+        
+        // CRUD図シートを作成
+        $sheet = $spreadsheet->getActiveSheet();
+        $sheet->setTitle('CRUD解析結果');
+        
+        // ヘッダー行の設定
+        $this->setupHeader($sheet);
+        
+        // 結果データの入力
+        $row = 2; // データは2行目から
+        $uniqueTables = []; // 一意のテーブル名を収集
+        
+        foreach ($results as $filePath => $functions) {
+            foreach ($functions as $functionName => $tables) {
+                foreach ($tables as $tableName => $operations) {
+                    $isView = in_array($tableName, $views);
+                    $note = '';
+                    
+                    // ユニークテーブル名のリストを収集
+                    if (!in_array($tableName, $uniqueTables)) {
+                        $uniqueTables[] = $tableName;
+                    }
+                    
+                    // 各操作タイプ（C/R/U/D）をフラグとして設定
+                    $hasC = $hasR = $hasU = $hasD = false;
+                    
+                    foreach ($operations as $operation) {
+                        if (strpos($operation, 'C@temp') !== false) {
+                            $hasC = true;
+                            $note = '@temp';
+                        } 
+                        else if (strpos($operation, 'C') === 0) {
+                            $hasC = true;
+                        }
+                        
+                        if (strpos($operation, 'R@view') !== false || (strpos($operation, 'R') === 0 && $isView)) {
+                            $hasR = true;
+                            $note = !empty($note) ? $note . ',@view' : '@view';
+                        }
+                        else if (strpos($operation, 'R') === 0) {
+                            $hasR = true;
+                        }
+                        
+                        if (strpos($operation, 'U') === 0) {
+                            $hasU = true;
+                        }
+                        
+                        if (strpos($operation, 'D') === 0) {
+                            $hasD = true;
+                        }
+                        
+                        // 未解決の変数/定数
+                        if (strpos($operation, '@未解決') !== false) {
+                            $note = $note ? $note . ',@未解決' : '@未解決';
+                        }
+                    }
+                    
+                    // データをシートに設定
+                    $sheet->setCellValue('A' . $row, basename($filePath));
+                    $sheet->setCellValue('B' . $row, $functionName);
+                    $sheet->setCellValue('C' . $row, $tableName);
+                    $sheet->setCellValue('D' . $row, $hasC ? '○' : '');
+                    $sheet->setCellValue('E' . $row, $hasR ? '○' : '');
+                    $sheet->setCellValue('F' . $row, $hasU ? '○' : '');
+                    $sheet->setCellValue('G' . $row, $hasD ? '○' : '');
+                    $sheet->setCellValue('H' . $row, $note);
+                    
+                    // 行のスタイル調整
+                    $this->applyRowStyle($sheet, $row, $note);
+                    
+                    $row++;
+                }
+            }
+        }
+        
+        // テーブル横断的なCRUD図シートを追加
+        $this->addCrossFunctionalCrudSheet($spreadsheet, $results, $uniqueTables, $views);
+        
+        // 罫線とセルのサイズ調整
+        $this->formatExcel($sheet, $row - 1);
+        
+        // フィルタとフリーズペインを設定
+        $sheet->setAutoFilter('A1:H' . ($row - 1));
+        $sheet->freezePane('A2');
+        
+        // ファイル保存
+        $timestamp = date('YmdHis');
+        $filename = "SQL解析結果_{$timestamp}.xlsx";
+        $filepath = $outputDir . '/' . $filename;
+        
+        $writer = new Xlsx($spreadsheet);
+        $writer->save($filepath);
+        
+        if ($this->verbose) {
+            $time = date('H:i:s');
+            echo "[$time] エクセルファイルを出力しました: $filepath" . PHP_EOL;
+        }
+        
+        return $filepath;
+    }
+    
+    /**
+     * ヘッダー行の設定
+     *
+     * @param object $sheet スプレッドシート
+     */
+    private function setupHeader($sheet) {
+        $sheet->setCellValue('A1', 'ファイル名');
+        $sheet->setCellValue('B1', '関数名');
+        $sheet->setCellValue('C1', 'テーブル名');
+        $sheet->setCellValue('D1', 'C');
+        $sheet->setCellValue('E1', 'R');
+        $sheet->setCellValue('F1', 'U');
+        $sheet->setCellValue('G1', 'D');
+        $sheet->setCellValue('H1', '注釈');
+        
+        // ヘッダー行のスタイル設定
+        foreach (range('A', 'H') as $column) {
+            $sheet->getStyle($column . '1')
+                ->getFill()
+                ->setFillType(Fill::FILL_SOLID)
+                ->getStartColor()->setRGB('4472C4');
+            
+            $sheet->getStyle($column . '1')
+                ->getFont()
+                ->getColor()
+                ->setRGB('FFFFFF');
+            
+            $sheet->getStyle($column . '1')
+                ->getFont()
+                ->setBold(true);
+            
+            $sheet->getStyle($column . '1')
+                ->getAlignment()
+                ->setHorizontal(Alignment::HORIZONTAL_CENTER)
+                ->setVertical(Alignment::VERTICAL_CENTER);
+        }
+    }
+    
+    /**
+     * 行のスタイルを適用
+     *
+     * @param object $sheet スプレッドシート
+     * @param int $row 行番号
+     * @param string $note 注釈
+     */
+    private function applyRowStyle($sheet, $row, $note) {
+        // ビューの行に色付け
+        if (strpos($note, '@view') !== false) {
+            $sheet->getStyle('A'.$row.':H'.$row)->getFill()
+                ->setFillType(Fill::FILL_SOLID)
+                ->getStartColor()->setRGB('E6F2FF');
+        }
+        
+        // 一時テーブルの行に色付け
+        if (strpos($note, '@temp') !== false) {
+            $sheet->getStyle('A'.$row.':H'.$row)->getFill()
+                ->setFillType(Fill::FILL_SOLID)
+                ->getStartColor()->setRGB('FFF2CC');
+        }
+        
+        // 未解決変数・定数の行に色付け
+        if (strpos($note, '@未解決') !== false) {
+            $sheet->getStyle('A'.$row.':H'.$row)->getFill()
+                ->setFillType(Fill::FILL_SOLID)
+                ->getStartColor()->setRGB('FFCCCC');
+        }
+        
+        // CRUDセルの中央揃え
+        foreach (range('D', 'G') as $column) {
+            $sheet->getStyle($column . $row)
+                ->getAlignment()
+                ->setHorizontal(Alignment::HORIZONTAL_CENTER)
+                ->setVertical(Alignment::VERTICAL_CENTER);
+        }
+    }
+    
+    /**
+     * テーブル×関数のクロス集計CRUD図を作成
+     *
+     * @param object $spreadsheet スプレッドシート
+     * @param array $results 解析結果
+     * @param array $uniqueTables 一意のテーブル名リスト
+     * @param array $views ビューリスト
+     */
+    private function addCrossFunctionalCrudSheet($spreadsheet, $results, $uniqueTables, $views) {
+        // 新しいシートを追加
+        $sheet = $spreadsheet->createSheet();
+        $sheet->setTitle('テーブル横断CRUD図');
+        
+        // 一意のファイル関数リストを作成
+        $fileFunctions = [];
+        foreach ($results as $filePath => $functions) {
+            foreach ($functions as $functionName => $tables) {
+                $key = basename($filePath) . '::' . $functionName;
+                if (!in_array($key, $fileFunctions)) {
+                    $fileFunctions[] = $key;
+                }
+            }
+        }
+        
+        // ヘッダー行の設定
+        $sheet->setCellValue('A1', 'テーブル名');
+        $column = 'B';
+        foreach ($fileFunctions as $index => $fileFunction) {
+            $sheet->setCellValue($column . '1', $fileFunction);
+            $column++;
+        }
+        
+        // ヘッダーのスタイル設定
+        $lastColumn = chr(ord('A') + count($fileFunctions));
+        $sheet->getStyle('A1:' . $lastColumn . '1')
+            ->getFill()
+            ->setFillType(Fill::FILL_SOLID)
+            ->getStartColor()->setRGB('4472C4');
+        
+        $sheet->getStyle('A1:' . $lastColumn . '1')
+            ->getFont()
+            ->getColor()
+            ->setRGB('FFFFFF');
+        
+        $sheet->getStyle('A1:' . $lastColumn . '1')
+            ->getFont()
+            ->setBold(true);
+        
+        $sheet->getStyle('A1:' . $lastColumn . '1')
+            ->getAlignment()
+            ->setHorizontal(Alignment::HORIZONTAL_CENTER)
+            ->setVertical(Alignment::VERTICAL_CENTER);
+        
+        // テーブルごとにCRUD操作を設定
+        $row = 2;
+        foreach ($uniqueTables as $tableName) {
+            $sheet->setCellValue('A' . $row, $tableName);
+            
+            $isView = in_array($tableName, $views);
+            if ($isView) {
+                $sheet->getStyle('A' . $row)
+                    ->getFont()
+                    ->getColor()
+                    ->setRGB('0070C0');
+            }
+            
+            $column = 'B';
+            foreach ($fileFunctions as $fileFunction) {
+                list($filePath, $functionName) = explode('::', $fileFunction, 2);
+                
+                // CRUD操作を取得
+                $operations = [];
+                if (isset($results[$filePath][$functionName][$tableName])) {
+                    $operations = $results[$filePath][$functionName][$tableName];
+                }
+                
+                // CRUD操作の文字列を作成
+                $cruds = '';
+                foreach ($operations as $operation) {
+                    // 操作の基本種別を取得（C/R/U/D）
+                    $opType = substr($operation, 0, 1);
+                    if (!strpos($cruds, $opType)) {
+                        $cruds .= $opType;
+                    }
+                }
+                
+                $sheet->setCellValue($column . $row, $cruds);
+                
+                // セルスタイルの設定
+                if (!empty($cruds)) {
+                    $sheet->getStyle($column . $row)
+                        ->getAlignment()
+                        ->setHorizontal(Alignment::HORIZONTAL_CENTER)
+                        ->setVertical(Alignment::VERTICAL_CENTER);
+                    
+                    $sheet->getStyle($column . $row)
+                        ->getFill()
+                        ->setFillType(Fill::FILL_SOLID);
+                    
+                    // 操作タイプによって背景色を変更
+                    if (strpos($cruds, 'C') !== false && strpos($cruds, 'D') !== false) {
+                        // C+Dの組み合わせは危険な操作として赤系
+                        $sheet->getStyle($column . $row)
+                            ->getFill()
+                            ->getStartColor()->setRGB('FFCCCC');
+                    } else if (strpos($cruds, 'U') !== false) {
+                        // Updateは黄色系
+                        $sheet->getStyle($column . $row)
+                            ->getFill()
+                            ->getStartColor()->setRGB('FFEB9C');
+                    } else if (strpos($cruds, 'C') !== false) {
+                        // Createは緑系
+                        $sheet->getStyle($column . $row)
+                            ->getFill()
+                            ->getStartColor()->setRGB('E2EFDA');
+                    } else if (strpos($cruds, 'R') !== false) {
+                        // Readは青系
+                        $sheet->getStyle($column . $row)
+                            ->getFill()
+                            ->getStartColor()->setRGB('DDEBF7');
+                    } else if (strpos($cruds, 'D') !== false) {
+                        // Deleteは赤系
+                        $sheet->getStyle($column . $row)
+                            ->getFill()
+                            ->getStartColor()->setRGB('FFCCCC');
+                    }
+                }
+                
+                $column++;
+            }
+            
+            $row++;
+        }
+        
+        // フォーマット調整
+        $this->formatCrossSheet($sheet, $lastColumn, $row - 1);
+    }
+    
+    /**
+     * クロス集計シートのフォーマット設定
+     *
+     * @param object $sheet スプレッドシート
+     * @param string $lastColumn 最終列
+     * @param int $lastRow 最終行
+     */
+    private function formatCrossSheet($sheet, $lastColumn, $lastRow) {
+        // カラム幅の調整
+        $sheet->getColumnDimension('A')->setWidth(20);
+        for ($i = 'B'; $i <= $lastColumn; $i++) {
+            $sheet->getColumnDimension($i)->setWidth(15);
+        }
+        
+        // 罫線設定
+        $range = 'A1:' . $lastColumn . $lastRow;
+        $styleThinBorder = [
+            'borders' => [
+                'allBorders' => [
+                    'borderStyle' => Border::BORDER_THIN,
+                    'color' => ['rgb' => '000000'],
+                ],
+            ],
+        ];
+        $sheet->getStyle($range)->applyFromArray($styleThinBorder);
+        
+        // フィルタとフリーズペイン設定
+        $sheet->setAutoFilter('A1:' . $lastColumn . $lastRow);
+        $sheet->freezePane('B2');
+    }
+    
+    /**
+     * エクセルのフォーマット設定
+     *
+     * @param object $sheet スプレッドシート
+     * @param int $lastRow 最終行
+     */
+    private function formatExcel($sheet, $lastRow) {
+        // CRUD列のセンター揃え
+        foreach (range('D', 'G') as $column) {
+            $sheet->getStyle($column . '2:' . $column . $lastRow)
+                ->getAlignment()
+                ->setHorizontal(Alignment::HORIZONTAL_CENTER)
+                ->setVertical(Alignment::VERTICAL_CENTER);
+        }
+        
+        // ファイル名、関数名、テーブル名のセルサイズ調整
+        $sheet->getColumnDimension('A')->setAutoSize(true);
+        $sheet->getColumnDimension('B')->setAutoSize(true);
+        $sheet->getColumnDimension('C')->setAutoSize(true);
+        
+        // CRUD列の幅設定
+        foreach (range('D', 'G') as $column) {
+            $sheet->getColumnDimension($column)->setWidth(5);
+        }
+        
+        // 注釈列の幅設定
+        $sheet->getColumnDimension('H')->setWidth(15);
+        
+        // 全体の罫線設定
+        $range = 'A1:H' . $lastRow;
+        $styleThinBorder = [
+            'borders' => [
+                'allBorders' => [
+                    'borderStyle' => Border::BORDER_THIN,
+                    'color' => ['rgb' => '000000'],
+                ],
+            ],
+        ];
+        $sheet->getStyle($range)->applyFromArray($styleThinBorder);
+        
+        // フリーズペイン設定（ヘッダー行を固定）
+        $sheet->freezePane('A2');
+    }
+} 
