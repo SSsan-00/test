@@ -1,0 +1,205 @@
+<?php
+
+/**
+ * ファイル処理を担当するクラス
+ * 
+ * このクラスは以下の処理を担当します：
+ * 1. ファイル検索
+ *    - 再帰的なディレクトリ走査
+ *    - 特定拡張子のファイル検索
+ *    - ファイルパスの収集
+ * 
+ * 2. ファイル読み込み
+ *    - PHPファイルの読み込み
+ *    - エラーハンドリング
+ *    - ファイル存在確認
+ * 
+ * 3. ビュー管理
+ *    - ビューリストの読み込み
+ *    - ビューリストファイルの作成
+ *    - ビュー情報の提供
+ * 
+ * 4. 進捗管理
+ *    - 処理済みファイル数の追跡
+ *    - 進捗状況の表示
+ *    - 進捗率の計算
+ * 
+ * 5. エラーハンドリング
+ *    - ファイル操作の例外処理
+ *    - エラーメッセージの表示
+ *    - ディレクトリ存在確認
+ * 
+ * 6. デバッグ機能
+ *    - 詳細な処理ログ
+ *    - 進捗状況の表示
+ *    - エラー情報の出力
+ */
+class FileProcessor {
+    private $verbose = false;
+    private $processedFiles = 0;
+    private $totalFiles = 0;
+    
+    /**
+     * コンストラクタ
+     *
+     * @param bool $verbose 詳細表示モード
+     */
+    public function __construct(bool $verbose = false) {
+        $this->verbose = $verbose;
+    }
+    
+    /**
+     * 処理済みファイル数をリセット
+     */
+    public function resetProgress() {
+        $this->processedFiles = 0;
+        $this->totalFiles = 0;
+    }
+    
+    /**
+     * 処理進捗状況を表示
+     * 
+     * @param string $message メッセージ
+     */
+    public function showProgress($message) {
+        if (!$this->verbose) {
+            return;
+        }
+        
+        $time = date('H:i:s');
+        echo "[$time] $message" . PHP_EOL;
+    }
+    
+    /**
+     * 進捗状況更新（ファイル処理完了）
+     * 
+     * @param string $filename ファイル名
+     */
+    public function updateProgress($filename) {
+        $this->processedFiles++;
+        
+        if (!$this->verbose) {
+            return;
+        }
+        
+        // 10ファイルごとに進捗を表示
+        if ($this->processedFiles % 10 === 0 || $this->processedFiles === $this->totalFiles) {
+            $percent = round(($this->processedFiles / $this->totalFiles) * 100, 1);
+            $time = date('H:i:s');
+            echo "[$time] 進捗状況: {$percent}% ({$this->processedFiles}/{$this->totalFiles}) - {$filename}" . PHP_EOL;
+        }
+    }
+    
+    /**
+     * 指定されたディレクトリから特定拡張子のファイルを再帰的に検索
+     * 
+     * @param string $dir 検索ディレクトリ
+     * @param array $extensions 検索する拡張子の配列
+     * @return array ファイルパスの配列
+     */
+    public function findFiles($dir, $extensions = ['php', 'inc', 'html', 'js']) {
+        $files = [];
+        $extensionsPattern = implode('|', $extensions);
+        
+        if (!is_dir($dir)) {
+            $this->showProgress("警告: 指定されたディレクトリが存在しません: {$dir}");
+            return $files;
+        }
+        
+        try {
+            $iterator = new RecursiveIteratorIterator(
+                new RecursiveDirectoryIterator($dir, RecursiveDirectoryIterator::SKIP_DOTS),
+                RecursiveIteratorIterator::SELF_FIRST
+            );
+            
+            foreach ($iterator as $file) {
+                if ($file->isFile() && preg_match('/\.(' . $extensionsPattern . ')$/i', $file->getPathname())) {
+                    $files[] = $file->getPathname();
+                }
+            }
+            
+            $this->totalFiles = count($files);
+        } catch (Exception $e) {
+            $this->showProgress("エラー: ファイル検索中に例外が発生しました: " . $e->getMessage());
+        }
+        
+        return $files;
+    }
+    
+    /**
+     * ビューリストをロードする
+     * 
+     * @return array ビューリスト
+     */
+    public function loadViews() {
+        $viewFilePath = __DIR__ . '/../input/views.txt';
+        $views = [];
+        
+        if (file_exists($viewFilePath)) {
+            $views = file($viewFilePath, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+            $views = array_map('trim', $views);
+            $this->showProgress("ビューリスト読み込み完了: " . count($views) . " 件のビューを検出");
+        } else {
+            // input/views.txtが存在しない場合は作成する
+            $this->showProgress("ビューリストが見つかりません: $viewFilePath");
+            $inputDir = __DIR__ . '/../input';
+            if (!is_dir($inputDir)) {
+                mkdir($inputDir, 0777, true);
+                $this->showProgress("inputディレクトリを作成しました: $inputDir");
+            }
+            // 空のビューリストを作成
+            file_put_contents($viewFilePath, '');
+            $this->showProgress("空のビューリストファイルを作成しました: $viewFilePath");
+        }
+        
+        return $views;
+    }
+    
+    /**
+     * ファイルからPHPコードを読み込む
+     * 
+     * @param string $filePath ファイルパス
+     * @return string|null ファイル内容またはnull
+     */
+    public function readFile($filePath) {
+        if (!file_exists($filePath)) {
+            $this->showProgress("エラー: ファイルが存在しません: {$filePath}");
+            return null;
+        }
+        
+        try {
+            $content = file_get_contents($filePath);
+            return $content;
+        } catch (Exception $e) {
+            $this->showProgress("エラー: ファイル読み込み中に例外が発生しました: " . $e->getMessage());
+            return null;
+        }
+    }
+    
+    /**
+     * 総ファイル数を設定
+     * 
+     * @param int $totalFiles 総ファイル数
+     */
+    public function setTotalFiles($totalFiles) {
+        $this->totalFiles = $totalFiles;
+    }
+    
+    /**
+     * 処理済みファイル数を取得
+     * 
+     * @return int 処理済みファイル数
+     */
+    public function getProcessedFiles() {
+        return $this->processedFiles;
+    }
+    
+    /**
+     * 総ファイル数を取得
+     * 
+     * @return int 総ファイル数
+     */
+    public function getTotalFiles() {
+        return $this->totalFiles;
+    }
+} 
