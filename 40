@@ -1,0 +1,863 @@
+<?php
+
+use PhpParser\Error;
+use PhpParser\NodeTraverser;
+use PhpParser\NodeVisitor\NameResolver;
+use PhpParser\ParserFactory;
+
+/**
+ * SQL静的解析ツールのメインクラス
+ * 
+ * このクラスは以下の処理を担当します：
+ * 1. ファイル処理
+ *    - 対象ディレクトリの再帰的な走査
+ *    - PHPファイルの読み込み
+ *    - ビューリストの読み込み
+ * 
+ * 2. コード解析
+ *    - PHPParserを使用したAST解析
+ *    - 関数・クラス定義の抽出
+ *    - 文字列連結の処理
+ *    - 変数・定数の解決
+ *    - SQLクエリの抽出と解析
+ * 
+ * 3. 解析結果の管理
+ *    - ファイル単位での結果整理
+ *    - 関数単位での結果整理
+ *    - テーブル単位での操作（CRUD）の集約
+ *    - 結果のマージと重複排除
+ * 
+ * 4. テスト機能
+ *    - テストファイルの実行
+ *    - テスト結果の集計
+ *    - パフォーマンス計測
+ *    - 詳細なテストレポート生成
+ * 
+ * 5. エクセル出力
+ *    - 解析結果のエクセル形式への変換
+ *    - シートの作成とフォーマット
+ *    - 結果の保存
+ * 
+ * 6. デバッグ機能
+ *    - 詳細な処理ログ
+ *    - メモリ使用量の監視
+ *    - 進捗状況の表示
+ *    - エラー処理とフォールバック
+ */
+class SqlAnalyzer {
+    /**
+     * @var FileProcessor ファイル処理クラス
+     */
+    private $fileProcessor;
+    
+    /**
+     * @var StringProcessor 文字列処理クラス
+     */
+    private $stringProcessor;
+    
+    /**
+     * @var QueryParser クエリ解析クラス
+     */
+    private $queryParser;
+    
+    /**
+     * @var ExcelExporter エクセル出力クラス
+     */
+    private $excelExporter;
+    
+    /**
+     * @var array 解析結果
+     */
+    private $results = [];
+    
+    /**
+     * @var array ビューリスト
+     */
+    private $views = [];
+    
+    /**
+     * @var bool 詳細出力モード
+     */
+    private $verbose = false;
+    
+    /**
+     * @var \PhpParser\Parser PHPParser
+     */
+    private $parser;
+    
+    /**
+     * コンストラクタ
+     * 
+     * @param bool $verbose 詳細出力モード
+     */
+    public function __construct($verbose = false) {
+        $this->verbose = $verbose;
+        
+        // 依存クラスを初期化
+        $this->fileProcessor = new FileProcessor($verbose);
+        $this->stringProcessor = new StringProcessor($verbose);
+        $this->queryParser = new QueryParser([], $verbose);
+        $this->excelExporter = new ExcelExporter($verbose);
+        
+        // ビューリストを読み込む
+        $this->views = $this->fileProcessor->loadViews();
+        
+        // クエリ解析器にビューリストを設定
+        $this->queryParser = new QueryParser($this->views, $verbose);
+        
+        // PHPParserの初期化
+        if (class_exists('PhpParser\ParserFactory')) {
+            $parserFactory = new ParserFactory;
+            $this->parser = $parserFactory->createForNewestSupportedVersion();
+        }
+    }
+    
+    /**
+     * 解析を実行
+     * 
+     * @param string $targetDir 解析対象ディレクトリ
+     * @return bool 成功したかどうか
+     */
+    public function analyze($targetDir) {
+        // 解析開始メッセージ
+        $this->showProgress("SQL静的解析を開始します: {$targetDir}");
+        
+        // ファイルリストの取得
+        $this->showProgress("対象ファイルを検索中...");
+        $files = $this->fileProcessor->findFiles($targetDir, ['php', 'inc', 'html', 'js']);
+        
+        if (empty($files)) {
+            $this->showProgress("エラー: 解析対象ファイルが見つかりませんでした。");
+            return false;
+        }
+        
+        // ファイル数を設定
+        $this->fileProcessor->setTotalFiles(count($files));
+        $this->showProgress("解析対象ファイル数: " . $this->fileProcessor->getTotalFiles());
+        
+        // 各ファイルを解析
+        foreach ($files as $filePath) {
+            $this->analyzeFile($filePath);
+            $this->fileProcessor->updateProgress(basename($filePath));
+        }
+        
+        // 結果を出力
+        $this->showProgress("処理完了: " . $this->fileProcessor->getProcessedFiles() . " ファイルを解析しました");
+        
+        // エクセル出力
+        if (!empty($this->results)) {
+            $this->showProgress("エクセルファイルに出力中...");
+            $filepath = $this->excelExporter->export($this->results, $this->views);
+            $this->showProgress("エクセル出力完了: {$filepath}");
+        } else {
+            $this->showProgress("結果が空のため、エクセル出力はスキップします");
+        }
+        
+        return true;
+    }
+    
+    /**
+     * 指定されたファイルを解析
+     * 
+     * @param string $filePath ファイルパス
+     */
+    private function analyzeFile($filePath) {
+        // メモリ使用量の初期値を記録
+        $initialMemory = memory_get_usage();
+        
+        // ファイル内容を取得
+        $code = $this->fileProcessor->readFile($filePath);
+        if ($code === null) {
+            return;
+        }
+        
+        // 進捗表示
+        $this->showProgress("解析中: " . basename($filePath));
+        
+        // PHPParserを使用して関数解析が可能かチェック
+        if ($this->parser !== null) {
+            try {
+                $this->analyzeWithParser($code, $filePath);
+            } catch (Error $e) {
+                $this->showProgress("PHPParserによる解析に失敗: " . $e->getMessage() . " 正規表現ベースの解析に切り替えます");
+                // エラーが発生した場合は従来の方法でフォールバック
+                $this->analyzeWithRegex($code, $filePath);
+            }
+        } else {
+            // PHPParserが利用できない場合は正規表現ベースで解析
+            $this->analyzeWithRegex($code, $filePath);
+        }
+        
+        // メモリ使用量の変化を表示
+        $currentMemory = memory_get_usage();
+        $memoryDiff = $currentMemory - $initialMemory;
+        $this->showProgress("メモリ使用量: " . round($memoryDiff / 1024 / 1024, 2) . "MB");
+    }
+    
+    /**
+     * PHPParserを使用したファイル解析
+     * 
+     * @param string $code ファイル内容
+     * @param string $filePath ファイルパス
+     */
+    private function analyzeWithParser($code, $filePath) {
+        // PHPタグが省略されている場合は追加
+        if (strpos($code, '<?php') === false && strpos($code, '<?=') === false) {
+            $code = '<?php ' . $code;
+        }
+        
+        try {
+            // ASTへのパース
+            $ast = $this->parser->parse($code);
+            
+            // 名前解決と定数解決のためのビジター追加
+            $nameResolver = new NameResolver();
+            $traverser = new NodeTraverser();
+            $traverser->addVisitor($nameResolver);
+            
+            // カスタムビジターを追加して変数の追跡と解決を行う
+            $variableCollector = new class($this->verbose) extends \PhpParser\NodeVisitorAbstract {
+                private $variables = [];
+                private $constants = [];
+                private $verbose;
+                
+                public function __construct($verbose) {
+                    $this->verbose = $verbose;
+                }
+                
+                public function enterNode(\PhpParser\Node $node) {
+                    // 変数代入の収集
+                    if ($node instanceof \PhpParser\Node\Expr\Assign) {
+                        if ($node->var instanceof \PhpParser\Node\Expr\Variable) {
+                            $varName = $node->var->name;
+                            if (is_string($varName)) {
+                                if ($node->expr instanceof \PhpParser\Node\Scalar\String_) {
+                                    $this->variables[$varName] = $node->expr->value;
+                                } else if ($node->expr instanceof \PhpParser\Node\Scalar\LNumber) {
+                                    $this->variables[$varName] = (string)$node->expr->value;
+                                } else if ($node->expr instanceof \PhpParser\Node\Scalar\DNumber) {
+                                    $this->variables[$varName] = (string)$node->expr->value;
+                                }
+                            }
+                        }
+                    }
+                    // 定数定義の収集
+                    else if ($node instanceof \PhpParser\Node\Expr\FuncCall) {
+                        if ($node->name instanceof \PhpParser\Node\Name && $node->name->toString() === 'define') {
+                            if (isset($node->args[0]) && isset($node->args[1])) {
+                                $arg0 = $node->args[0]->value;
+                                $arg1 = $node->args[1]->value;
+                                
+                                if ($arg0 instanceof \PhpParser\Node\Scalar\String_ && 
+                                    $arg1 instanceof \PhpParser\Node\Scalar\String_) {
+                                    $this->constants[$arg0->value] = $arg1->value;
+                                }
+                            }
+                        }
+                    }
+                    // const宣言の収集
+                    else if ($node instanceof \PhpParser\Node\Stmt\Const_) {
+                        foreach ($node->consts as $const) {
+                            if ($const->value instanceof \PhpParser\Node\Scalar\String_) {
+                                $this->constants[$const->name->toString()] = $const->value->value;
+                            }
+                        }
+                    }
+                }
+                
+                public function getVariables() {
+                    return $this->variables;
+                }
+                
+                public function getConstants() {
+                    return $this->constants;
+                }
+            };
+            
+            $traverser->addVisitor($variableCollector);
+            $ast = $traverser->traverse($ast);
+            
+            // 関数とクラス定義の分析
+            $this->analyzeFunctionsAndClasses($ast, $filePath);
+            
+            // 文字列連結と変数解決を行う
+            list($processedCode, $unresolved) = $this->stringProcessor->process($code);
+            
+            // 処理されたコードを検証（デバッグ用）
+            $this->stringProcessor->checkProcessedCode($processedCode, basename($filePath));
+            
+            // クエリパーサーに未解決変数・定数を設定
+            $this->queryParser->setUnresolved($unresolved);
+            
+            // 変数コレクターから収集した変数と定数も設定
+            $this->stringProcessor->addCollectedVariables($variableCollector->getVariables());
+            $this->stringProcessor->addCollectedConstants($variableCollector->getConstants());
+            
+            // SQLクエリの解析（関数外のコードを'main'として扱う）
+            $results = $this->queryParser->parseQueries($processedCode, 'main', basename($filePath));
+            
+            // 結果をマージ
+            $this->mergeResults($results);
+            
+        } catch (Error $e) {
+            $this->showProgress("PHPParserによる解析に失敗: " . $e->getMessage() . " 正規表現ベースの解析に切り替えます");
+            // エラーが発生した場合は従来の方法でフォールバック
+            $this->analyzeWithRegex($code, $filePath);
+        }
+    }
+    
+    /**
+     * ASTから関数とクラスを解析
+     * 
+     * @param array $ast 抽象構文木
+     * @param string $filePath ファイルパス
+     */
+    private function analyzeFunctionsAndClasses($ast, $filePath) {
+        foreach ($ast as $node) {
+            $this->analyzeNode($node, basename($filePath));
+        }
+    }
+    
+    /**
+     * ノードを解析（再帰的に処理）
+     *
+     * @param \PhpParser\Node $node 解析対象ノード
+     * @param string $filePath ファイル名
+     */
+    private function analyzeNode($node, $filePath) {
+        // 関数定義
+        if ($node instanceof \PhpParser\Node\Stmt\Function_) {
+            $this->analyzeFunctionNode($node, $filePath);
+        }
+        // クラス定義
+        else if ($node instanceof \PhpParser\Node\Stmt\Class_) {
+            $this->analyzeClassNode($node, $filePath);
+        }
+        // 他のノード内の子ノードも再帰的に処理
+        else if ($node instanceof \PhpParser\Node\Stmt\Class_ || 
+                 $node instanceof \PhpParser\Node\Stmt\Function_ ||
+                 $node instanceof \PhpParser\Node\Stmt\Namespace_) {
+            foreach ($node->stmts as $subNode) {
+                $this->analyzeNode($subNode, $filePath);
+            }
+        }
+    }
+    
+    /**
+     * 関数定義ノードを解析
+     *
+     * @param \PhpParser\Node\Stmt\Function_ $node 関数定義ノード
+     * @param string $filePath ファイル名
+     */
+    private function analyzeFunctionNode($node, $filePath) {
+        $functionName = $node->name->toString();
+        $stmts = $node->getStmts();
+        
+        // 関数内の各文を連結してコードブロックを作成
+        $functionCode = '';
+        foreach ($stmts as $stmt) {
+            $functionCode .= $this->getNodeCode($stmt);
+        }
+        
+        // 文字列連結と変数解決を行う
+        list($processedCode, $unresolved) = $this->stringProcessor->process($functionCode);
+        
+        // クエリパーサーに未解決変数・定数を設定
+        $this->queryParser->setUnresolved($unresolved);
+        
+        // 関数内のSQLクエリを解析
+        $results = $this->queryParser->parseQueries($processedCode, $functionName, $filePath);
+        
+        // 結果をマージ
+        $this->mergeResults($results);
+    }
+    
+    /**
+     * クラス定義ノードを解析
+     *
+     * @param \PhpParser\Node\Stmt\Class_ $node クラス定義ノード
+     * @param string $filePath ファイル名
+     */
+    private function analyzeClassNode($node, $filePath) {
+        $className = $node->name->toString();
+        
+        // クラス内のメソッドを取得
+        foreach ($node->getMethods() as $method) {
+            $methodName = $method->name->toString();
+            $isStatic = $method->isStatic();
+            $fullMethodName = $methodName;
+            
+            // メソッド内の各文を連結してコードブロックを作成
+            $methodCode = '';
+            foreach ($method->getStmts() as $stmt) {
+                $methodCode .= $this->getNodeCode($stmt);
+            }
+            
+            // 文字列連結と変数解決を行う
+            list($processedCode, $unresolved) = $this->stringProcessor->process($methodCode);
+            
+            // クエリパーサーに未解決変数・定数を設定
+            $this->queryParser->setUnresolved($unresolved);
+            
+            // メソッド内のSQLクエリを解析
+            $results = $this->queryParser->parseQueries($processedCode, $fullMethodName, $filePath);
+            
+            // 結果をマージ
+            $this->mergeResults($results);
+        }
+    }
+    
+    /**
+     * ノードからコードを取得
+     *
+     * @param \PhpParser\Node\Stmt|\PhpParser\Node\Expr $node ノード
+     * @return string コード
+     */
+    private function getNodeCode($node) {
+        // ノードに該当する部分のコードを取得
+        if ($node instanceof \PhpParser\Node\Expr\Assign) {
+            // 代入ノードの処理
+            if ($node->var instanceof \PhpParser\Node\Expr\Variable && 
+                $node->expr instanceof \PhpParser\Node\Scalar\String_) {
+                return '$' . $node->var->name . ' = "' . $node->expr->value . '";';
+            } elseif ($node->var instanceof \PhpParser\Node\Expr\Variable && 
+                     $node->expr instanceof \PhpParser\Node\Scalar\LNumber) {
+                return '$' . $node->var->name . ' = ' . $node->expr->value . ';';
+            } elseif ($node->var instanceof \PhpParser\Node\Expr\Variable && 
+                     $node->expr instanceof \PhpParser\Node\Scalar\DNumber) {
+                return '$' . $node->var->name . ' = ' . $node->expr->value . ';';
+            }
+        } elseif ($node instanceof \PhpParser\Node\Stmt\Expression) {
+            // 式ステートメントの場合、式自体を取得
+            return $this->getNodeCode($node->expr) . ';';
+        } elseif ($node instanceof \PhpParser\Node\Expr\BinaryOp\Concat) {
+            // 文字列連結の場合
+            $left = $this->getNodeCode($node->left);
+            $right = $this->getNodeCode($node->right);
+            return $left . ' . ' . $right;
+        }
+        
+        // PrettyPrinterを使ってコードを取得（より安全な方法）
+        try {
+            $prettyPrinter = new \PhpParser\PrettyPrinter\Standard();
+            return $prettyPrinter->prettyPrint([$node]);
+        } catch (\Exception $e) {
+            // エラーが発生した場合は空文字列を返す
+            $this->showProgress("ノードコード取得エラー: " . $e->getMessage());
+            return '';
+        }
+    }
+    
+    /**
+     * 正規表現ベースの解析
+     * 
+     * @param string $code ファイル内容
+     * @param string $filePath ファイルパス
+     */
+    private function analyzeWithRegex($code, $filePath) {
+        // 文字列連結と変数解決を行う
+        list($processedCode, $unresolved) = $this->stringProcessor->process($code);
+        
+        // 処理されたコードを検証（デバッグ用）
+        $this->stringProcessor->checkProcessedCode($processedCode, basename($filePath));
+        
+        // クエリパーサーに未解決変数・定数を設定
+        $this->queryParser->setUnresolved($unresolved);
+        
+        // 関数定義を検出
+        preg_match_all('/function\s+([a-zA-Z0-9_]+)\s*\([^)]*\)\s*\{(.*?)\}/s', $processedCode, $functionMatches, PREG_SET_ORDER);
+        
+        // メソッド定義を検出
+        preg_match_all('/class\s+([a-zA-Z0-9_]+).*?\{(.*?)\}/s', $processedCode, $classMatches, PREG_SET_ORDER);
+        
+        // 関数外のコード部分を抽出
+        $mainCode = $processedCode;
+        foreach ($functionMatches as $match) {
+            $mainCode = str_replace($match[0], '', $mainCode);
+        }
+        foreach ($classMatches as $match) {
+            $mainCode = str_replace($match[0], '', $mainCode);
+        }
+        
+        // 関数定義ごとにSQLクエリ解析
+        foreach ($functionMatches as $match) {
+            $functionName = $match[1];
+            $functionBody = $match[2];
+            
+            // 関数内のSQLクエリを解析
+            $results = $this->queryParser->parseQueries($functionBody, $functionName, basename($filePath));
+            
+            // 結果をマージ
+            $this->mergeResults($results);
+        }
+        
+        // クラス内のメソッド定義を検出して解析
+        foreach ($classMatches as $classMatch) {
+            $className = $classMatch[1];
+            $classBody = $classMatch[2];
+            
+            // メソッド定義を検出
+            preg_match_all('/(public|private|protected|static)?\s*function\s+([a-zA-Z0-9_]+)\s*\([^)]*\)\s*\{(.*?)\}/s', $classBody, $methodMatches, PREG_SET_ORDER);
+            
+            foreach ($methodMatches as $methodMatch) {
+                $methodName = $methodMatch[2];
+                $methodBody = $methodMatch[3];
+                
+                // メソッド内のSQLクエリを解析
+                $results = $this->queryParser->parseQueries($methodBody, $methodName, basename($filePath));
+                
+                // 結果をマージ
+                $this->mergeResults($results);
+            }
+        }
+        
+        // 関数外のコード（main扱い）のSQLクエリ解析
+        $results = $this->queryParser->parseQueries($mainCode, 'main', basename($filePath));
+        
+        // 結果をマージ
+        $this->mergeResults($results);
+    }
+    
+    /**
+     * 結果をマージする
+     * 
+     * @param array $newResults 新しい結果
+     */
+    private function mergeResults($newResults) {
+        foreach ($newResults as $filePath => $functions) {
+            if (!isset($this->results[$filePath])) {
+                $this->results[$filePath] = [];
+            }
+            
+            foreach ($functions as $functionName => $tables) {
+                if (!isset($this->results[$filePath][$functionName])) {
+                    $this->results[$filePath][$functionName] = [];
+                }
+                
+                foreach ($tables as $tableName => $operations) {
+                    if (!isset($this->results[$filePath][$functionName][$tableName])) {
+                        $this->results[$filePath][$functionName][$tableName] = [];
+                    }
+                    
+                    $this->results[$filePath][$functionName][$tableName] = array_merge(
+                        $this->results[$filePath][$functionName][$tableName],
+                        $operations
+                    );
+                    
+                    // 重複を排除
+                    $this->results[$filePath][$functionName][$tableName] = array_unique(
+                        $this->results[$filePath][$functionName][$tableName]
+                    );
+                }
+            }
+        }
+    }
+    
+    /**
+     * テスト実行メソッド
+     * 
+     * @param string $testDir テストディレクトリ
+     * @return array テスト結果
+     */
+    public function runTests($testDir) {
+        // 結果をリセット
+        $this->results = [];
+        
+        // テストメッセージ
+        $this->showProgress("SQL静的解析テストを開始します: {$testDir}");
+        
+        // テスト対象ファイルを検索
+        $files = $this->fileProcessor->findFiles($testDir, ['php']);
+        if (empty($files)) {
+            $this->showProgress("エラー: テストファイルが見つかりませんでした。");
+            return ['success' => false, 'message' => 'テストファイルが見つかりませんでした'];
+        }
+        
+        // テストファイル一覧を表示
+        $this->showProgress("テスト対象ファイル: ");
+        foreach ($files as $index => $file) {
+            $this->showProgress("  " . ($index + 1) . ". " . basename($file));
+        }
+        
+        $testResults = [];
+        $successCount = 0;
+        $queryCount = 0;
+        $crudCounts = ['C' => 0, 'R' => 0, 'U' => 0, 'D' => 0];
+        $tableStats = [];
+        $startTime = microtime(true);
+        
+        // 各テストファイルを実行
+        foreach ($files as $filePath) {
+            $filename = basename($filePath);
+            $fileStartTime = microtime(true);
+            $this->showProgress("\nテスト実行中: {$filename}");
+            
+            // ファイルを解析
+            $this->analyzeFile($filePath);
+            $fileEndTime = microtime(true);
+            $fileTime = round(($fileEndTime - $fileStartTime) * 1000, 2); // ミリ秒単位
+            
+            // テスト結果を判定
+            $testSuccess = false;
+            $testMessage = '';
+            $fileQueries = 0;
+            $fileTables = 0;
+            $fileCrud = ['C' => 0, 'R' => 0, 'U' => 0, 'D' => 0];
+            
+            // 結果があればテスト成功
+            if (isset($this->results[basename($filePath)])) {
+                $testSuccess = true;
+                
+                // ファイル内のクエリ数をカウント
+                foreach ($this->results[basename($filePath)] as $function => $tables) {
+                    $fileTables += count($tables);
+                    
+                    foreach ($tables as $table => $operations) {
+                        $fileQueries += count($operations);
+                        
+                        // テーブル統計を収集
+                        if (!isset($tableStats[$table])) {
+                            $tableStats[$table] = [
+                                'C' => 0, 'R' => 0, 'U' => 0, 'D' => 0,
+                                'files' => [], 'isView' => false, 'isTemp' => false
+                            ];
+                        }
+                        
+                        // ファイル追跡
+                        if (!in_array($filename, $tableStats[$table]['files'])) {
+                            $tableStats[$table]['files'][] = $filename;
+                        }
+                        
+                        // CRUD操作をカウント
+                        foreach ($operations as $op) {
+                            $opType = substr($op, 0, 1);
+                            if (in_array($opType, ['C', 'R', 'U', 'D'])) {
+                                $fileCrud[$opType]++;
+                                $crudCounts[$opType]++;
+                                $tableStats[$table][$opType]++;
+                            }
+                            
+                            // テンポラリかビューかをチェック
+                            if (strpos($op, '@temp') !== false) {
+                                $tableStats[$table]['isTemp'] = true;
+                            }
+                            if (strpos($op, '@view') !== false) {
+                                $tableStats[$table]['isView'] = true;
+                            }
+                        }
+                    }
+                }
+                
+                $queryCount += $fileQueries;
+                $crudSummary = "C:{$fileCrud['C']} R:{$fileCrud['R']} U:{$fileCrud['U']} D:{$fileCrud['D']}";
+                $testMessage = "{$fileQueries}個のクエリ, {$fileTables}個のテーブル (CRUD: {$crudSummary})";
+                $successCount++;
+            } else {
+                $testSuccess = false;
+                $testMessage = 'SQLクエリが検出されませんでした';
+            }
+            
+            // テスト結果を記録
+            $testResults[$filename] = [
+                'success' => $testSuccess,
+                'message' => $testMessage,
+                'queries' => $fileQueries,
+                'tables' => $fileTables,
+                'crud' => $fileCrud,
+                'time' => $fileTime
+            ];
+            
+            $statusMark = $testSuccess ? '✓' : '✗';
+            $this->showProgress("{$statusMark} テスト {$filename}: {$testMessage} ({$fileTime}ms)");
+        }
+        
+        $endTime = microtime(true);
+        $totalTime = round(($endTime - $startTime) * 1000, 2); // ミリ秒単位
+        
+        // 成功率を計算
+        $totalTests = count($files);
+        $successRate = ($totalTests > 0) ? round(($successCount / $totalTests) * 100, 1) : 0;
+        
+        $this->showProgress("\n===== テスト結果の要約 =====");
+        $this->showProgress("実行されたテスト: {$totalTests}");
+        $this->showProgress("成功したテスト: {$successCount}");
+        $this->showProgress("検出されたクエリ数: {$queryCount}");
+        $crudSummary = "C:{$crudCounts['C']} R:{$crudCounts['R']} U:{$crudCounts['U']} D:{$crudCounts['D']}";
+        $this->showProgress("CRUD操作の合計: {$crudSummary}");
+        $this->showProgress("成功率: {$successRate}%");
+        $this->showProgress("実行時間: {$totalTime}ms");
+        
+        // 詳細なテスト結果を表示
+        $this->showProgress("\n===== 詳細なテスト結果 =====");
+        foreach ($testResults as $filename => $result) {
+            $status = $result['success'] ? '✓ 成功' : '✗ 失敗';
+            $timeInfo = "({$result['time']}ms)";
+            $this->showProgress("{$status}: {$filename} - {$result['message']} {$timeInfo}");
+        }
+        
+        // 検出されたテーブルと操作を表示
+        $this->showProgress("\n===== 検出されたSQLクエリとCRUD操作 =====");
+        $this->printDetectedTables();
+        
+        // テスト統計を追加出力
+        $this->showProgress("\n===== テスト統計の詳細 =====");
+        $this->showProgress("最も多くのクエリを含むファイル: " . $this->findMaxByKey($testResults, 'queries'));
+        $this->showProgress("最も多くのテーブルを使用するファイル: " . $this->findMaxByKey($testResults, 'tables'));
+        $this->showProgress("処理時間が最も長いファイル: " . $this->findMaxByKey($testResults, 'time'));
+        
+        return [
+            'success' => $successCount > 0,
+            'testResults' => $testResults,
+            'totalTests' => $totalTests,
+            'successCount' => $successCount,
+            'queryCount' => $queryCount,
+            'successRate' => $successRate,
+            'crudCounts' => $crudCounts,
+            'tableStats' => $tableStats,
+            'totalTime' => $totalTime,
+            'results' => $this->results
+        ];
+    }
+    
+    /**
+     * 指定されたキーの値が最大のファイル名を取得
+     * 
+     * @param array $results テスト結果
+     * @param string $key 比較するキー
+     * @return string ファイル名
+     */
+    private function findMaxByKey($results, $key) {
+        $maxValue = 0;
+        $maxFile = '';
+        
+        foreach ($results as $filename => $result) {
+            if ($result[$key] > $maxValue) {
+                $maxValue = $result[$key];
+                $maxFile = $filename;
+            }
+        }
+        
+        return $maxFile . " ({$maxValue})";
+    }
+    
+    /**
+     * 検出されたテーブルと操作を表示
+     */
+    private function printDetectedTables() {
+        if (empty($this->results)) {
+            $this->showProgress("検出されたテーブルはありません。");
+            return;
+        }
+        
+        // ファイル数をカウント
+        $fileCount = count($this->results);
+        $this->showProgress("合計 {$fileCount} ファイルでSQLクエリを検出: ");
+        
+        $totalTables = 0;
+        $totalQueries = 0;
+        $tableStats = [];
+        
+        foreach ($this->results as $filePath => $functions) {
+            $this->showProgress("\n📄 ファイル: {$filePath}");
+            $fileTables = 0;
+            $fileQueries = 0;
+            
+            foreach ($functions as $functionName => $tables) {
+                $this->showProgress("  関数: {$functionName}");
+                
+                foreach ($tables as $tableName => $operations) {
+                    $fileTables++;
+                    $totalTables++;
+                    $fileQueries += count($operations);
+                    $totalQueries += count($operations);
+                    
+                    // テーブル統計を集計
+                    if (!isset($tableStats[$tableName])) {
+                        $tableStats[$tableName] = [
+                            'C' => 0, 'R' => 0, 'U' => 0, 'D' => 0, 
+                            'files' => [], 'isView' => false, 'isTemp' => false
+                        ];
+                    }
+                    
+                    // ファイル追跡
+                    if (!in_array($filePath, $tableStats[$tableName]['files'])) {
+                        $tableStats[$tableName]['files'][] = $filePath;
+                    }
+                    
+                    $operationsStr = implode(',', $operations);
+                    $isView = strpos($operationsStr, '@view') !== false;
+                    $isTemp = strpos($operationsStr, '@temp') !== false;
+                    
+                    if ($isView) {
+                        $tableStats[$tableName]['isView'] = true;
+                    }
+                    
+                    if ($isTemp) {
+                        $tableStats[$tableName]['isTemp'] = true;
+                    }
+                    
+                    // 各操作をカウント
+                    foreach ($operations as $op) {
+                        $opType = substr($op, 0, 1);
+                        if (in_array($opType, ['C', 'R', 'U', 'D'])) {
+                            $tableStats[$tableName][$opType]++;
+                        }
+                    }
+                    
+                    // 操作タイプとアノテーションを表示
+                    $tableType = $isView ? "📊" : ($isTemp ? "⏱️" : "📋");
+                    $notes = [];
+                    if ($isView) $notes[] = '@view';
+                    if ($isTemp) $notes[] = '@temp';
+                    $notesStr = !empty($notes) ? " (" . implode(', ', $notes) . ")" : '';
+                    
+                    $this->showProgress("    {$tableType} テーブル: {$tableName}{$notesStr} - 操作: {$operationsStr}");
+                }
+            }
+            
+            $this->showProgress("  -- {$filePath} 内で {$fileTables} テーブルに対する {$fileQueries} 件のクエリを検出");
+        }
+        
+        // テーブル統計の要約表示
+        $this->showProgress("\n===== テーブル統計の要約 =====");
+        $this->showProgress("合計テーブル数: {$totalTables} (ユニーク: " . count($tableStats) . ")");
+        $this->showProgress("合計クエリ数: {$totalQueries}");
+        
+        // 各テーブルの詳細統計
+        $this->showProgress("\n----- テーブル別統計 -----");
+        foreach ($tableStats as $tableName => $stats) {
+            $tableType = $stats['isView'] ? "📊" : ($stats['isTemp'] ? "⏱️" : "📋");
+            $typeLabel = $stats['isView'] ? " (ビュー)" : ($stats['isTemp'] ? " (一時テーブル)" : "");
+            $this->showProgress("{$tableType} {$tableName}{$typeLabel}:");
+            $this->showProgress("  CRUD操作: C:{$stats['C']} R:{$stats['R']} U:{$stats['U']} D:{$stats['D']}");
+            $this->showProgress("  利用ファイル数: " . count($stats['files']));
+        }
+    }
+    
+    /**
+     * 進捗メッセージを表示
+     * 
+     * @param string $message メッセージ
+     */
+    private function showProgress($message) {
+        $this->fileProcessor->showProgress($message);
+    }
+    
+    /**
+     * 結果を取得
+     * 
+     * @return array 解析結果
+     */
+    public function getResults() {
+        return $this->results;
+    }
+    
+    /**
+     * ビューリストを取得
+     * 
+     * @return array ビューリスト
+     */
+    public function getViews() {
+        return $this->views;
+    }
+} 
