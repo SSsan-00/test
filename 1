@@ -1,110 +1,279 @@
 #!/usr/bin/env php
 <?php
+/**
+ * CRUD Analyzer v3.0  (AST Edition)
+ * ------------------------------------------------------------------
+ * 1. 再帰的に *.php / *.inc / *.html / *.js を走査
+ * 2. PhpParser AST で  SQL 文字列を静的抽出
+ * 3. CRUD 判定し Excel 出力 (output/crud_analysis.xlsx)
+ * 
+ * 2025-05-21  MIT
+ * ------------------------------------------------------------------
+ * usage: php crudAnalyzer.php <TARGET_DIR>
+ */
+
 declare(strict_types=1);
+require_once __DIR__ . '/vendor/autoload.php';
 
-require __DIR__ . '/vendor/autoload.php';
+use PhpParser\{ParserFactory, Node, NodeTraverser};
+use PhpParser\Node\Expr\{Assign, AssignOp\Concat as AssignConcat,
+    BinaryOp\Concat, Variable, ConstFetch, Encapsed, FuncCall, MethodCall,
+    StaticCall, PropertyFetch};
+use PhpParser\Node\Scalar\String_;
+use PhpOffice\PhpSpreadsheet\{Spreadsheet, Writer\Xlsx};
 
-use PhpOffice\PhpSpreadsheet\Spreadsheet;
-use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
-use PhpParser\ParserFactory;
+/* =========================================================
+   0. 定数・設定
+   ======================================================= */
+const EXT_PATTERN  = '/\.(php|inc|html?|js)$/i';
+const SQL_HEAD     = '(SELECT|INSERT|UPDATE|DELETE|MERGE|CREATE|DROP|TRUNCATE|WITH)';
+date_default_timezone_set('Asia/Tokyo');
 
-// ガベージコレクション有効化
-gc_enable();
-
-// 引数チェック
-if ($argc < 3) {
-    fwrite(STDERR, "Usage: php analyzer.php <target_dir> <output.xlsx>\n");
+/* =========================================================
+   1. 引数チェック
+   ======================================================= */
+$target = $argv[1] ?? '';
+if (!$target || !is_dir($target = realpath($target))) {
+    fwrite(STDERR, "Usage: php crudAnalyzer.php <TARGET_DIR>\n");
     exit(1);
 }
 
-$targetDir  = rtrim($argv[1], "/\\");
-$outputFile = $argv[2];
-if (!is_dir($targetDir)) {
-    fwrite(STDERR, "Error: '{$targetDir}' is not a directory.\n");
-    exit(1);
-}
+/* ビュー一覧 (任意) */
+$views = is_file($vf = __DIR__ . '/input/views.txt')
+       ? array_map('strtolower', array_map('trim', file($vf)))
+       : [];
 
-// 将来の AST 用意（今回は使わないがインスタンスのみ）
+/* =========================================================
+   2. 進捗用に対象ファイル数を取得
+   ======================================================= */
+$total = iterator_count(new RegexIterator(
+            new RecursiveIteratorIterator(
+                new RecursiveDirectoryIterator($target, FilesystemIterator::SKIP_DOTS)
+            ), EXT_PATTERN
+         ));
+if (!$total) { echo "解析対象なし\n"; exit; }
+$done = 0; $start = microtime(true); $last = $start;
+
+/* =========================================================
+   3. CRUD 結果ハッシュ
+   ======================================================= */
+$crud = []; // key => row-array
+$addCrud = function(string $file,string $func,string $tbl,array $ops,bool $isView,bool $isTemp) use (&$crud) {
+    $note = [];
+    if ($isView) $note[]='@view';
+    if ($isTemp) $note[]='@temp';
+    $key = "$file|$func|$tbl|".implode(',',$note);
+    $crud[$key]['file']   = $file;
+    $crud[$key]['func']   = $func;
+    $crud[$key]['table']  = $tbl;
+    $crud[$key]['note']   = implode(',',$note);
+    foreach (['C','R','U','D'] as $c) {
+        $crud[$key][$c] = ($crud[$key][$c] ?? false) || !empty($ops[$c]);
+    }
+};
+
+/* =========================================================
+   4. パーサ準備
+   ======================================================= */
 $parser = (new ParserFactory())->createForNewestSupportedVersion();
 
-// スプレッドシート準備（シートは 1 枚）
-$spreadsheet = new Spreadsheet();
-$sheet       = $spreadsheet->getActiveSheet();
-$sheet->setTitle('CRUD Results');
+/* =========================================================
+   5. メイン走査
+   ======================================================= */
+$iter = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($target, FilesystemIterator::SKIP_DOTS));
+foreach ($iter as $fInfo) {
+    if (!$fInfo->isFile() || !preg_match(EXT_PATTERN, $fInfo->getFilename())) continue;
 
-// ヘッダー
-$sheet->fromArray(['File', 'Table', 'C', 'R', 'U', 'D'], null, 'A1');
+    $rel = substr($fInfo->getPathname(), strlen($target)+1);
+    $code = file_get_contents($fInfo->getPathname());
+    if ($code===false) continue;
 
-$row = 2;
-$prevFile = null;
+    /* ---- AST 解析 ------------------------------------------------- */
+    try {
+        $stmts = $parser->parse($code);
+        $traverser = new NodeTraverser();
+        $visitor   = new class($rel,$addCrud,$views) extends PhpParser\NodeVisitorAbstract {
 
-$rii = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($targetDir));
-foreach ($rii as $file) {
-    if (!$file->isFile() || strtolower($file->getExtension()) !== 'php') {
-        continue;
-    }
+            private string $file;
+            private $addCrud;
+            private array  $views;
+            private array  $symStack = [[]];     // 変数→文字列 のスタック
+            private string $func = 'main';
 
-    // 相対パス
-    $relPath = substr($file->getPathname(), strlen($targetDir) + 1);
-    $content = file_get_contents($file->getPathname());
-    $crudMap = analyzeCrud($content);
-
-    // ファイル内の各テーブル操作を出力
-    foreach ($crudMap as $table => $ops) {
-        // ファイル切り替え時は空行を挿入
-        if ($relPath !== $prevFile) {
-            if ($prevFile !== null) {
-                $row++;  // 空白行
+            public function __construct(string $file, callable $addCrud, array $views) {
+                $this->file = $file;
+                $this->addCrud = $addCrud;
+                $this->views = $views;
             }
-            // 新ファイル名を出力
-            $sheet->setCellValue("A{$row}", $relPath);
-            $prevFile = $relPath;
-        }
-        // 同一ファイル２行目以降は A 列を空白に
-        // テーブルと CRUD 列を埋める
-        $sheet->setCellValue("B{$row}", $table);
-        $sheet->setCellValue("C{$row}", $ops['C'] ? '○' : '');
-        $sheet->setCellValue("D{$row}", $ops['R'] ? '○' : '');
-        $sheet->setCellValue("E{$row}", $ops['U'] ? '○' : '');
-        $sheet->setCellValue("F{$row}", $ops['D'] ? '○' : '');
 
-        $row++;
-    }
-
-    // メモリ解放
-    unset($content, $crudMap);
-    gc_collect_cycles();
-}
-
-// ファイル書き出し
-$writer = new Xlsx($spreadsheet);
-$writer->save($outputFile);
-
-echo "✔ {$outputFile} を生成しました。\n\n";
-
-/**
- * 簡易版：正規表現による CRUD 抽出
- */
-function analyzeCrud(string $content): array
-{
-    $map = [];
-    $patterns = [
-        'C' => '/INSERT\s+INTO\s+`?([a-zA-Z0-9_]+)`?/i',
-        'R' => '/SELECT\b.*?\bFROM\s+`?([a-zA-Z0-9_]+)`?/is',
-        'U' => '/UPDATE\s+`?([a-zA-Z0-9_]+)`?/i',
-        'D' => '/DELETE\s+FROM\s+`?([a-zA-Z0-9_]+)`?/i',
-    ];
-
-    foreach ($patterns as $op => $pat) {
-        if (preg_match_all($pat, $content, $m)) {
-            foreach ($m[1] as $tbl) {
-                if (!isset($map[$tbl])) {
-                    $map[$tbl] = ['C'=>false,'R'=>false,'U'=>false,'D'=>false];
+            /* ---------- スコープ管理 ---------- */
+            public function enterNode(Node $n) {
+                if ($n instanceof Node\Stmt\Function_) {
+                    $this->symStack[] = [];
+                    $this->func = $n->name->toString();
                 }
-                $map[$tbl][$op] = true;
+                elseif ($n instanceof Node\Stmt\ClassMethod) {
+                    $this->symStack[] = [];
+                    /** @var Node\Stmt\Class_ $cls */
+                    $cls = $n->getAttribute('parent');
+                    $className = $cls instanceof Node\Stmt\Class_ && $cls->name
+                               ? $cls->name->toString() : 'anonymousClass';
+                    $this->func = $className.'::'.$n->name->toString();
+                }
+
+                /* -------- 変数代入 -------- */
+                if ($n instanceof Assign) {
+                    if ($n->var instanceof Variable && is_string($n->var->name)) {
+                        $val = $this->evalExpr($n->expr);
+                        if ($val!==null) $this->top()[$n->var->name] = $val;
+                    }
+                }
+                /* -------- .= 連結 -------- */
+                elseif ($n instanceof AssignConcat) {
+                    if ($n->var instanceof Variable && is_string($n->var->name)) {
+                        $left = $this->top()[$n->var->name] ?? '';
+                        $right= $this->evalExpr($n->expr) ?? '';
+                        if (is_string($left) && is_string($right))
+                            $this->top()[$n->var->name] = $left.$right;
+                    }
+                }
+                /* -------- SQL 呼び出し検出 -------- */
+                elseif ($n instanceof FuncCall || $n instanceof MethodCall || $n instanceof StaticCall) {
+                    if (isset($n->args[0])) {
+                        $sql = $this->evalExpr($n->args[0]->value);
+                        if ($sql && preg_match('/^'.SQL_HEAD.'/i',$sql)) {
+                            $this->analyzeSql($sql);
+                        }
+                    }
+                }
+                /* -------- 直接文字列 -------- */
+                elseif ($n instanceof Encapsed || $n instanceof String_) {
+                    $sql = $this->evalExpr($n);
+                    if ($sql && preg_match('/^'.SQL_HEAD.'/i',$sql)) {
+                        $this->analyzeSql($sql);
+                    }
+                }
             }
-        }
+
+            public function leaveNode(Node $n) {
+                if ($n instanceof Node\Stmt\Function_ || $n instanceof Node\Stmt\ClassMethod) {
+                    array_pop($this->symStack);
+                    $this->func = 'main';
+                }
+            }
+
+            /* ---------- ヘルパ ---------- */
+            private function &top(): array {
+                return $this->symStack[array_key_last($this->symStack)];
+            }
+
+            private function evalExpr($expr): ?string {
+                if ($expr instanceof String_) {
+                    return $expr->value;
+                }
+                if ($expr instanceof ConstFetch && $expr->name->toString()==='null') {
+                    return null;
+                }
+                if ($expr instanceof Variable && is_string($expr->name)) {
+                    return $this->top()[$expr->name] ?? null;
+                }
+                if ($expr instanceof Encapsed) {
+                    $s=''; foreach ($expr->parts as $p) {
+                        $s.=$this->evalExpr($p)??'';
+                    } return $s;
+                }
+                if ($expr instanceof BinaryOp\Concat) {
+                    $left = $this->evalExpr($expr->left);
+                    $right= $this->evalExpr($expr->right);
+                    return ($left??'').($right??'');
+                }
+                return null; // 数値・配列等は未評価
+            }
+
+            private function analyzeSql(string $sql): void {
+                $sqlU = strtoupper($sql);
+                $tbls = [];
+
+                /* R 系 */
+                if (preg_match_all('/FROM\s+([A-Z0-9_]+)/', $sqlU,$m))
+                    foreach ($m[1] as $t) $tbls[$t]['R']=true;
+                if (preg_match_all('/JOIN\s+([A-Z0-9_]+)/', $sqlU,$m))
+                    foreach ($m[1] as $t) $tbls[$t]['R']=true;
+                if (preg_match_all('/\(\s*SELECT .*? FROM\s+([A-Z0-9_]+)/', $sqlU,$m))
+                    foreach ($m[1] as $t) $tbls[$t]['R']=true;
+
+                /* CUD */
+                if (preg_match('/INSERT\s+INTO\s+([A-Z0-9_]+)/',$sqlU,$m))
+                    $tbls[$m[1]]['C']=true;
+                if (preg_match('/UPDATE\s+([A-Z0-9_]+)/',$sqlU,$m))
+                    $tbls[$m[1]]['U']=true;
+                if (preg_match('/DELETE\s+FROM\s+([A-Z0-9_]+)/',$sqlU,$m))
+                    $tbls[$m[1]]['D']=true;
+                if (preg_match('/MERGE\s+INTO\s+([A-Z0-9_]+)/',$sqlU,$m)) {
+                    $tbls[$m[1]]['C']=true; $tbls[$m[1]]['U']=true;
+                }
+                if (preg_match('/(?:DROP|TRUNCATE)\s+TABLE\s+([A-Z0-9_]+)/',$sqlU,$m))
+                    $tbls[$m[1]]['D']=true;
+
+                /* TEMP */
+                if (preg_match('/CREATE\s+TEMP\s+TABLE\s+([A-Z0-9_]+)/',$sqlU,$m))
+                    $tbls[$m[1]]+=['C'=>true,'temp'=>true];
+                if (preg_match('/SELECT .*?INTO\s+TEMP\s+([A-Z0-9_]+)/',$sqlU,$m))
+                    $tbls[$m[1]]+=['C'=>true,'temp'=>true];
+
+                /* WITH CTE */
+                if (preg_match_all('/WITH\s+([A-Z0-9_]+)\s+AS\s*\(/',$sqlU,$m))
+                    foreach($m[1] as $cte) $tbls[$cte]+=['C'=>true,'R'=>true,'temp'=>true];
+
+                /* 出力 */
+                foreach ($tbls as $t=>$ops) {
+                    $isView = in_array(strtolower($t),$this->views);
+                    ($this->addCrud)(
+                        $this->file,$this->func,$t,$ops,$isView,!empty($ops['temp'])
+                    );
+                }
+            }
+        };
+
+        $traverser->addVisitor($visitor);
+        $traverser->traverse($stmts);
+    }
+    /* ---- パース失敗：正規表現フォールバック ---- */
+    catch (Throwable $e) {
+        // *必要最低限* の簡易検出で続行
+        if (preg_match_all('/["\']\s*'.SQL_HEAD.'\b.*?["\']/is',$code,$m))
+            foreach($m[0] as $raw)
+                $visitor->analyzeSql(trim($raw,"\"' ")); // Visitor の簡易呼出
     }
 
-    return $map;
+    /* ---- 進捗表示 ---- */
+    $done++;
+    $now = microtime(true);
+    if ($now - $last >= ($total>300?1:0.5) || $done===$total) {
+        $rate=$done/$total; $eta=$rate?($now-$start)/$rate-($now-$start):0;
+        printf("\r[%6.2f%%] %d/%d files | elapsed %ds | ETA %ds",
+            $rate*100,$done,$total,(int)($now-$start),(int)$eta);
+        $last=$now;
+    }
 }
+echo PHP_EOL;
+
+/* =========================================================
+   6. Excel 出力
+   ======================================================= */
+$xls = new Spreadsheet(); $sh=$xls->getActiveSheet()->setTitle('CRUD図');
+$head=['A'=>'ファイル','B'=>'関数','C'=>'テーブル','D'=>'注釈','E'=>'C','F'=>'R','G'=>'U','H'=>'D'];
+foreach($head as $col=>$txt) $sh->setCellValue("$col1",$txt);
+$row=2;
+foreach($crud as $r){
+    $sh->fromArray([
+        $r['file'],$r['func'],$r['table'],$r['note'],
+        $r['C']?'✓':'',$r['R']?'✓':'',$r['U']?'✓':'',$r['D']?'✓':''
+    ],null,"A{$row}"); $row++;
+}
+foreach(range('A','H') as $c) $sh->getColumnDimension($c)->setAutoSize(true);
+if(!is_dir('output')) mkdir('output',0777,true);
+(new Xlsx($xls))->save('output/crud_analysis.xlsx');
+
+echo "解析完了 → output/crud_analysis.xlsx\n";
