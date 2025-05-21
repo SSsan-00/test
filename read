@@ -1,0 +1,104 @@
+    # SQL静的解析ツール
+
+このツールは、PHPコードを解析してSQLクエリを検出し、テーブルに対するCRUD（Create, Read, Update, Delete）操作を特定するための静的解析ツールです。
+
+## 概要
+
+SQLクエリの静的解析を行い、コード内で使用されているテーブルとそれに対する操作（CRUD）を特定します。解析結果はExcelファイルに出力され、詳細なCRUD図を生成します。
+
+主な機能：
+- PHP/INCファイルからのSQLクエリの検出
+- テーブルに対するCRUD操作の解析
+- 関数・メソッド単位での解析
+- 結果のExcel出力
+- ビューとテンポラリテーブルの識別
+
+## 使い方
+
+### 基本的なコマンド
+
+```bash
+# 基本的な解析
+php analyzer.php /path/to/directory
+
+# 詳細出力モードで解析
+php analyzer.php -v /path/to/directory
+
+# テストモードで実行
+php analyzer.php -t /path/to/test_directory
+
+# メモリ制限を指定して実行
+php analyzer.php -m 512M /path/to/directory
+
+# ヘルプを表示
+php analyzer.php -h
+```
+
+### 出力ファイル
+
+解析結果は`output`ディレクトリに保存されます。出力ファイル名は`SQL解析結果_YYYYMMDDHHMMSS.xlsx`の形式で生成されます。
+
+## 最新バージョンの変更点
+
+- PHP-Parserを最新バージョン（5.4.0）に更新
+- `createForNewestSupportedVersion()`メソッドの使用によるPHP最新構文のサポート
+- getNodeCode()メソッドの改善によるコード抽出の安定性向上
+- テスト機能の拡張と詳細な結果表示
+- 解析結果の階層的な表示とテーブル統計の追加
+
+## 技術要件
+
+- PHP 7.2以上
+- 依存ライブラリ:
+  - nikic/php-parser ^5.4
+  - phpoffice/phpspreadsheet ^1.29
+
+## インストール
+
+```bash
+# 依存ライブラリのインストール
+composer install
+
+# PHP-Parserを最新バージョンに更新
+composer update nikic/php-parser --with-all-dependencies
+```
+
+## フォルダ構成
+
+- `src/` : ソースコード
+- `tests/` : テストファイル
+- `input/` : 入力ファイル（views.txt等）
+- `output/` : 出力結果（エクセルファイル）
+
+## 仕様
+
+### SQLクエリ解析
+
+- SELECT、INSERT、UPDATE、DELETE、CREATE、DROP、TRUNCATEなどの基本的なSQLクエリを検出
+- 一時テーブル（SELECT INTO TEMP、CREATE TEMP TABLE）の検出と注釈付け
+- WITH句（共通テーブル式）の解析
+- JOINの解析とテーブル参照の検出
+- トランザクションブロック内のクエリ解析
+
+### 関数解析
+
+- ユーザー定義関数（function）のブロック解析
+- クラスメソッドの解析
+- 関数ブロック外の「main」領域の解析
+
+### 出力形式
+
+エクセルファイルに以下の形式で出力します：
+
+- ファイル名
+- 関数名
+- テーブル名
+- C（Create）
+- R（Read）
+- U（Update）
+- D（Delete）
+- 注釈（@view、@tempなど）
+
+## ライセンス
+
+MIT 
