@@ -1,0 +1,720 @@
+<?php
+
+/**
+ * 文字列処理を担当するクラス
+ * 
+ * このクラスは以下の処理を担当します：
+ * 1. PHPコードのクリーンアップ
+ *    - PHP開始タグの補完（省略されている場合）
+ *    - コメントの削除（複数行、単一行、ハッシュスタイル）
+ * 
+ * 2. 文字列連結の処理
+ *    - 基本的な文字列連結（$var = "str1" . "str2"）
+ *    - .= 演算子による連結（$var .= "str"）
+ *    - 複数の文字列連結（3つ以上の連結）
+ *    - 関数呼び出し結果との連結
+ * 
+ * 3. 変数と定数の解決
+ *    - 変数の定義と値の収集
+ *    - 定数の定義と値の収集
+ *    - 変数参照の解決（{$var}形式、直接$var形式）
+ *    - 未解決変数・定数の追跡
+ * 
+ * 4. 最適化
+ *    - 正規表現パターンのキャッシュ
+ *    - 変数解決の一括処理
+ *    - 処理回数の制限による無限ループ防止
+ * 
+ * 5. デバッグ機能
+ *    - 詳細な処理ログの出力
+ *    - 処理時間の計測
+ *    - 未解決変数・定数の報告
+ */
+class StringProcessor {
+    private $variables = [];
+    private $constants = [];
+    private $unresolved = [];
+    private $verbose = false;
+    private $maxIterations = 50; // 無限ループ防止の最大繰り返し回数
+    private $maxProcessIterations = 50; // 文字列連結処理の最大繰り返し回数
+    
+    /**
+     * 正規表現パターンのキャッシュ
+     */
+    private static $patternCache = [];
+    
+    /**
+     * コンストラクタ
+     *
+     * @param bool $verbose 詳細表示モード
+     */
+    public function __construct(bool $verbose = false) {
+        $this->verbose = $verbose;
+        $this->initPatternCache();
+    }
+    
+    /**
+     * 正規表現パターンのキャッシュを初期化
+     */
+    private function initPatternCache() {
+        if (empty(self::$patternCache)) {
+            // 基本的なパターンをキャッシュ
+            self::$patternCache = [
+                'variableAssign' => '/\$([a-zA-Z0-9_]+)\s*=\s*[\'"](.+?)[\'"]\s*;/i',
+                'constDefine' => '/define\s*\(\s*[\'"]([a-zA-Z0-9_]+)[\'"]\s*,\s*[\'"](.+?)[\'"]\s*\)/i',
+                'constDeclaration' => '/const\s+([a-zA-Z0-9_]+)\s*=\s*[\'"](.+?)[\'"]\s*;/i',
+                'varVarAssign' => '/\$([a-zA-Z0-9_]+)\s*=\s*\$([a-zA-Z0-9_]+)\s*;/i',
+                'dotEquals' => '/\$([a-zA-Z0-9_]+)(\s*\.=\s*)(\'|")(.+?)(\'|")/',
+                'basicConcat' => '/\$([a-zA-Z0-9_]+)(\s*=\s*)(\'|")(.+?)(\'|")(\s*\.\s*)(\'|")(.+?)(\'|")/',
+                'curlyBraceVar' => '/"([^"]*)\{\$([a-zA-Z0-9_]+)\}([^"]*)"/s',
+                'directVar' => '/"([^"]*)\$([a-zA-Z0-9_]+)([^"]*)"/s',
+                'dotConcat' => '/(\'|")([^\'"]*)(\1)\s*\.\s*(\'|")([^\'"]*)(\4)/s',
+                'multipleConcat' => '/([\'"])([^\'"]*)(\1)\s*\.\s*([\'"])([^\'"]*)(\4)\s*\.\s*([\'"])([^\'"]*)(\7)/s',
+                'funcConcat1' => '/\$([a-zA-Z0-9_]+)\s*=\s*([a-zA-Z0-9_]+\([^)]*\))\s*\.\s*([\'"])([^\'"]*)(\3)/s',
+                'funcConcat2' => '/\$([a-zA-Z0-9_]+)\s*=\s*([\'"])([^\'"]*)(\2)\s*\.\s*([a-zA-Z0-9_]+\([^)]*\))/s',
+            ];
+        }
+    }
+    
+    /**
+     * PHPコードをクリーンアップし、文字列連結と変数・定数解決を行う
+     *
+     * @param string $code PHPコード
+     * @return array [処理済みコード, 未解決変数・定数リスト]
+     */
+    public function process($code) {
+        // 処理開始時間
+        $startTime = microtime(true);
+        
+        $this->variables = [];
+        $this->constants = [];
+        $this->unresolved = [];
+        
+        // PHP開始タグの補完
+        $code = $this->ensurePhpStartTag($code);
+        
+        // コメントの削除
+        $code = $this->removeComments($code);
+        
+        // 変数と定数のマップを収集
+        $this->collectVariablesAndConstants($code);
+        
+        // 文字列連結のクリーンアップ
+        $processedCode = $this->cleanupConcatenation($code);
+        
+        // 最適化された変数解決を適用
+        $processedCode = $this->resolveVariablesOptimized($processedCode);
+        
+        // 未解決の変数を記録しているか確認（デバッグ用）
+        if ($this->verbose && !empty($this->unresolved)) {
+            $time = date('H:i:s');
+            echo "[$time] 以下の変数/定数が未解決: " . implode(", ", array_keys($this->unresolved)) . PHP_EOL;
+        }
+        
+        // 処理時間の計測（デバッグ用）
+        if ($this->verbose) {
+            $endTime = microtime(true);
+            $processingTime = round(($endTime - $startTime) * 1000, 2); // ミリ秒単位
+            if ($processingTime > 100) {  // 100ms以上かかる場合のみ出力
+                $time = date('H:i:s');
+                echo "[$time] 文字列処理に {$processingTime}ms かかりました" . PHP_EOL;
+            }
+        }
+        
+        return [$processedCode, $this->unresolved];
+    }
+    
+    /**
+     * PHP開始タグを補完する
+     *
+     * @param string $code PHPコード
+     * @return string 開始タグが補完されたコード
+     */
+    private function ensurePhpStartTag($code) {
+        // 既にPHP開始タグがある場合は何もしない
+        if (strpos($code, '<?php') !== false || strpos($code, '<?=') !== false) {
+            return $code;
+        }
+        
+        // コードが空の場合は何もしない
+        if (trim($code) === '') {
+            return $code;
+        }
+        
+        // PHP開始タグを追加
+        return '<?php ' . $code;
+    }
+    
+    /**
+     * コメントを削除する
+     *
+     * @param string $code PHPコード
+     * @return string コメント削除後のコード
+     */
+    private function removeComments($code) {
+        // 複数行コメント削除
+        $code = preg_replace('!/\*.*?\*/!s', '', $code);
+        // 単一行コメント削除 (// スタイル)
+        $code = preg_replace('!//.*?$!m', '', $code);
+        // 単一行コメント削除 (# スタイル)
+        $code = preg_replace('!#.*?$!m', '', $code);
+        
+        return $code;
+    }
+    
+    /**
+     * 変数と定数の定義を収集する
+     *
+     * @param string $code PHPコード
+     */
+    private function collectVariablesAndConstants($code) {
+        // 定数の定義を検出（define関数）
+        if (preg_match_all(self::$patternCache['constDefine'], $code, $constantMatches, PREG_SET_ORDER)) {
+            foreach ($constantMatches as $match) {
+                $this->constants[$match[1]] = $match[2];
+            }
+        }
+        
+        // 定数の定義を検出（const宣言）
+        if (preg_match_all(self::$patternCache['constDeclaration'], $code, $constMatches, PREG_SET_ORDER)) {
+            foreach ($constMatches as $match) {
+                $this->constants[$match[1]] = $match[2];
+            }
+        }
+        
+        // 変数の代入を検出（文字列リテラル）
+        if (preg_match_all(self::$patternCache['variableAssign'], $code, $varMatches, PREG_SET_ORDER)) {
+            foreach ($varMatches as $match) {
+                $this->variables[$match[1]] = $match[2];
+            }
+        }
+        
+        // 変数の代入を検出（他の変数からの代入）
+        $varVarMatches = [];
+        preg_match_all(self::$patternCache['varVarAssign'], $code, $varVarMatches, PREG_SET_ORDER);
+        
+        $iterations = 0;
+        $resolvedCount = 0;
+        
+        while (!empty($varVarMatches) && $iterations < $this->maxIterations) {
+            $previousResolvedCount = $resolvedCount;
+            $resolvedCount = 0;
+            
+            foreach ($varVarMatches as $key => $match) {
+                $targetVar = $match[1];
+                $sourceVar = $match[2];
+                
+                if (isset($this->variables[$sourceVar])) {
+                    $this->variables[$targetVar] = $this->variables[$sourceVar];
+                    $resolvedCount++;
+                    unset($varVarMatches[$key]);  // 解決された変数を削除
+                }
+            }
+            
+            // 解決された変数がない場合は中断
+            if ($resolvedCount == $previousResolvedCount && $iterations > 0) {
+                break;
+            }
+            
+            $iterations++;
+        }
+        
+        // 未解決の変数から変数参照を記録
+        foreach ($varVarMatches as $match) {
+            $targetVar = $match[1];
+            $sourceVar = $match[2];
+            $this->unresolved['$'.$sourceVar] = true;
+        }
+    }
+    
+    /**
+     * 文字列連結処理をクリーンアップする
+     *
+     * @param string $code PHPコード
+     * @return string クリーンアップされたコード
+     */
+    private function cleanupConcatenation($code) {
+        // 最大処理回数を設定して無限ループを防止
+        $maxProcessIterations = 3;
+        $processCount = 0;
+        $prevCode = '';
+        
+        while ($prevCode !== $code && $processCount < $maxProcessIterations) {
+            $prevCode = $code;
+            $processCount++;
+            
+            // 基本的な文字列連結パターン (変数への代入)
+            $code = $this->processBasicConcatenation($code);
+            
+            // .= 演算子の処理
+            $code = $this->processDotEqualsOperator($code);
+            
+            // 変数の解決（二重引用符内の{$var}形式）
+            $code = $this->processCurlyBraceVariables($code);
+            
+            // 変数の解決（二重引用符内の直接変数）
+            $code = $this->processDirectVariables($code);
+            
+            // 文字列外の変数参照と定数の解決
+            $code = $this->processExternalReferences($code);
+            
+            // ピリオドでの文字列連結
+            $code = $this->processDotConcatenation($code);
+            
+            // ネストした変数の解決
+            $code = $this->processNestedVariables($code);
+            
+            // 連続した文字列連結の処理（3つ以上のピリオド連結）
+            $code = $this->processMultipleConcatenation($code);
+            
+            // 関数呼び出し結果の文字列連結
+            $code = $this->processFunctionConcatenation($code);
+        }
+        
+        if ($this->verbose && $processCount >= $maxProcessIterations) {
+            echo "[警告] 文字列連結処理が最大回数 ({$maxProcessIterations}) に達しました。未処理の連結が残っている可能性があります。\n";
+        }
+        
+        return $code;
+    }
+    
+    /**
+     * 基本的な文字列連結処理
+     *
+     * @param string $code PHPコード
+     * @return string 処理後のコード
+     */
+    private function processBasicConcatenation($code) {
+        $iteration = 0;
+        $pattern = '/\$([a-zA-Z0-9_]+)(\s*=\s*)(\'|")(.+?)(\'|")(\s*\.\s*)(\'|")(.+?)(\'|")/';
+        
+        while (preg_match($pattern, $code) && $iteration < $this->maxIterations) {
+            $code = preg_replace_callback(
+                $pattern,
+                function ($matches) {
+                    $varName = $matches[1];
+                    $content = $matches[4] . $matches[8];
+                    $this->variables[$varName] = $content; // 変数マップを更新
+                    return '$' . $matches[1] . $matches[2] . $matches[3] . $content . $matches[9];
+                },
+                $code
+            );
+            $iteration++;
+        }
+        
+        return $code;
+    }
+    
+    /**
+     * .= 演算子の処理
+     *
+     * @param string $code PHPコード
+     * @return string 処理後のコード
+     */
+    private function processDotEqualsOperator($code) {
+        $iteration = 0;
+        $pattern = '/\$([a-zA-Z0-9_]+)(\s*\.=\s*)(\'|")(.+?)(\'|")/';
+        
+        while (preg_match($pattern, $code) && $iteration < $this->maxIterations) {
+            $code = preg_replace_callback(
+                $pattern,
+                function ($matches) use (&$code) {
+                    $varName = $matches[1];
+                    $content = $matches[4];
+                    
+                    // 変数の現在値を探す
+                    if (preg_match('/\$' . $varName . '\s*=\s*(\'|")(.+?)(\'|")/', $code, $varMatches)) {
+                        // 変数に内容を追加して変数マップを更新
+                        $updatedValue = $varMatches[2] . $content;
+                        $this->variables[$varName] = $updatedValue;
+                        
+                        // 変数定義を更新
+                        $code = preg_replace(
+                            '/\$' . $varName . '\s*=\s*(\'|")(.+?)(\'|")/',
+                            '$' . $varName . ' = ' . $varMatches[1] . $updatedValue . $varMatches[3],
+                            $code,
+                            1
+                        );
+                        // 連結部分を削除
+                        return '';
+                    }
+                    
+                    // 変数定義が見つからない場合は新しく定義
+                    if (!isset($this->variables[$varName])) {
+                        $this->variables[$varName] = $content;
+                        return '$' . $varName . ' = "' . $content . '";';
+                    }
+                    
+                    // 既存の変数に追加
+                    $existingValue = $this->variables[$varName];
+                    $this->variables[$varName] = $existingValue . $content;
+                    return '$' . $varName . ' = "' . $existingValue . $content . '";';
+                },
+                $code
+            );
+            $iteration++;
+        }
+        
+        return $code;
+    }
+    
+    /**
+     * 二重引用符内の{$var}形式の変数を処理
+     *
+     * @param string $code PHPコード
+     * @return string 処理後のコード
+     */
+    private function processCurlyBraceVariables($code) {
+        $iteration = 0;
+        $pattern = '/"([^"]*)\{\$([a-zA-Z0-9_]+)\}([^"]*)"/';
+        
+        while (preg_match($pattern, $code) && $iteration < $this->maxIterations) {
+            $code = preg_replace_callback(
+                $pattern,
+                function ($matches) {
+                    $prefix = $matches[1];
+                    $varName = $matches[2];
+                    $suffix = $matches[3];
+                    
+                    if (isset($this->variables[$varName])) {
+                        $replacedValue = $prefix . $this->variables[$varName] . $suffix;
+                        return '"' . $replacedValue . '"';
+                    }
+                    
+                    // 未解決の変数を記録
+                    $this->unresolved['$'.$varName] = true;
+                    
+                    // 変数が見つからない場合は元の形式を維持
+                    return $matches[0];
+                },
+                $code
+            );
+            $iteration++;
+        }
+        
+        return $code;
+    }
+    
+    /**
+     * 二重引用符内の直接変数形式($var)を処理
+     *
+     * @param string $code PHPコード
+     * @return string 処理後のコード
+     */
+    private function processDirectVariables($code) {
+        $iteration = 0;
+        $pattern = '/"([^"]*)\$([a-zA-Z0-9_]+)([^"]*)"/';
+        
+        while (preg_match($pattern, $code) && $iteration < $this->maxIterations) {
+            $code = preg_replace_callback(
+                $pattern,
+                function ($matches) {
+                    $prefix = $matches[1];
+                    $varName = $matches[2];
+                    $suffix = $matches[3];
+                    
+                    if (isset($this->variables[$varName])) {
+                        $replacedValue = $prefix . $this->variables[$varName] . $suffix;
+                        return '"' . $replacedValue . '"';
+                    }
+                    
+                    // 未解決の変数を記録
+                    $this->unresolved['$'.$varName] = true;
+                    
+                    // 変数が見つからない場合は元の形式を維持
+                    return $matches[0];
+                },
+                $code
+            );
+            $iteration++;
+        }
+        
+        return $code;
+    }
+    
+    /**
+     * 文字列外の変数参照と定数を処理
+     *
+     * @param string $code PHPコード
+     * @return string 処理後のコード
+     */
+    private function processExternalReferences($code) {
+        $iteration = 0;
+        $pattern = '/([^\'"]|\s)(\$([a-zA-Z0-9_]+)|([A-Z][A-Z0-9_]+))([^\'"]|\s)/';
+        
+        while (preg_match($pattern, $code) && $iteration < $this->maxIterations) {
+            $code = preg_replace_callback(
+                $pattern,
+                function ($matches) {
+                    $prefix = $matches[1];
+                    $expression = $matches[2];
+                    $suffix = $matches[5];
+                    
+                    // 変数の場合
+                    if (substr($expression, 0, 1) === '$') {
+                        $varName = substr($expression, 1);
+                        if (isset($this->variables[$varName])) {
+                            return $prefix . "'" . $this->variables[$varName] . "'" . $suffix;
+                        }
+                        
+                        // 未解決の変数を記録
+                        $this->unresolved[$expression] = true;
+                    } 
+                    // 定数の場合
+                    else if (preg_match('/^[A-Z][A-Z0-9_]+$/', $expression)) {
+                        if (isset($this->constants[$expression])) {
+                            return $prefix . "'" . $this->constants[$expression] . "'" . $suffix;
+                        }
+                        
+                        // 未解決の定数を記録
+                        $this->unresolved[$expression] = true;
+                    }
+                    
+                    return $matches[0];
+                },
+                $code
+            );
+            $iteration++;
+        }
+        
+        return $code;
+    }
+    
+    /**
+     * ピリオドでの文字列連結を処理
+     *
+     * @param string $code PHPコード
+     * @return string 処理後のコード
+     */
+    private function processDotConcatenation($code) {
+        $iteration = 0;
+        $pattern = '/(\'|")([^\'"]*)(\1)\s*\.\s*(\'|")([^\'"]*)(\4)/';
+        
+        while (preg_match($pattern, $code) && $iteration < $this->maxIterations) {
+            $code = preg_replace_callback(
+                $pattern,
+                function ($matches) {
+                    // 同じクォートタイプの場合は単純に連結
+                    if ($matches[1] === $matches[4]) {
+                        return $matches[1] . $matches[2] . $matches[5] . $matches[6];
+                    }
+                    // 異なるクォートタイプの場合はエスケープを考慮
+                    else {
+                        // 最初のクォートタイプを利用
+                        $content = $matches[2] . $matches[5];
+                        // エスケープ処理
+                        if ($matches[1] === '"') {
+                            $content = str_replace('"', '\\"', $content);
+                        } else {
+                            $content = str_replace("'", "\\'", $content);
+                        }
+                        return $matches[1] . $content . $matches[1];
+                    }
+                },
+                $code
+            );
+            $iteration++;
+        }
+        
+        return $code;
+    }
+    
+    /**
+     * ネストした変数の解決
+     *
+     * @param string $code PHPコード
+     * @return string 処理後のコード
+     */
+    private function processNestedVariables($code) {
+        $iteration = 0;
+        $pattern = '/"([^"]*)\{\$([a-zA-Z0-9_]+)\->([a-zA-Z0-9_]+)\}([^"]*)"/';
+        
+        while (preg_match($pattern, $code) && $iteration < $this->maxIterations) {
+            $code = preg_replace_callback(
+                $pattern,
+                function ($matches) {
+                    $prefix = $matches[1];
+                    $objName = $matches[2];
+                    $propName = $matches[3];
+                    $suffix = $matches[4];
+                    
+                    // オブジェクトのプロパティは単純化して未解決としてマーク
+                    $this->unresolved['$'.$objName.'->'.$propName] = true;
+                    
+                    // オブジェクト参照は維持
+                    return $matches[0];
+                },
+                $code
+            );
+            $iteration++;
+        }
+        
+        return $code;
+    }
+    
+    /**
+     * 複数の文字列連結（3つ以上）を処理
+     *
+     * @param string $code PHPコード
+     * @return string 処理後のコード
+     */
+    private function processMultipleConcatenation($code) {
+        $iteration = 0;
+        // 3つ以上の連続した文字列連結を検出するパターン
+        $pattern = '/([\'"])([^\'"]*)(\1)\s*\.\s*([\'"])([^\'"]*)(\4)\s*\.\s*([\'"])([^\'"]*)(\7)/';
+        
+        while (preg_match($pattern, $code) && $iteration < $this->maxIterations) {
+            $code = preg_replace_callback(
+                $pattern,
+                function ($matches) {
+                    $combined = $matches[2] . $matches[5] . $matches[8];
+                    // 最初のクォートタイプを使用
+                    return $matches[1] . $combined . $matches[1];
+                },
+                $code
+            );
+            $iteration++;
+        }
+        
+        return $code;
+    }
+    
+    /**
+     * 関数呼び出し結果との文字列連結を処理
+     *
+     * @param string $code PHPコード
+     * @return string 処理後のコード
+     */
+    private function processFunctionConcatenation($code) {
+        // 関数呼び出し結果と文字列リテラルの連結を記録
+        preg_match_all('/\$([a-zA-Z0-9_]+)\s*=\s*([a-zA-Z0-9_]+\([^)]*\))\s*\.\s*([\'"])([^\'"]*)(\3)/s', $code, $matches, PREG_SET_ORDER);
+        
+        foreach ($matches as $match) {
+            $varName = $match[1];
+            // 関数呼び出しがある場合は変数を未解決としてマーク
+            $this->unresolved['$'.$varName] = true;
+        }
+        
+        // 文字列リテラルと関数呼び出し結果の連結を記録
+        preg_match_all('/\$([a-zA-Z0-9_]+)\s*=\s*([\'"])([^\'"]*)(\2)\s*\.\s*([a-zA-Z0-9_]+\([^)]*\))/s', $code, $matches, PREG_SET_ORDER);
+        
+        foreach ($matches as $match) {
+            $varName = $match[1];
+            // 関数呼び出しがある場合は変数を未解決としてマーク
+            $this->unresolved['$'.$varName] = true;
+        }
+        
+        return $code;
+    }
+    
+    /**
+     * 変数解決の冗長性を削減する最適化された実装
+     * 変数の解決を一度にまとめて行うことで効率化
+     *
+     * @param string $code PHPコード
+     * @return string 処理後のコード
+     */
+    private function resolveVariablesOptimized($code) {
+        // まず全ての変数を収集
+        $allVariables = [];
+        preg_match_all('/\$([a-zA-Z0-9_]+)/', $code, $varMatches);
+        
+        if (empty($varMatches[1])) {
+            return $code; // 変数がない場合は早期リターン
+        }
+        
+        // 使用されている変数のみを処理対象とする
+        $uniqueVars = array_unique($varMatches[1]);
+        
+        // 解決可能な変数のみフィルタリング
+        $resolvableVars = array_intersect_key($this->variables, array_flip($uniqueVars));
+        
+        if (empty($resolvableVars)) {
+            return $code; // 解決可能な変数がない場合は早期リターン
+        }
+        
+        // 長い名前の変数から順に処理（短い名前が他の変数の一部になっている場合の誤置換を防止）
+        uksort($resolvableVars, function($a, $b) {
+            return strlen($b) - strlen($a);
+        });
+        
+        // 一度に置換処理を行う
+        $replacePairs = [];
+        foreach ($resolvableVars as $varName => $value) {
+            // 文字列内の変数置換パターン
+            $replacePairs['{'.$varName.'}'] = $value;
+            $replacePairs['{$'.$varName.'}'] = $value;
+            $replacePairs['$'.$varName] = $value; // 注意: これは文字列外の変数も置換するため要注意
+        }
+        
+        // 効率的な置換（strtrは複数の置換を一度に行える）
+        return strtr($code, $replacePairs);
+    }
+    
+    /**
+     * 未解決の変数・定数リストを取得
+     *
+     * @return array 未解決の変数・定数リスト
+     */
+    public function getUnresolved() {
+        return $this->unresolved;
+    }
+    
+    /**
+     * 外部から収集された変数を追加
+     *
+     * @param array $variables 収集された変数
+     * @return void
+     */
+    public function addCollectedVariables($variables) {
+        if (!empty($variables)) {
+            $this->variables = array_merge($this->variables, $variables);
+        }
+    }
+    
+    /**
+     * 外部から収集された定数を追加
+     *
+     * @param array $constants 収集された定数
+     * @return void
+     */
+    public function addCollectedConstants($constants) {
+        if (!empty($constants)) {
+            $this->constants = array_merge($this->constants, $constants);
+        }
+    }
+    
+    /**
+     * 処理されたコードを検証する（デバッグ用）
+     *
+     * @param string $code 処理されたコード
+     * @param string $filePath ファイルパス
+     */
+    public function checkProcessedCode($code, $filePath) {
+        if (!$this->verbose) {
+            return;
+        }
+        
+        // 文字列連結がどれだけ解決できたか確認
+        $concatenationCount = substr_count($code, '.=') + substr_count($code, ' . ');
+        
+        // 変数参照数
+        preg_match_all('/\$[a-zA-Z0-9_]+/', $code, $variables);
+        $variablesCount = count($variables);
+        
+        if ($concatenationCount > 0) {
+            $time = date('H:i:s');
+            echo "[$time] 注意: {$filePath} には {$concatenationCount} 個の未解決文字列連結が残っています" . PHP_EOL;
+        }
+        
+        if ($variablesCount > 0) {
+            $time = date('H:i:s');
+            echo "[$time] 情報: {$filePath} には {$variablesCount} 個の変数参照があります" . PHP_EOL;
+        }
+        
+        if (!empty($this->unresolved)) {
+            $time = date('H:i:s');
+            echo "[$time] 注意: {$filePath} には未解決変数/定数があります: " . implode(', ', array_keys($this->unresolved)) . PHP_EOL;
+        }
+    }
+} 
