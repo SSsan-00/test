@@ -1,0 +1,79 @@
+#!/usr/bin/env php
+<?php
+// オートローダーのセットアップ
+require_once __DIR__ . '/vendor/autoload.php';
+
+// カスタムクラスのロード
+require_once __DIR__ . '/src/FileProcessor.php';
+require_once __DIR__ . '/src/StringProcessor.php';
+require_once __DIR__ . '/src/QueryParser.php';
+require_once __DIR__ . '/src/ExcelExporter.php';
+require_once __DIR__ . '/src/SqlAnalyzer.php';
+
+// メモリ制限を引き上げ
+ini_set('memory_limit', '1G');
+
+// コマンドライン引数を解析
+$options = getopt("hvtm:", ["help", "verbose", "test", "memory-limit:"]);
+
+// ヘルプフラグのチェック
+if (isset($options['h']) || isset($options['help'])) {
+    echo "使用方法: php analyzer.php [オプション] [解析対象フォルダ]\n";
+    echo "オプション:\n";
+    echo "  -h, --help           このヘルプを表示\n";
+    echo "  -v, --verbose        詳細な出力を表示\n";
+    echo "  -t, --test           テストを実行\n";
+    echo "  -m, --memory-limit   メモリ制限を設定（例: 512M）\n";
+    exit(0);
+}
+
+// メモリ制限の設定
+if (isset($options['m']) || isset($options['memory-limit'])) {
+    $limit = isset($options['m']) ? $options['m'] : $options['memory-limit'];
+    ini_set('memory_limit', $limit);
+    echo "メモリ制限を設定: {$limit}\n";
+}
+
+// 詳細出力モードの設定
+$verbose = isset($options['v']) || isset($options['verbose']);
+
+// SqlAnalyzerインスタンスの作成
+$analyzer = new SqlAnalyzer($verbose);
+
+// テストモードかどうかのチェック
+$testMode = isset($options['t']) || isset($options['test']);
+
+// コマンドライン引数から解析対象フォルダを取得
+$targetDir = null;
+foreach ($argv as $index => $arg) {
+    if ($index > 0 && $arg[0] !== '-' && !in_array($argv[$index-1], ['-m', '--memory-limit'])) {
+        $targetDir = $arg;
+        break;
+    }
+}
+
+// テストモードの実行
+if ($testMode) {
+    if ($targetDir === null) {
+        echo "テスト用のディレクトリを指定してください。\n";
+        echo "使用方法: php analyzer.php -t [テスト対象フォルダ]\n";
+        exit(1);
+    }
+    
+    $results = $analyzer->runTests($targetDir);
+    echo "\nテスト完了\n";
+    exit($results['success'] ? 0 : 1);
+}
+
+// 通常の解析モード
+if ($targetDir === null) {
+    echo "エラー: 解析対象フォルダが指定されていません。\n";
+    echo "使用方法: php analyzer.php [解析対象フォルダ]\n";
+    echo "ヘルプを表示するには: php analyzer.php --help\n";
+    exit(1);
+}
+
+// 解析実行
+$success = $analyzer->analyze($targetDir);
+
+exit($success ? 0 : 1);
