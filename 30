@@ -1,0 +1,313 @@
+<?php
+
+/**
+ * SQLクエリの解析を担当するクラス
+ * 
+ * このクラスは以下の処理を担当します：
+ * 1. SQLクエリの抽出と解析
+ *    - SELECT文の解析（FROM句、JOIN句）
+ *    - INSERT文の解析
+ *    - UPDATE文の解析
+ *    - DELETE文の解析
+ *    - CREATE TEMP TABLE文の解析
+ *    - SELECT INTO TEMP文の解析
+ *    - DROP TABLE文の解析
+ *    - TRUNCATE文の解析
+ *    - WITH句（CTE）の解析
+ * 
+ * 2. CRUD操作の判定
+ *    - SELECT → R（Read）
+ *    - INSERT → C（Create）
+ *    - UPDATE → U（Update）
+ *    - DELETE → D（Delete）
+ *    - CREATE TEMP/SELECT INTO → C@temp
+ *    - DROP/TRUNCATE → D
+ * 
+ * 3. テーブル情報の処理
+ *    - テーブル名の正規化（スキーマ名の除去）
+ *    - ビューの判定（@view注釈の付与）
+ *    - 一時テーブルの判定（@temp注釈の付与）
+ *    - 未解決変数・定数の判定（@未解決注釈の付与）
+ * 
+ * 4. 結果の集約
+ *    - ファイル単位での結果整理
+ *    - 関数単位での結果整理
+ *    - テーブル単位での操作（CRUD）の集約
+ * 
+ * 5. デバッグ機能
+ *    - メモリ使用量の監視
+ *    - クエリ解析の詳細ログ
+ *    - 進捗状況の表示
+ */
+class QueryParser {
+    private $views = [];
+    private $unresolved = [];
+    private $verbose = false;
+    
+    /**
+     * コンストラクタ
+     *
+     * @param array $views ビューリスト
+     * @param bool $verbose 詳細表示モード
+     */
+    public function __construct(array $views = [], bool $verbose = false) {
+        $this->views = $views;
+        $this->verbose = $verbose;
+    }
+    
+    /**
+     * 未解決変数・定数のリストを設定
+     *
+     * @param array $unresolved 未解決変数・定数リスト
+     */
+    public function setUnresolved(array $unresolved) {
+        $this->unresolved = $unresolved;
+    }
+    
+    /**
+     * すべてのSQLクエリを解析する
+     *
+     * @param string $code PHPコード
+     * @param string $functionName 関数名
+     * @param string $filePath ファイルパス
+     * @return array 解析結果
+     */
+    public function parseQueries($code, $functionName, $filePath) {
+        $results = [];
+        $initialMemory = memory_get_usage();
+
+        // WITH句（CTE）の抽出
+        if (preg_match_all('/WITH\s+([a-zA-Z0-9_]+)\s+AS\s*\((.*?)\)/is', $code, $withMatches, PREG_SET_ORDER)) {
+            foreach ($withMatches as $withMatch) {
+                $cteName = $withMatch[1];
+                $cteBody = $withMatch[2];
+                // CTE自体は一時テーブルとしてC@temp、かつRも付与
+                $operation = 'C@temp';
+                if (!isset($results[$filePath])) $results[$filePath] = [];
+                if (!isset($results[$filePath][$functionName])) $results[$filePath][$functionName] = [];
+                if (!isset($results[$filePath][$functionName][$cteName])) $results[$filePath][$functionName][$cteName] = [];
+                $results[$filePath][$functionName][$cteName][] = $operation;
+                $results[$filePath][$functionName][$cteName][] = 'R';
+                // CTE内部のSELECTも再帰的に解析
+                $cteResults = $this->parseQueries($cteBody, $functionName, $filePath);
+                foreach ($cteResults as $f => $funcs) {
+                    foreach ($funcs as $fn => $tables) {
+                        foreach ($tables as $t => $ops) {
+                            foreach ($ops as $op) {
+                                if (!isset($results[$filePath][$functionName][$t])) $results[$filePath][$functionName][$t] = [];
+                                if (!in_array($op, $results[$filePath][$functionName][$t])) $results[$filePath][$functionName][$t][] = $op;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // SELECT ... FROM ... のテーブル名抽出
+        if (preg_match_all('/SELECT.*?FROM\s+([^;\n\r\)]+)(?:;|\)|\n|\r|$)/is', $code, $selectMatches, PREG_SET_ORDER)) {
+            foreach ($selectMatches as $selectMatch) {
+                $fromClause = $selectMatch[1];
+                // FROM句のテーブル名（カンマ区切り、JOIN含む）
+                $fromClause = preg_replace('/\([^\)]*\)/', '', $fromClause); // サブクエリ除去
+                $tables = [];
+                // カンマ区切りで分割
+                foreach (preg_split('/,/', $fromClause) as $part) {
+                    // JOIN句も分割
+                    foreach (preg_split('/\bJOIN\b/i', $part) as $tbl) {
+                        $tbl = trim($tbl);
+                        // テーブル名抽出
+                        if (preg_match('/^([a-zA-Z0-9_\.]+)/', $tbl, $m)) {
+                            $tableName = $m[1];
+                            $tableName = preg_replace('/^[a-zA-Z0-9_]+\./', '', $tableName); // スキーマ除去
+                            // 除外リスト
+                            $exclude = ['select','from','where','set','true','false','on','as','group','order','limit','offset','union','intersect','except','update','delete','insert','create','table','into','values','and','or','not','by','having','left','right','inner','outer','cross','full','natural','using','case','when','then','else','end','distinct','all','exists','in','is','like','between','asc','desc','with'];
+                            if ($tableName && !in_array(strtolower($tableName), $exclude) && !preg_match('/[^a-zA-Z0-9_]/', $tableName)) {
+                                $operation = $this->determineOperation('SELECT', $tableName);
+                                if ($operation) {
+                                    if (!isset($results[$filePath])) $results[$filePath] = [];
+                                    if (!isset($results[$filePath][$functionName])) $results[$filePath][$functionName] = [];
+                                    if (!isset($results[$filePath][$functionName][$tableName])) $results[$filePath][$functionName][$tableName] = [];
+                                    if (!in_array($operation, $results[$filePath][$functionName][$tableName])) $results[$filePath][$functionName][$tableName][] = $operation;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // JOIN句単独も抽出
+        if (preg_match_all('/JOIN\s+([a-zA-Z0-9_\.]+)/is', $code, $joinMatches)) {
+            foreach ($joinMatches[1] as $tableName) {
+                $tableName = preg_replace('/^[a-zA-Z0-9_]+\./', '', $tableName);
+                $exclude = ['select','from','where','set','true','false','on','as','group','order','limit','offset','union','intersect','except','update','delete','insert','create','table','into','values','and','or','not','by','having','left','right','inner','outer','cross','full','natural','using','case','when','then','else','end','distinct','all','exists','in','is','like','between','asc','desc','with'];
+                if ($tableName && !in_array(strtolower($tableName), $exclude) && !preg_match('/[^a-zA-Z0-9_]/', $tableName)) {
+                    $operation = $this->determineOperation('SELECT', $tableName);
+                    if ($operation) {
+                        if (!isset($results[$filePath])) $results[$filePath] = [];
+                        if (!isset($results[$filePath][$functionName])) $results[$filePath][$functionName] = [];
+                        if (!isset($results[$filePath][$functionName][$tableName])) $results[$filePath][$functionName][$tableName] = [];
+                        if (!in_array($operation, $results[$filePath][$functionName][$tableName])) $results[$filePath][$functionName][$tableName][] = $operation;
+                    }
+                }
+            }
+        }
+
+        // INSERT, UPDATE, DELETE, CREATE TEMP, SELECT INTO TEMP, DROP, TRUNCATE
+        $patterns = [
+            'INSERT' => '/INSERT\s+INTO\s+([a-zA-Z0-9_\.]+)/is',
+            'UPDATE' => '/UPDATE\s+([a-zA-Z0-9_\.]+)/is',
+            'DELETE' => '/DELETE\s+FROM\s+([a-zA-Z0-9_\.]+)/is',
+            'CREATE_TEMP' => '/CREATE\s+TEMP\s+TABLE\s+([a-zA-Z0-9_\.]+)/is',
+            'SELECT_INTO' => '/SELECT\s+.*?INTO\s+TEMP\s+([a-zA-Z0-9_\.]+)/is',
+            'DROP' => '/DROP\s+TABLE\s+([a-zA-Z0-9_\.]+)/is',
+            'TRUNCATE' => '/TRUNCATE\s+([a-zA-Z0-9_\.]+)/is'
+        ];
+        foreach ($patterns as $type => $pattern) {
+            if (preg_match_all($pattern, $code, $matches, PREG_SET_ORDER)) {
+                foreach ($matches as $match) {
+                    $tableName = $match[1];
+                    $tableName = preg_replace('/^[a-zA-Z0-9_]+\./', '', $tableName);
+                    $exclude = ['select','from','where','set','true','false','on','as','group','order','limit','offset','union','intersect','except','update','delete','insert','create','table','into','values','and','or','not','by','having','left','right','inner','outer','cross','full','natural','using','case','when','then','else','end','distinct','all','exists','in','is','like','between','asc','desc','with'];
+                    if ($tableName && !in_array(strtolower($tableName), $exclude) && !preg_match('/[^a-zA-Z0-9_]/', $tableName)) {
+                        $operation = $this->determineOperation($type, $tableName);
+                        if ($operation) {
+                            if (!isset($results[$filePath])) $results[$filePath] = [];
+                            if (!isset($results[$filePath][$functionName])) $results[$filePath][$functionName] = [];
+                            if (!isset($results[$filePath][$functionName][$tableName])) $results[$filePath][$functionName][$tableName] = [];
+                            if (!in_array($operation, $results[$filePath][$functionName][$tableName])) $results[$filePath][$functionName][$tableName][] = $operation;
+                        }
+                    }
+                }
+            }
+        }
+
+        $currentMemory = memory_get_usage();
+        $memoryDiff = $currentMemory - $initialMemory;
+        $this->showProgress("クエリ解析メモリ使用量: " . round($memoryDiff / 1024 / 1024, 2) . "MB");
+        return $results;
+    }
+    
+    private function determineOperation($type, $tableName) {
+        $operation = null;
+        
+        switch ($type) {
+            case 'SELECT':
+                $operation = 'R';
+                break;
+            case 'INSERT':
+                $operation = 'C';
+                break;
+            case 'UPDATE':
+                $operation = 'U';
+                break;
+            case 'DELETE':
+                $operation = 'D';
+                break;
+            case 'CREATE_TEMP':
+            case 'SELECT_INTO':
+                $operation = 'C@temp';
+                break;
+            case 'DROP':
+            case 'TRUNCATE':
+                $operation = 'D';
+                break;
+        }
+        
+        // ビューの判定
+        if (in_array($tableName, $this->views)) {
+            $operation .= '@view';
+        }
+        
+        return $operation;
+    }
+    
+    /**
+     * 解析結果を追加
+     * 
+     * @param array &$results 結果配列への参照
+     * @param string $filePath ファイルパス
+     * @param string $functionName 関数名
+     * @param string $tableName テーブル名
+     * @param string $operation 操作（CRUD）
+     */
+    private function addResult(&$results, $filePath, $functionName, $tableName, $operation) {
+        // テーブル名が空でないことを確認
+        $tableName = trim($tableName);
+        if (empty($tableName)) {
+            return;
+        }
+        
+        // 未解決変数・定数のチェック
+        $isUnresolved = false;
+        $note = '';
+        
+        // 変数または定数の形式かチェック
+        if (!empty($this->unresolved)) {
+            if ((substr($tableName, 0, 1) === '$' && isset($this->unresolved[$tableName])) || 
+                (preg_match('/^[A-Z][A-Z0-9_]+$/', $tableName) && isset($this->unresolved[$tableName]))) {
+                $isUnresolved = true;
+                $note = '@未解決';
+            }
+        }
+        
+        // ビューかどうかを確認
+        if (in_array($tableName, $this->views) && strpos($operation, '@view') === false) {
+            $note = ($note ? $note . ',@view' : '@view');
+            $operation .= '@view';
+        }
+        
+        // 未解決の場合、注釈を追加
+        if ($isUnresolved && !strpos($operation, '@未解決')) {
+            $operation .= ($note ? '' : '@未解決');
+        }
+        
+        // 結果を配列に追加
+        if (!isset($results[$filePath])) {
+            $results[$filePath] = [];
+        }
+        
+        if (!isset($results[$filePath][$functionName])) {
+            $results[$filePath][$functionName] = [];
+        }
+        
+        if (!isset($results[$filePath][$functionName][$tableName])) {
+            $results[$filePath][$functionName][$tableName] = [];
+        }
+        
+        if (!in_array($operation, $results[$filePath][$functionName][$tableName])) {
+            $results[$filePath][$functionName][$tableName][] = $operation;
+        }
+    }
+    
+    /**
+     * SQLクエリの詳細をログに出力
+     * 
+     * @param string $query クエリ文字列
+     * @param string $operation 操作タイプ（C/R/U/D）
+     * @param string $tableName テーブル名
+     * @param string $filePath ファイルパス
+     * @param string $functionName 関数名
+     */
+    private function logQueryDetails($query, $operation, $tableName, $filePath, $functionName) {
+        if (!$this->verbose) {
+            return;
+        }
+        
+        $formattedQuery = trim(preg_replace('/\s+/', ' ', $query));
+        $time = date('H:i:s');
+        echo "[$time] SQL検出: [{$operation}] {$tableName} in {$filePath}::{$functionName}" . PHP_EOL;
+        echo "[$time]   Query: " . substr($formattedQuery, 0, 100) . (strlen($formattedQuery) > 100 ? '...' : '') . PHP_EOL;
+    }
+    
+    /**
+     * 進捗メッセージを表示
+     * 
+     * @param string $message メッセージ
+     */
+    private function showProgress($message) {
+        if ($this->verbose) {
+            echo $message . "\n";
+        }
+    }
+} 
