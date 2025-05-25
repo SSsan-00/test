@@ -1,0 +1,263 @@
+#!/usr/bin/env php
+<?php
+/**
+ * splitSourceBlocks.php  –  v2.0 (フォールバック強化版)
+ *
+ * 依存: nikic/php-parser >= 5
+ *      composer require nikic/php-parser
+ *
+ * --------------------------------------------------------------
+ *  1) AST 解析（標準ルート）
+ *  2) フォールバック：
+ *       token_get_all + 再帰 brace 解析
+ * --------------------------------------------------------------
+ */
+
+declare(strict_types=1);
+require_once __DIR__ . '/vendor/autoload.php';
+
+use PhpParser\{Error, Lexer\Emulative, ParserFactory, PrettyPrinter\Standard};
+use PhpParser\Node\Stmt;
+
+/* ────────────────────────────────────────────────────────────────
+ *  公開 API
+ * ──────────────────────────────────────────────────────────────── */
+
+/**
+ * @param string $code  解析対象 PHP コード
+ * @return array<string, string>
+ */
+function splitSourceBlocks(string $code): array
+{
+    /* ---------- AST ルート ---------- */
+    $lexer  = new Emulative(['usedAttributes' => ['startFilePos', 'endFilePos']]);
+    $parser = (new ParserFactory())->createForNewestSupportedVersion($lexer);
+
+    try {
+        $ast = $parser->parse($code);
+        if ($ast === null) {
+            throw new Error('empty ast');
+        }
+        return astSplit($ast);
+    } catch (Error) {
+        /* ---------- フォールバック ---------- */
+        return fallbackSplit($code);
+    }
+}
+
+/* ────────────────────────────────────────────────────────────────
+ *  1. AST 正常系
+ * ──────────────────────────────────────────────────────────────── */
+function astSplit(array $ast): array
+{
+    $printer = new Standard();   // AST→コード
+    $blocks  = ['main' => ''];
+
+    $appendMain = static function (string $snippet) use (&$blocks): void {
+        $snippet = trim($snippet);
+        if ($snippet !== '') {
+            $blocks['main'] .= ($blocks['main'] === '' ? '' : PHP_EOL) . $snippet;
+        }
+    };
+
+    $walk = function (array $stmts) use (&$walk, $printer, &$blocks, $appendMain): void {
+        foreach ($stmts as $s) {
+
+            /* --- 名前空間は潜るだけ --- */
+            if ($s instanceof Stmt\Namespace_) {
+                $walk($s->stmts ?? []);
+                continue;
+            }
+
+            /* --- グローバル関数 --- */
+            if ($s instanceof Stmt\Function_) {
+                $blocks[$s->name->toString()] = $printer->prettyPrint($s->stmts);
+                continue;
+            }
+
+            /* --- クラス / インタフェース / トレイト --- */
+            if ($s instanceof Stmt\ClassLike) {
+                $class = $s->name?->toString() ?? 'AnonymousClass';
+                foreach ($s->stmts as $in) {
+                    if ($in instanceof Stmt\ClassMethod) {
+                        $k = "{$class}::{$in->name->toString()}";
+                        $blocks[$k] = $printer->prettyPrint($in->stmts ?? []);
+                    }
+                }
+                continue;
+            }
+
+            /* --- その他は main --- */
+            $appendMain($printer->prettyPrint([$s]));
+        }
+    };
+
+    $walk($ast);
+    return $blocks;
+}
+
+/* ────────────────────────────────────────────────────────────────
+ *  2. Fallback 版
+ *     token_get_all を使い「除外レンジ」方式で精度向上
+ * ──────────────────────────────────────────────────────────────── */
+function fallbackSplit(string $code): array
+{
+    $tokens = token_get_all($code, TOKEN_PARSE);
+    $N      = count($tokens);
+
+    $blocks = ['main' => ''];
+    $exclude = [];                       // [startIndex, endIndex]
+
+    /**
+     * 指定 index の `{` から対応する `}` を返す
+     * @return int 終了 } の index
+     */
+    $matchBrace = static function (int $idx) use ($tokens, $N): int {
+        $depth = 0;
+        for ($i = $idx; $i < $N; $i++) {
+            $t = $tokens[$i];
+            if ($t === '{')   $depth++;
+            elseif ($t === '}') $depth--;
+            if ($depth === 0) return $i;
+        }
+        return $N - 1; // 不整合でも EOF まで
+    };
+
+    /** token 配列 -> 文字列 */
+    $sliceToString = static function (int $s, int $e) use ($tokens): string {
+        $buf = '';
+        for ($i = $s; $i <= $e; $i++) {
+            $buf .= is_array($tokens[$i]) ? $tokens[$i][1] : $tokens[$i];
+        }
+        return trim($buf);
+    };
+
+    /**
+     * クラス / トレイト / インタフェース Body 内で method を抽出
+     */
+    $scanClassBody = static function (int $openIdx, int $closeIdx, string $clsName)
+                      use (&$blocks, $tokens, &$exclude, $matchBrace, $sliceToString): void
+    {
+        $i = $openIdx + 1;
+        while ($i < $closeIdx) {
+            $tok = $tokens[$i];
+
+            // Visibility (public/private ...) を飛ばして T_FUNCTION を探す
+            if (is_array($tok) && $tok[0] === T_FUNCTION) {
+
+                // 無名関数対策: 次の有効トークンが "(" ならスキップ
+                $j = $i + 1;
+                while ($j < $closeIdx && is_array($tokens[$j]) && $tokens[$j][0] === T_WHITESPACE) $j++;
+                if ($tokens[$j] === '(') { $i++; continue; }
+
+                // メソッド名
+                while ($j < $closeIdx && is_array($tokens[$j]) && $tokens[$j][0] === T_STRING === false) $j++;
+                $method = is_array($tokens[$j]) ? $tokens[$j][1] : 'anonymous';
+                // 開き '{' 探索
+                while ($j < $closeIdx && $tokens[$j] !== '{') $j++;
+                if ($j >= $closeIdx) { $i++; continue; }
+                $end = $matchBrace($j);
+
+                $key = "{$clsName}::{$method}";
+                $blocks[$key] = $sliceToString($j + 1, $end - 1);
+                $exclude[]    = [$i, $end];   // メソッド全体を除外
+                $i = $end + 1;
+                continue;
+            }
+            $i++;
+        }
+    };
+
+    /* ───── トップレベル走査 ───── */
+    $i = 0;
+    while ($i < $N) {
+        $tok = $tokens[$i];
+
+        /* ----- namespace ----- */
+        if (is_array($tok) && $tok[0] === T_NAMESPACE) {
+            // '{' or ';' まで飛ばす
+            while ($i < $N && $tokens[$i] !== '{' && $tokens[$i] !== ';') $i++;
+            if ($tokens[$i] === '{') { // braces style
+                $end = $matchBrace($i);
+                // namespace 内は再帰的に fallbackSplit へ委任
+                $nsCode = $sliceToString($i + 1, $end - 1);
+                $nested = fallbackSplit("<?php\n" . $nsCode);
+                // main は無視（namespace 外に main があるので）
+                foreach ($nested as $k => $v) {
+                    if ($k === 'main' && trim($v) === '') continue;
+                    $blocks[$k] = $v;
+                }
+                $exclude[] = [$i, $end];
+                $i = $end + 1;
+                continue;
+            }
+            $i++;
+            continue;
+        }
+
+        /* ----- グローバル関数 ----- */
+        if (is_array($tok) && $tok[0] === T_FUNCTION) {
+            // 無名関数ならスキップ
+            $j = $i + 1;
+            while ($j < $N && is_array($tokens[$j]) && $tokens[$j][0] === T_WHITESPACE) $j++;
+            if ($tokens[$j] === '(') { $i++; continue; }  // 無名関数
+
+            // 名前取得
+            while ($j < $N && (!is_array($tokens[$j]) || $tokens[$j][0] !== T_STRING)) $j++;
+            $fname = is_array($tokens[$j]) ? $tokens[$j][1] : 'anonymousFunc';
+
+            // '{' まで送る
+            while ($j < $N && $tokens[$j] !== '{') $j++;
+            if ($j >= $N) { $i++; continue; }
+            $end = $matchBrace($j);
+
+            $blocks[$fname] = $sliceToString($j + 1, $end - 1);
+            $exclude[]      = [$i, $end];
+            $i = $end + 1;
+            continue;
+        }
+
+        /* ----- class / trait / interface ----- */
+        if (is_array($tok)
+            && in_array($tok[0], [T_CLASS, T_TRAIT, T_INTERFACE], true)
+        ) {
+            // クラス名
+            $j = $i + 1;
+            while ($j < $N && is_array($tokens[$j]) && $tokens[$j][0] === T_WHITESPACE) $j++;
+            $clsName = (is_array($tokens[$j]) && $tokens[$j][0] === T_STRING)
+                       ? $tokens[$j][1]
+                       : 'AnonymousClass';
+
+            while ($j < $N && $tokens[$j] !== '{') $j++;
+            if ($j >= $N) { $i++; continue; }
+            $end = $matchBrace($j);
+
+            $scanClassBody($j, $end, $clsName);
+            $exclude[] = [$i, $end];
+            $i = $end + 1;
+            continue;
+        }
+
+        $i++;
+    }
+
+    /* ───── main の再構築（除外レンジを飛ばす） ───── */
+    $exclude = array_map(fn($p)=>['s'=>$p[0],'e'=>$p[1]], $exclude);
+    usort($exclude, fn($a,$b)=>$a['s']<=>$b['s']);
+
+    $mainBuf = '';
+    $eIdx = 0;
+    for ($i = 0; $i < $N; $i++) {
+        // 現在トークンが除外レンジ内か
+        while ($eIdx < count($exclude) && $i > $exclude[$eIdx]['e']) $eIdx++;
+        if ($eIdx < count($exclude)
+            && $i >= $exclude[$eIdx]['s']
+            && $i <= $exclude[$eIdx]['e']) {
+            continue; // スキップ
+        }
+        $mainBuf .= is_array($tokens[$i]) ? $tokens[$i][1] : $tokens[$i];
+    }
+
+    $blocks['main'] = trim($mainBuf);
+    return $blocks;
+}
