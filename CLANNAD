@@ -1,0 +1,269 @@
+<?php
+/**
+ * ------------------------------------------------------------------
+ *  replaceIdentifiers()
+ *  ---------------------------------------------------------------
+ *  ■ 役割
+ *    - 与えられた PHP ソースコード文字列を AST 解析し，
+ *      定数／変数を “定義されたリテラル値” に静的置換する。
+ *    - nikic/php-parser でパース出来なかった場合は
+ *      正規表現ベースのフォールバックで最低限の置換を行う。
+ *
+ *  ■ 置換ルール
+ *    - 解析して値が分かった      : → そのリテラル値で置換
+ *    - 値が分からない／未定義    : → 変数   → 'var_<名前>'
+ *                                   定数   → 'con_<名前>'
+ *
+ *  ■ 前提
+ *    - $code には既に「<?php」開始タグが含まれている。
+ *    - composer で以下 2 パッケージをインストール済み
+ *        nikic/php-parser:^5
+ *        ext-tokenizer (PHP 標準)
+ * ------------------------------------------------------------------
+ */
+
+use PhpParser\{Error, Node, NodeTraverser, NodeVisitorAbstract, ParserFactory};
+use PhpParser\Node\Expr\Assign;
+use PhpParser\Node\Expr\ConstFetch;
+use PhpParser\Node\Expr\FuncCall;
+use PhpParser\Node\Expr\Variable;
+use PhpParser\Node\Scalar;
+use PhpParser\Node\Stmt\Const_;
+use PhpParser\PrettyPrinter\Standard;
+
+/**
+ * PHP ソース中の定数・変数を静的に解決して置換する
+ *
+ * @param  string $code 置換前ソース
+ * @return string       置換後ソース
+ */
+function replaceIdentifiers(string $code): string
+{
+    /* ---------- 1. パーサ準備 ---------- */
+    $parserFactory = new ParserFactory();
+    $parser        = $parserFactory->createForNewestSupportedVersion();
+    $prettyPrinter = new Standard();
+
+    try {
+        /* ---------- 2. AST 生成 ---------- */
+        $ast = $parser->parse($code);
+
+        /* ---------- 3. ① 定義収集フェーズ ---------- */
+        /**
+         * variables : ['$name' => Scalar|mixed|null]
+         * constants  : ['NAME'   => Scalar|mixed|null]
+         */
+        $variables = $constants = [];
+
+        $collector = new class($variables, $constants) extends NodeVisitorAbstract {
+            public array $vars;
+            public array $consts;
+            public function __construct(array &$v, array &$c)
+            {
+                $this->vars   = &$v;
+                $this->consts = &$c;
+            }
+
+            public function leaveNode(Node $node)
+            {
+                /* --- 変数代入 $var = <scalar>; --- */
+                if ($node instanceof Assign &&
+                    $node->var instanceof Variable &&
+                    is_string($node->var->name) &&
+                    $this->isScalar($node->expr)
+                ) {
+                    $name              = $node->var->name;
+                    $this->vars[$name] = $this->getScalarValue($node->expr);
+                }
+
+                /* --- const CONST = <scalar>; --- */
+                if ($node instanceof Const_) {
+                    foreach ($node->consts as $constElem) {
+                        if ($this->isScalar($constElem->value)) {
+                            $this->consts[$constElem->name->toString()] =
+                                $this->getScalarValue($constElem->value);
+                        }
+                    }
+                }
+
+                /* --- define('CONST', <scalar>); --- */
+                if ($node instanceof FuncCall             &&
+                    $node->name instanceof Node\Name      &&
+                    strtolower($node->name->toString()) === 'define' &&
+                    isset($node->args[0], $node->args[1]) &&
+                    $node->args[0]->value instanceof Scalar\String_ &&
+                    $this->isScalar($node->args[1]->value)
+                ) {
+                    $cName                       = $node->args[0]->value->value;
+                    $this->consts[$cName]        = $this->getScalarValue($node->args[1]->value);
+                }
+            }
+
+            /* --- スカラー判定（数値・文字列・真偽・null） --- */
+            private function isScalar(Node $n): bool
+            {
+                return $n instanceof Scalar\String_
+                    || $n instanceof Scalar\LNumber
+                    || $n instanceof Scalar\DNumber
+                    || $n instanceof Scalar\MagicConst
+                    || $n instanceof Node\Expr\ConstFetch
+                    || $n instanceof Node\Expr\ClassConstFetch
+                    || $n instanceof Node\Expr\Array_; // 単純化のため配列は除外しても良い
+            }
+            /* --- スカラー値を PHP 値に変換 --- */
+            private function getScalarValue(Node $n)
+            {
+                if ($n instanceof Scalar\String_)   return $n->value;
+                if ($n instanceof Scalar\LNumber)   return (int)$n->value;
+                if ($n instanceof Scalar\DNumber)   return (float)$n->value;
+                if ($n instanceof ConstFetch) {
+                    $name = strtolower($n->name->toString());
+                    if ($name === 'true')  return true;
+                    if ($name === 'false') return false;
+                    if ($name === 'null')  return null;
+                }
+                // それ以外は未解決扱い
+                return null;
+            }
+        };
+
+        $traverser = new NodeTraverser();
+        $traverser->addVisitor($collector);
+        $traverser->traverse($ast);
+
+        $variables = $collector->vars;
+        $constants = $collector->consts;
+
+        /* ---------- 4. ② 置換フェーズ ---------- */
+        $replacer = new class($variables, $constants) extends NodeVisitorAbstract {
+            private array $vars;
+            private array $consts;
+
+            public function __construct(array $v, array $c)
+            {
+                $this->vars   = $v;
+                $this->consts = $c;
+            }
+
+            public function leaveNode(Node $node)
+            {
+                /* --- 変数置換 --- */
+                if ($node instanceof Variable && is_string($node->name)) {
+                    $name = $node->name;
+                    if (array_key_exists($name, $this->vars)) {
+                        return $this->toScalarNode($this->vars[$name]);
+                    }
+                    // 未解決 → 'var_<name>'
+                    return new Scalar\String_('var_' . $name);
+                }
+
+                /* --- 定数置換 --- */
+                if ($node instanceof ConstFetch) {
+                    $cName = $node->name->toString();
+                    if (array_key_exists($cName, $this->consts)) {
+                        return $this->toScalarNode($this->consts[$cName]);
+                    }
+                    // 未解決 → 'con_<NAME>'
+                    return new Scalar\String_('con_' . $cName);
+                }
+            }
+
+            /* PHP 値 → Scalar ノード化 */
+            private function toScalarNode($val): Node
+            {
+                switch (true) {
+                    case is_string($val): return new Scalar\String_($val);
+                    case is_int($val):    return new Scalar\LNumber($val);
+                    case is_float($val):  return new Scalar\DNumber($val);
+                    case is_bool($val):   return new ConstFetch(
+                                                new Node\Name($val ? 'true' : 'false'));
+                    case is_null($val):   return new ConstFetch(new Node\Name('null'));
+                    // 配列やオブジェクトなど複雑型は文字列化
+                    default:              return new Scalar\String_(json_encode($val));
+                }
+            }
+        };
+
+        $traverser2 = new NodeTraverser();
+        $traverser2->addVisitor($replacer);
+        $ast = $traverser2->traverse($ast);
+
+        /* ---------- 5. 整形して返却 ---------- */
+        return $prettyPrinter->prettyPrintFile($ast);
+    }
+    catch (Error $e) {
+        /* ---------- 6. フォールバック ---------- */
+        return fallbackReplace($code);
+    }
+}
+
+/*======================================================================
+    フォールバック：正規表現で簡易置換
+  ======================================================================*/
+
+/**
+ * @param  string $code
+ * @return string
+ */
+function fallbackReplace(string $code): string
+{
+    /* --- a) 定数・変数定義取得 --- */
+    $varTable = [];   // $name => 'value'
+    $conTable = [];   // NAME   => 'value'
+
+    // 変数単純代入: $foo = 'bar';
+    if (preg_match_all('/\$([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([\'"])(.*?)\2\s*;/', 
+                       $code, $m, PREG_SET_ORDER)) {
+        foreach ($m as $match) $varTable[$match[1]] = $match[3];
+    }
+
+    // define('NAME','value');
+    if (preg_match_all('/define\s*\(\s*[\'"]([A-Z0-9_]+)[\'"]\s*,\s*([\'"])(.*?)\2\s*\)/i', 
+                       $code, $m, PREG_SET_ORDER)) {
+        foreach ($m as $match) $conTable[$match[1]] = $match[3];
+    }
+
+    // const NAME = 'value';
+    if (preg_match_all('/const\s+([A-Z0-9_]+)\s*=\s*([\'"])(.*?)\2\s*;/', 
+                       $code, $m, PREG_SET_ORDER)) {
+        foreach ($m as $match) $conTable[$match[1]] = $match[3];
+    }
+
+    /* --- b) 出現箇所を置換（定義行自身はスキップ） --- */
+    // 置換対象外にするために一時プレースホルダへ避難
+    $codeTmp = preg_replace_callback(
+        '/__PLACEHOLDER__/u', fn($x) => '__PLACEHOLDER__', $code); // 何もしないダミー
+
+    // 変数
+    foreach ($varTable as $name => $val) {
+        $codeTmp = preg_replace(
+            '/\$' . preg_quote($name,'/') . '\b/',
+            var_export($val, true), // スカラーをリテラル表現
+            $codeTmp
+        );
+    }
+    // 定数
+    foreach ($conTable as $name => $val) {
+        $codeTmp = preg_replace(
+            '/\b' . preg_quote($name,'/') . '\b/',
+            var_export($val, true),
+            $codeTmp
+        );
+    }
+
+    /* --- c) 未解決をプレースホルダ化 --- */
+    // 未解決変数 → 'var_<name>'
+    $codeTmp = preg_replace(
+        '/\$([A-Za-z_][A-Za-z0-9_]*)\b/',
+        '\'var_$1\'',
+        $codeTmp
+    );
+    // 未解決定数 → 'con_<NAME>'
+    $codeTmp = preg_replace(
+        '/\b([A-Z_][A-Z0-9_]*)\b/',
+        '\'con_$1\'',
+        $codeTmp
+    );
+
+    return $codeTmp;
+}
