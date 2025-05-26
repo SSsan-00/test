@@ -1,0 +1,221 @@
+<?php
+
+require 'vendor/autoload.php';
+
+use PhpParser\Node;
+use PhpParser\Node\Expr\Variable;
+use PhpParser\Node\Scalar\String_;
+use PhpParser\ParserFactory;
+use PhpParser\NodeTraverser;
+use PhpParser\NodeVisitor\NameResolver;
+use PhpParser\NodeVisitorAbstract;
+use PhpParser\Error;
+
+/**
+ * 変数と定数を置換するためのNodeVisitor
+ */
+class VariableReplacer extends NodeVisitorAbstract {
+    private $variables = [];
+    private $constants = [];
+
+    public function __construct(array $variables = [], array $constants = []) {
+        $this->variables = $variables;
+        $this->constants = $constants;
+    }
+
+    public function leaveNode(Node $node) {
+        if ($node instanceof Variable) {
+            $name = $node->name;
+            if (isset($this->variables[$name])) {
+                return new String_((string)$this->variables[$name]);
+            }
+        } elseif ($node instanceof Node\Expr\ConstFetch) {
+            $name = $node->name->toString();
+            if (isset($this->constants[$name])) {
+                return new String_((string)$this->constants[$name]);
+            }
+        }
+        return null;
+    }
+}
+
+/**
+ * 文字列内の変数と定数を実際の値に置換する関数
+ * 
+ * @param string $str 置換対象の文字列
+ * @return string 置換後の文字列
+ * @throws \InvalidArgumentException 無効な入力の場合
+ * @throws \RuntimeException 処理中にエラーが発生した場合
+ */
+function replaceVariablesAndConstants(string $str): string {
+    if (empty($str)) {
+        throw new \InvalidArgumentException('入力文字列が空です');
+    }
+
+    try {
+        // 変数と定数の値を取得
+        $variables = get_defined_vars();
+        $constants = get_defined_constants(true)['user'] ?? [];
+
+        // PHP-Parserを使用した置換
+        $parser = (new ParserFactory)->createForHostVersion();
+        $traverser = new NodeTraverser();
+        $traverser->addVisitor(new NameResolver());
+        $traverser->addVisitor(new VariableReplacer($variables, $constants));
+
+        // 文字列をPHPコードとして解析
+        $code = "<?php\n" . $str;
+        $ast = $parser->parse($code);
+
+        if ($ast === null) {
+            throw new \RuntimeException("解析に失敗しました");
+        }
+
+        $ast = $traverser->traverse($ast);
+
+        // 変数と定数の置換
+        $result = preg_replace_callback_array([
+            // {$変数名}形式の置換
+            '/\{(\$[a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*)\}/' => function($matches) use ($variables) {
+                $varName = substr($matches[1], 1); // $を除去
+                return isset($variables[$varName]) ? (string)$variables[$varName] : $matches[0];
+            },
+            // $変数名形式の置換
+            '/\$([a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*)/' => function($matches) use ($variables) {
+                $varName = $matches[1];
+                return isset($variables[$varName]) ? (string)$variables[$varName] : $matches[0];
+            },
+            // #定数名形式の置換
+            '/#([a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*)/' => function($matches) use ($constants) {
+                $constName = $matches[1];
+                return isset($constants[$constName]) ? (string)$constants[$constName] : $matches[0];
+            }
+        ], $str);
+
+        return $result;
+    } catch (Error $e) {
+        // PHP-Parserの構文エラーの場合
+        error_log("PHP-Parserエラー: " . $e->getMessage());
+        return preg_replace_callback_array([
+            '/\{(\$[a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*)\}/' => function($matches) use ($variables) {
+                $varName = substr($matches[1], 1);
+                return isset($variables[$varName]) ? (string)$variables[$varName] : $matches[0];
+            },
+            '/\$([a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*)/' => function($matches) use ($variables) {
+                $varName = $matches[1];
+                return isset($variables[$varName]) ? (string)$variables[$varName] : $matches[0];
+            },
+            '/#([a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*)/' => function($matches) use ($constants) {
+                $constName = $matches[1];
+                return isset($constants[$constName]) ? (string)$constants[$constName] : $matches[0];
+            }
+        ], $str);
+    } catch (\Exception $e) {
+        error_log("予期せぬエラー: " . $e->getMessage());
+        throw new \RuntimeException("処理中にエラーが発生しました: " . $e->getMessage(), 0, $e);
+    }
+}
+
+// テストケース
+function runTests() {
+    try {
+        // テスト1: 基本的な変数と定数の置換
+        $name = "田中太郎";
+        define("GREETING", "こんにちは");
+        $template1 = "こんにちは、{$name}さん！#GREETING";
+        $result1 = replaceVariablesAndConstants($template1);
+        echo "テスト1: " . ($result1 === "こんにちは、田中太郎さん！こんにちは" ? "成功" : "失敗") . "\n";
+
+        // テスト2: 存在しない変数と定数
+        $template2 = "存在しない変数: {\$unknown} と定数: #UNKNOWN";
+        $result2 = replaceVariablesAndConstants($template2);
+        echo "テスト2: " . ($result2 === "存在しない変数: {\$unknown} と定数: #UNKNOWN" ? "成功" : "失敗") . "\n";
+
+        // テスト3: 数値型の変数
+        $age = 25;
+        $template3 = "年齢は{$age}歳です";
+        $result3 = replaceVariablesAndConstants($template3);
+        echo "テスト3: " . ($result3 === "年齢は25歳です" ? "成功" : "失敗") . "\n";
+
+        // テスト4: 配列の変数
+        $user = ["name" => "山田花子", "age" => 30];
+        $template4 = "ユーザー情報: {$user['name']}さん、{$user['age']}歳";
+        $result4 = replaceVariablesAndConstants($template4);
+        echo "テスト4: " . ($result4 === "ユーザー情報: 山田花子さん、30歳" ? "成功" : "失敗") . "\n";
+
+        // テスト5: 複数の変数と定数の組み合わせ
+        define("COMPANY", "株式会社テスト");
+        $position = "エンジニア";
+        $template5 = "{$name}さんは#COMPANYの{$position}として働いています";
+        $result5 = replaceVariablesAndConstants($template5);
+        echo "テスト5: " . ($result5 === "田中太郎さんは株式会社テストのエンジニアとして働いています" ? "成功" : "失敗") . "\n";
+
+        // テスト6: 日本語の変数名
+        $日本語変数 = "日本語の変数名テスト";
+        $template6 = "日本語変数名のテスト: {$日本語変数}";
+        $result6 = replaceVariablesAndConstants($template6);
+        echo "テスト6: " . ($result6 === "日本語変数名のテスト: 日本語の変数名テスト" ? "成功" : "失敗") . "\n";
+
+        // テスト7: 特殊文字を含む変数
+        $special_var = "特殊文字: !@#$%^&*()";
+        $template7 = "特殊文字テスト: {$special_var}";
+        $result7 = replaceVariablesAndConstants($template7);
+        echo "テスト7: " . ($result7 === "特殊文字テスト: 特殊文字: !@#$%^&*()" ? "成功" : "失敗") . "\n";
+
+        // テスト8: 複数の形式の混在
+        $template8 = "{$name}さんは{$position}として#COMPANYで働いています";
+        $result8 = replaceVariablesAndConstants($template8);
+        echo "テスト8: " . ($result8 === "田中太郎さんはエンジニアとして株式会社テストで働いています" ? "成功" : "失敗") . "\n";
+
+        // テスト9: ネストされた配列
+        $nested = ["user" => ["profile" => ["name" => "佐藤花子"]]];
+        $template9 = "ネストされた配列: {$nested['user']['profile']['name']}";
+        $result9 = replaceVariablesAndConstants($template9);
+        echo "テスト9: " . ($result9 === "ネストされた配列: 佐藤花子" ? "成功" : "失敗") . "\n";
+
+        // テスト10: 複雑な式
+        $age_plus_5 = $age + 5;
+        $template10 = "計算結果: {$age_plus_5}歳、{$name}さんの{$position}としての経験年数";
+        $result10 = replaceVariablesAndConstants($template10);
+        echo "テスト10: " . ($result10 === "計算結果: 30歳、田中太郎さんのエンジニアとしての経験年数" ? "成功" : "失敗") . "\n";
+
+        // テスト11: 空文字列の処理
+        try {
+            replaceVariablesAndConstants("");
+            echo "テスト11: 失敗（例外が発生すべき）\n";
+        } catch (\InvalidArgumentException $e) {
+            echo "テスト11: 成功（期待通りの例外）\n";
+        }
+
+        // テスト12: 無効な変数名
+        $template12 = "無効な変数名: {\$invalid123}";
+        $result12 = replaceVariablesAndConstants($template12);
+        echo "テスト12: " . ($result12 === "無効な変数名: {\$invalid123}" ? "成功" : "失敗") . "\n";
+
+        // テスト13: オブジェクトのプロパティ
+        $obj = new stdClass();
+        $obj->name = "鈴木一郎";
+        $template13 = "オブジェクトプロパティ: {$obj->name}";
+        $result13 = replaceVariablesAndConstants($template13);
+        echo "テスト13: " . ($result13 === "オブジェクトプロパティ: 鈴木一郎" ? "成功" : "失敗") . "\n";
+
+        // テスト14: 複数の定数
+        define("DEPARTMENT", "開発部");
+        define("ROLE", "リーダー");
+        $template14 = "{$name}さんは#COMPANYの#DEPARTMENTで#ROLEを務めています";
+        $result14 = replaceVariablesAndConstants($template14);
+        echo "テスト14: " . ($result14 === "田中太郎さんは株式会社テストの開発部でリーダーを務めています" ? "成功" : "失敗") . "\n";
+
+        // テスト15: エスケープされた文字
+        $template15 = "エスケープ: \${$name}";
+        $result15 = replaceVariablesAndConstants($template15);
+        echo "テスト15: " . ($result15 === "エスケープ: \$田中太郎" ? "成功" : "失敗") . "\n";
+
+    } catch (\Exception $e) {
+        error_log("テスト実行中にエラーが発生しました: " . $e->getMessage());
+        throw $e;
+    }
+}
+
+// テストの実行
+runTests();
