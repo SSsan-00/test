@@ -1,0 +1,150 @@
+# SSMS & T-SQL チートシート
+
+## 🎹 基本ショートカット
+- **新しいクエリ**: `Ctrl + N`
+- **クエリ実行**: `F5` または `Ctrl + E`
+- **構文解析**: `Ctrl + F5`
+- **保存**: `Ctrl + S`
+- **オブジェクトエクスプローラー**: `F8`
+- **検索**: `Ctrl + F`
+- **置換**: `Ctrl + H`
+
+## 🧭 SSMS の使い方ガイド
+- **クエリの作成**: ツールバーまたは `Ctrl + N` で新規クエリウィンドウを開く。
+- **実行対象のデータベース選択**: クエリエディターの上部ドロップダウンから選択、または `USE` 文を使用。
+- **データベースの構造確認**: 左側の「オブジェクトエクスプローラー」でテーブルやビューを展開。
+- **右クリック操作**: テーブルやビューを右クリックして、デザイン変更やデータの閲覧が可能。
+
+## 📂 データベース選択とバッチ区切り
+
+### `USE` の使い方
+```sql
+USE SampleDB;
+```
+指定したデータベースにスコープを切り替え。
+
+### `GO` の使い方
+```sql
+USE SampleDB;
+GO
+
+SELECT * FROM Users;
+GO
+```
+`GO` はバッチを明示的に分けるマーカー。SSMSなどクライアントで処理。
+
+## 🏗 データ定義 (DDL)
+```sql
+CREATE DATABASE SampleDB;
+CREATE TABLE Users (ID INT PRIMARY KEY, Name NVARCHAR(50));
+ALTER TABLE Users ADD Age INT;
+ALTER TABLE Users ALTER COLUMN Name NVARCHAR(100);
+DROP TABLE Users;
+```
+
+## 🛠 データ操作 (DML)
+```sql
+INSERT INTO Users (ID, Name) VALUES (1, 'Taro');
+UPDATE Users SET Name = 'Jiro' WHERE ID = 1;
+DELETE FROM Users WHERE ID = 1;
+SELECT * FROM Users;
+```
+
+## 🔁 重複除去
+```sql
+SELECT DISTINCT Name FROM Users;
+```
+
+## 📥 SELECT INTO
+```sql
+SELECT ID, Name INTO TempUsers FROM Users WHERE IsActive = 1;
+```
+
+## 🔍 条件・集計・並べ替え
+```sql
+SELECT * FROM Users WHERE Name = 'Taro';
+SELECT * FROM Users ORDER BY Name ASC;
+SELECT Name, COUNT(*) FROM Users GROUP BY Name;
+SELECT Name, COUNT(*) FROM Users GROUP BY Name HAVING COUNT(*) > 1;
+```
+
+## 🔗 結合・ビュー
+```sql
+SELECT * FROM Orders INNER JOIN Customers ON Orders.CustomerID = Customers.ID;
+SELECT * FROM Orders LEFT JOIN Customers ON Orders.CustomerID = Customers.ID;
+CREATE VIEW ActiveUsers AS SELECT * FROM Users WHERE IsActive = 1;
+```
+
+## 📚 公式ドキュメントリンク
+- [SSMS のチュートリアルとヒント](https://learn.microsoft.com/ja-jp/ssms/tutorials/ssms-tricks?view=sql-server-ver16)
+- [T-SQL リファレンス](https://learn.microsoft.com/ja-jp/sql/t-sql/language-reference?view=sql-server-ver16)
+- [SELECT INTO](https://learn.microsoft.com/ja-jp/sql/t-sql/queries/select-into-transact-sql?view=sql-server-ver16)
+- [SELECT 文](https://learn.microsoft.com/ja-jp/sql/t-sql/queries/select-transact-sql?view=sql-server-ver16)
+
+
+SSMS & T-SQL チートシート
+
+基本ショートカット
+- 新しいクエリ: Ctrl + N
+- クエリ実行: F5 または Ctrl + E
+- 構文解析: Ctrl + F5
+- 保存: Ctrl + S
+- オブジェクトエクスプローラー: F8
+- 検索: Ctrl + F
+- 置換: Ctrl + H
+
+SSMS の使い方ガイド
+- クエリの作成: ツールバーまたは Ctrl + N で新規クエリウィンドウを開く。
+- 実行対象のデータベース選択: クエリエディターの上部ドロップダウンから選択、または USE 文を使用。
+- データベースの構造確認: 左側の「オブジェクトエクスプローラー」でテーブルやビューを展開。
+- 右クリック操作: テーブルやビューを右クリックして、デザイン変更やデータの閲覧が可能。
+
+データベース選択とバッチ区切り
+
+USE の使い方
+USE SampleDB;
+指定したデータベースにスコープを切り替え。
+
+GO の使い方
+USE SampleDB;
+GO
+
+SELECT * FROM Users;
+GO
+GO はバッチを明示的に分けるマーカー。SSMSなどクライアントで処理。
+
+データ定義 (DDL)
+CREATE DATABASE SampleDB;
+CREATE TABLE Users (ID INT PRIMARY KEY, Name NVARCHAR(50));
+ALTER TABLE Users ADD Age INT;
+ALTER TABLE Users ALTER COLUMN Name NVARCHAR(100);
+DROP TABLE Users;
+
+データ操作 (DML)
+INSERT INTO Users (ID, Name) VALUES (1, 'Taro');
+UPDATE Users SET Name = 'Jiro' WHERE ID = 1;
+DELETE FROM Users WHERE ID = 1;
+SELECT * FROM Users;
+
+重複除去
+SELECT DISTINCT Name FROM Users;
+
+SELECT INTO
+SELECT ID, Name INTO TempUsers FROM Users WHERE IsActive = 1;
+
+条件・集計・並べ替え
+SELECT * FROM Users WHERE Name = 'Taro';
+SELECT * FROM Users ORDER BY Name ASC;
+SELECT Name, COUNT(*) FROM Users GROUP BY Name;
+SELECT Name, COUNT(*) FROM Users GROUP BY Name HAVING COUNT(*) > 1;
+
+結合・ビュー
+SELECT * FROM Orders INNER JOIN Customers ON Orders.CustomerID = Customers.ID;
+SELECT * FROM Orders LEFT JOIN Customers ON Orders.CustomerID = Customers.ID;
+CREATE VIEW ActiveUsers AS SELECT * FROM Users WHERE IsActive = 1;
+
+公式ドキュメントリンク
+- SSMS のチュートリアルとヒント: https://learn.microsoft.com/ja-jp/ssms/tutorials/ssms-tricks?view=sql-server-ver16
+- T-SQL リファレンス: https://learn.microsoft.com/ja-jp/sql/t-sql/language-reference?view=sql-server-ver16
+- SELECT INTO: https://learn.microsoft.com/ja-jp/sql/t-sql/queries/select-into-transact-sql?view=sql-server-ver16
+- SELECT 文: https://learn.microsoft.com/ja-jp/sql/t-sql/queries/select-transact-sql?view=sql-server-ver16 
