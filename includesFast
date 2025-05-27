@@ -1,0 +1,183 @@
+#!/usr/bin/env php
+<?php
+
+require 'vendor/autoload.php';
+
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+use PhpParser\NodeFinder;
+use PhpParser\ParserFactory;
+use PhpParser\Error;
+use PhpParser\PrettyPrinter\Standard;
+
+class IncludeAnalyzer {
+    private $spreadsheet;
+    private $sheet;
+    private $row = 2;
+    private $basePath;
+    private $processedFiles = [];
+    private $startTime;
+    private $totalFiles = 0;
+    private $processedCount = 0;
+    private $parser;
+    private $nodeFinder;
+    private $prettyPrinter;
+
+    public function __construct($basePath) {
+        $this->basePath = rtrim($basePath, '/');
+        $this->spreadsheet = new Spreadsheet();
+        $this->sheet = $this->spreadsheet->getActiveSheet();
+        $this->setupSheet();
+        $this->startTime = microtime(true);
+        
+        // PHP-Parserの初期化
+        $this->parser = (new ParserFactory)->createForNewestSupportedVersion();
+        $this->nodeFinder = new NodeFinder;
+        $this->prettyPrinter = new Standard;
+    }
+
+    private function setupSheet() {
+        $this->sheet->setCellValue('A1', 'file_path');
+        $this->sheet->setCellValue('B1', 'include_file');
+        $this->sheet->getColumnDimension('A')->setWidth(50);
+        $this->sheet->getColumnDimension('B')->setWidth(50);
+    }
+
+    public function analyze() {
+        $this->processDirectory($this->basePath);
+        $this->saveResults();
+    }
+
+    private function processDirectory($dir) {
+        $files = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($dir, RecursiveDirectoryIterator::SKIP_DOTS)
+        );
+
+        foreach ($files as $file) {
+            if ($file->isFile() && in_array($file->getExtension(), ['php', 'inc'])) {
+                $this->totalFiles++;
+            }
+        }
+
+        $files = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($dir, RecursiveDirectoryIterator::SKIP_DOTS)
+        );
+
+        foreach ($files as $file) {
+            if ($file->isFile() && in_array($file->getExtension(), ['php', 'inc'])) {
+                $this->processFile($file->getPathname());
+                $this->processedCount++;
+                $this->showProgress();
+            }
+        }
+    }
+
+    private function processFile($filePath) {
+        if (isset($this->processedFiles[$filePath])) {
+            return;
+        }
+        $this->processedFiles[$filePath] = true;
+
+        $content = file_get_contents($filePath);
+        $content = $this->cleanupContent($content);
+        $relativePath = str_replace($this->basePath . '/', '', $filePath);
+
+        // PHP-Parserを使用した解析を試みる
+        $includes = $this->parseWithPhpParser($content);
+        
+        // PHP-Parserでの解析が失敗した場合、正規表現による解析にフォールバック
+        if (empty($includes)) {
+            $includes = $this->parseWithRegex($content);
+        }
+
+        foreach ($includes as $includeFile) {
+            $this->sheet->setCellValue('A' . $this->row, $relativePath);
+            $this->sheet->setCellValue('B' . $this->row, $includeFile);
+            $this->row++;
+        }
+    }
+
+    private function parseWithPhpParser($content) {
+        try {
+            $ast = $this->parser->parse($content);
+            if ($ast === null) {
+                return [];
+            }
+
+            $includes = [];
+            $includeNodes = $this->nodeFinder->find($ast, function($node) {
+                return $node instanceof \PhpParser\Node\Expr\Include_;
+            });
+
+            foreach ($includeNodes as $node) {
+                if ($node instanceof \PhpParser\Node\Expr\Include_ && $node->expr !== null) {
+                    $includes[] = $this->prettyPrinter->prettyPrintExpr($node->expr);
+                }
+            }
+
+            return $includes;
+        } catch (Error $e) {
+            return [];
+        }
+    }
+
+    private function parseWithRegex($content) {
+        $includes = [];
+        $patterns = [
+            '/include\s*\(\s*[\'"]([^\'"]+)[\'"]\s*\)/',
+            '/include_once\s*\(\s*[\'"]([^\'"]+)[\'"]\s*\)/',
+            '/require\s*\(\s*[\'"]([^\'"]+)[\'"]\s*\)/',
+            '/require_once\s*\(\s*[\'"]([^\'"]+)[\'"]\s*\)/'
+        ];
+
+        foreach ($patterns as $pattern) {
+            if (preg_match_all($pattern, $content, $matches)) {
+                $includes = array_merge($includes, $matches[1]);
+            }
+        }
+
+        return $includes;
+    }
+
+    private function cleanupContent($content) {
+        // コメントの除去
+        $content = preg_replace('!/\*.*?\*/!s', '', $content);
+        $content = preg_replace('/\/\/.*$/m', '', $content);
+        
+        // <? を <?php に変換
+        $content = preg_replace('/<\?(?!php|=)/', '<?php', $content);
+        
+        return $content;
+    }
+
+    private function showProgress() {
+        $elapsed = microtime(true) - $this->startTime;
+        $progress = ($this->processedCount / $this->totalFiles) * 100;
+        $speed = $this->processedCount / $elapsed;
+        
+        echo sprintf(
+            "\r処理中: %.1f%% (%d/%d) - 速度: %.1f ファイル/秒 - 経過時間: %.1f秒",
+            $progress,
+            $this->processedCount,
+            $this->totalFiles,
+            $speed,
+            $elapsed
+        );
+    }
+
+    private function saveResults() {
+        $writer = new Xlsx($this->spreadsheet);
+        $outputFile = 'include_analysis_' . date('Y-m-d_His') . '.xlsx';
+        $writer->save($outputFile);
+        echo "\n\n結果を {$outputFile} に保存しました。\n";
+    }
+}
+
+// コマンドライン引数の処理
+if ($argc < 2) {
+    echo "使用方法: php include_analyzer.php <ディレクトリパス>\n";
+    exit(1);
+}
+
+$analyzer = new IncludeAnalyzer($argv[1]);
+$analyzer->analyze(); 
