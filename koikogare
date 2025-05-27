@@ -8,9 +8,6 @@ use PhpParser\ParserFactory;
 use PhpParser\Error;
 use PhpOffice\PhpSpreadsheet\Spreadsheet;
 use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
-use RecursiveIteratorIterator;
-use RecursiveDirectoryIterator;
-use FilesystemIterator;
 
 class FunctionCallFinder
 {
@@ -78,7 +75,7 @@ class FunctionCallFinder
         }
     }
 
-    private function processFile($filePath, $relativePath)
+    public function processFile($filePath, $relativePath)
     {
         $content = file_get_contents($filePath);
         
@@ -91,6 +88,8 @@ class FunctionCallFinder
         try {
             $ast = $this->parser->parse($content);
             if ($ast === null) {
+                // フォールバック処理: 正規表現による簡易解析
+                $this->fallbackParse($content, $relativePath);
                 return;
             }
 
@@ -99,7 +98,9 @@ class FunctionCallFinder
 
             // 関数定義内の関数呼び出しを検出
             $functionNodes = $this->nodeFinder->find($ast, function(Node $node) {
-                return $node instanceof Node\Stmt\Function_ || $node instanceof Node\Stmt\ClassMethod;
+                return $node instanceof Node\Stmt\Function_ || 
+                       $node instanceof Node\Stmt\ClassMethod ||
+                       $node instanceof Node\Expr\Closure;
             });
 
             foreach ($functionNodes as $functionNode) {
@@ -107,15 +108,17 @@ class FunctionCallFinder
                     $functionName = $functionNode->name->toString();
                 } elseif ($functionNode instanceof Node\Stmt\ClassMethod) {
                     $functionName = $functionNode->name->toString();
+                } elseif ($functionNode instanceof Node\Expr\Closure) {
+                    $functionName = 'closure';
                 } else {
-                    // 無名関数やその他はスキップ
                     continue;
                 }
                 
                 $this->findFunctionCalls($functionNode->stmts, $functionName, $relativePath);
             }
         } catch (Error $error) {
-            echo "Parse Error in {$filePath}: {$error->getMessage()}\n";
+            // パースエラー時はフォールバック処理を実行
+            $this->fallbackParse($content, $relativePath);
         }
     }
 
@@ -138,7 +141,9 @@ class FunctionCallFinder
         }
 
         $functionCalls = $this->nodeFinder->find($nodes, function(Node $node) {
-            return $node instanceof Node\Expr\FuncCall || $node instanceof Node\Expr\MethodCall;
+            return $node instanceof Node\Expr\FuncCall || 
+                   $node instanceof Node\Expr\MethodCall ||
+                   $node instanceof Node\Expr\StaticCall;
         });
 
         foreach ($functionCalls as $call) {
@@ -152,6 +157,11 @@ class FunctionCallFinder
             } elseif ($call instanceof Node\Expr\MethodCall) {
                 if ($call->name instanceof Node\Identifier) {
                     $calledFunction = $call->name->toString();
+                }
+            } elseif ($call instanceof Node\Expr\StaticCall) {
+                if ($call->name instanceof Node\Identifier) {
+                    $class = $call->class instanceof Node\Name ? $call->class->toString() : '';
+                    $calledFunction = $class . '::' . $call->name->toString();
                 }
             }
 
@@ -168,12 +178,10 @@ class FunctionCallFinder
             // 再帰呼び出しの判定を修正
             $isRecursive = false;
             if ($callingFunction === $calledFunction) {
-                // 直接の再帰呼び出し
                 $isRecursive = true;
             } else {
-                // 相互呼び出しのチェック
                 $pair = [$callingFunction, $calledFunction];
-                sort($pair); // 順序を統一
+                sort($pair);
                 $pairKey = implode('->', $pair);
                 
                 if (isset($this->recursivePairs[$pairKey])) {
@@ -198,12 +206,46 @@ class FunctionCallFinder
         if ($arg->value instanceof Node\Scalar\String_) {
             return '"' . $arg->value->value . '"';
         } elseif ($arg->value instanceof Node\Scalar\LNumber) {
-            return $arg->value->value;
+            return (string)$arg->value->value;
         } elseif ($arg->value instanceof Node\Expr\Variable) {
             return '$' . $arg->value->name;
+        } elseif ($arg->value instanceof Node\Expr\New_) {
+            if ($arg->value->class instanceof Node\Name) {
+                return 'new ' . $arg->value->class->toString();
+            }
+            return 'new object';
+        } elseif ($arg->value instanceof Node\Expr\Array_) {
+            return 'array';
+        } elseif ($arg->value instanceof Node\Expr\ConstFetch) {
+            return $arg->value->name->toString();
+        } elseif ($arg->value instanceof Node\Expr\ClassConstFetch) {
+            $class = $arg->value->class instanceof Node\Name ? $arg->value->class->toString() : '';
+            $const = $arg->value->name instanceof Node\Identifier ? $arg->value->name->toString() : '';
+            return $class . '::' . $const;
+        } elseif ($arg->value instanceof Node\Expr\PropertyFetch) {
+            $var = $arg->value->var instanceof Node\Expr\Variable ? '$' . $arg->value->var->name : '';
+            $prop = $arg->value->name instanceof Node\Identifier ? $arg->value->name->toString() : '';
+            return $var . '->' . $prop;
+        } elseif ($arg->value instanceof Node\Expr\StaticPropertyFetch) {
+            $class = $arg->value->class instanceof Node\Name ? $arg->value->class->toString() : '';
+            $prop = $arg->value->name instanceof Node\Identifier ? $arg->value->name->toString() : '';
+            return $class . '::$' . $prop;
+        } elseif ($arg->value instanceof Node\Expr\MethodCall) {
+            $var = $arg->value->var instanceof Node\Expr\Variable ? '$' . $arg->value->var->name : '';
+            $method = $arg->value->name instanceof Node\Identifier ? $arg->value->name->toString() : '';
+            return $var . '->' . $method . '()';
+        } elseif ($arg->value instanceof Node\Expr\StaticCall) {
+            $class = $arg->value->class instanceof Node\Name ? $arg->value->class->toString() : '';
+            $method = $arg->value->name instanceof Node\Identifier ? $arg->value->name->toString() : '';
+            return $class . '::' . $method . '()';
+        } elseif ($arg->value instanceof Node\Expr\FuncCall) {
+            if ($arg->value->name instanceof Node\Name) {
+                return $arg->value->name->toString() . '()';
+            }
+            return 'function()';
         }
-        // 未対応の型の場合は、その内容を出力
-        return (string)$arg->value;
+        
+        return 'complex expression';
     }
 
     private function addToExcel($data)
@@ -216,6 +258,167 @@ class FunctionCallFinder
         $this->currentRow++;
     }
 
+    private function fallbackParse($content, $relativePath)
+    {
+        // クラス定義を検出
+        preg_match_all('/class\s+(\w+)\s*{([^}]*)}/s', $content, $classMatches, PREG_SET_ORDER);
+        foreach ($classMatches as $classMatch) {
+            $className = $classMatch[1];
+            $classBody = $classMatch[2];
+
+            // 静的メソッドを検出
+            preg_match_all('/public\s+static\s+function\s+(\w+)\s*\([^)]*\)\s*{([^}]*)}/s', $classBody, $staticMatches, PREG_SET_ORDER);
+            foreach ($staticMatches as $staticMatch) {
+                $methodName = $staticMatch[1];
+                $methodBody = $staticMatch[2];
+                
+                // 静的メソッド内の呼び出しを検出
+                $this->parseMethodCalls($methodBody, $className . '::' . $methodName, $relativePath);
+            }
+
+            // インスタンスメソッドを検出
+            preg_match_all('/public\s+function\s+(\w+)\s*\([^)]*\)\s*{([^}]*)}/s', $classBody, $methodMatches, PREG_SET_ORDER);
+            foreach ($methodMatches as $methodMatch) {
+                $methodName = $methodMatch[1];
+                $methodBody = $methodMatch[2];
+                
+                // インスタンスメソッド内の呼び出しを検出
+                $this->parseMethodCalls($methodBody, $methodName, $relativePath);
+            }
+        }
+
+        // 関数定義を検出
+        preg_match_all('/function\s+(\w+)\s*\([^)]*\)\s*{([^}]*)}/s', $content, $functionMatches, PREG_SET_ORDER);
+        foreach ($functionMatches as $match) {
+            $functionName = $match[1];
+            $functionBody = $match[2];
+            
+            // 関数内の呼び出しを検出
+            $this->parseMethodCalls($functionBody, $functionName, $relativePath);
+        }
+
+        // メインスコープの呼び出しを検出
+        $this->parseMethodCalls($content, 'main', $relativePath);
+    }
+
+    private function parseMethodCalls($body, $callingFunction, $relativePath)
+    {
+        // 静的メソッド呼び出しを検出
+        preg_match_all('/(\w+)::(\w+)\s*\(([^)]*)\)/', $body, $staticMatches, PREG_SET_ORDER);
+        foreach ($staticMatches as $match) {
+            $class = $match[1];
+            $method = $match[2];
+            $args = $this->parseArguments($match[3]);
+            $calledFunction = $class . '::' . $method;
+            
+            if (!in_array($calledFunction, $this->builtinFunctions) && 
+                !in_array($calledFunction, $this->skipFunctions)) {
+                $this->addToExcel([
+                    $relativePath,
+                    $callingFunction,
+                    $calledFunction,
+                    implode(', ', $args),
+                    $this->isRecursive($callingFunction, $calledFunction) ? 'Yes' : 'No'
+                ]);
+            }
+        }
+
+        // インスタンスメソッド呼び出しを検出
+        preg_match_all('/\$this->(\w+)\s*\(([^)]*)\)/', $body, $methodMatches, PREG_SET_ORDER);
+        foreach ($methodMatches as $match) {
+            $method = $match[1];
+            $args = $this->parseArguments($match[2]);
+            
+            if (!in_array($method, $this->builtinFunctions) && 
+                !in_array($method, $this->skipFunctions)) {
+                $this->addToExcel([
+                    $relativePath,
+                    $callingFunction,
+                    $method,
+                    implode(', ', $args),
+                    $this->isRecursive($callingFunction, $method) ? 'Yes' : 'No'
+                ]);
+            }
+        }
+
+        // 通常の関数呼び出しを検出
+        preg_match_all('/(\w+)\s*\(([^)]*)\)/', $body, $funcMatches, PREG_SET_ORDER);
+        foreach ($funcMatches as $match) {
+            $function = $match[1];
+            $args = $this->parseArguments($match[2]);
+            
+            if (!in_array($function, $this->builtinFunctions) && 
+                !in_array($function, $this->skipFunctions)) {
+                $this->addToExcel([
+                    $relativePath,
+                    $callingFunction,
+                    $function,
+                    implode(', ', $args),
+                    $this->isRecursive($callingFunction, $function) ? 'Yes' : 'No'
+                ]);
+            }
+        }
+    }
+
+    private function parseArguments($argsStr)
+    {
+        $args = [];
+        $currentArg = '';
+        $inString = false;
+        $stringChar = '';
+        $parenCount = 0;
+
+        for ($i = 0; $i < strlen($argsStr); $i++) {
+            $char = $argsStr[$i];
+            
+            if (($char === '"' || $char === "'") && ($i === 0 || $argsStr[$i-1] !== '\\')) {
+                if (!$inString) {
+                    $inString = true;
+                    $stringChar = $char;
+                } elseif ($char === $stringChar) {
+                    $inString = false;
+                }
+            }
+
+            if ($char === '(' && !$inString) {
+                $parenCount++;
+            } elseif ($char === ')' && !$inString) {
+                $parenCount--;
+            }
+
+            if ($char === ',' && !$inString && $parenCount === 0) {
+                $args[] = trim($currentArg);
+                $currentArg = '';
+            } else {
+                $currentArg .= $char;
+            }
+        }
+
+        if ($currentArg !== '') {
+            $args[] = trim($currentArg);
+        }
+
+        return $args;
+    }
+
+    private function isRecursive($callingFunction, $calledFunction)
+    {
+        if ($callingFunction === $calledFunction) {
+            return true;
+        }
+
+        $pair = [$callingFunction, $calledFunction];
+        sort($pair);
+        $pairKey = implode('->', $pair);
+        
+        if (isset($this->recursivePairs[$pairKey])) {
+            return true;
+        }
+        
+        $this->recursivePairs[$pairKey] = true;
+        return false;
+    }
+
     public function saveExcel($outputPath)
     {
         $writer = new Xlsx($this->spreadsheet);
@@ -225,14 +428,18 @@ class FunctionCallFinder
 
 // CLI起動用
 if (php_sapi_name() === 'cli' && basename(__FILE__) === basename($_SERVER['argv'][0])) {
-    $dir = $argv[1] ?? null;
-    if (!$dir || !is_dir($dir)) {
-        fwrite(STDERR, "Usage: php FunctionCallFinder.php <target_directory>\n");
+    $target = $argv[1] ?? null;
+    if (!$target || (!is_dir($target) && !is_file($target))) {
+        fwrite(STDERR, "Usage: php FunctionCallFinder.php <target_directory|target_file>\n");
         exit(1);
     }
     $finder = new FunctionCallFinder();
     $finder->loadSkipFunctions('skip_functions.txt');
-    $finder->processDirectory($dir);
+    if (is_file($target)) {
+        $finder->processFile($target, basename($target));
+    } else {
+        $finder->processDirectory($target);
+    }
     $finder->saveExcel('function_calls.xlsx');
     echo "Done. Output: function_calls.xlsx\n";
 } 
