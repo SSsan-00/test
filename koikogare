@@ -1,0 +1,238 @@
+<?php
+
+require 'vendor/autoload.php';
+
+use PhpParser\Node;
+use PhpParser\NodeFinder;
+use PhpParser\ParserFactory;
+use PhpParser\Error;
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+use RecursiveIteratorIterator;
+use RecursiveDirectoryIterator;
+use FilesystemIterator;
+
+class FunctionCallFinder
+{
+    private $parser;
+    private $nodeFinder;
+    private $spreadsheet;
+    private $currentRow = 2;
+    private $skipFunctions = [];
+    private $builtinFunctions;
+    private $recursivePairs = [];
+
+    public function __construct()
+    {
+        $this->parser = (new ParserFactory)->createForNewestSupportedVersion();
+        $this->nodeFinder = new NodeFinder();
+        $this->spreadsheet = new Spreadsheet();
+        $this->builtinFunctions = get_defined_functions()['internal'];
+        $this->setupExcel();
+    }
+
+    private function setupExcel()
+    {
+        $sheet = $this->spreadsheet->getActiveSheet();
+        $headers = ['file_path', 'calling', 'called', 'arg', 'recursion'];
+        foreach ($headers as $col => $header) {
+            $cell = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($col + 1) . '1';
+            $sheet->setCellValue($cell, $header);
+        }
+    }
+
+    public function loadSkipFunctions($file)
+    {
+        if (file_exists($file)) {
+            $this->skipFunctions = array_map('trim', file($file));
+        }
+    }
+
+    public function processDirectory($directory, $relativePath = '')
+    {
+        $iterator = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($directory, 
+                FilesystemIterator::SKIP_DOTS | FilesystemIterator::FOLLOW_SYMLINKS)
+        );
+        $total = 0;
+        foreach ($iterator as $file) {
+            if ($file->isFile() && $file->getExtension() === 'php') {
+                $total++;
+            }
+        }
+        $iterator->rewind();
+        $count = 0;
+        foreach ($iterator as $file) {
+            if ($file->isFile() && $file->getExtension() === 'php') {
+                $relativeFilePath = ltrim(str_replace($directory, '', $file->getPathname()), '/\\');
+                $this->processFile($file->getPathname(), $relativeFilePath);
+                $count++;
+                if ($count % 10 === 0 || $count === $total) {
+                    printf("[%d/%d] %s\n", $count, $total, $relativeFilePath);
+                }
+                // メモリ効率向上: 解析ごとにGC
+                if ($count % 50 === 0) {
+                    gc_collect_cycles();
+                }
+            }
+        }
+    }
+
+    private function processFile($filePath, $relativePath)
+    {
+        $content = file_get_contents($filePath);
+        
+        // 文字コード変換
+        $content = mb_convert_encoding($content, 'UTF-8', 'EUC-JP,UTF-8');
+        
+        // コメント除去とPHPタグの正規化
+        $content = $this->cleanupCode($content);
+
+        try {
+            $ast = $this->parser->parse($content);
+            if ($ast === null) {
+                return;
+            }
+
+            // メインスコープの関数呼び出しを検出
+            $this->findFunctionCalls($ast, 'main', $relativePath);
+
+            // 関数定義内の関数呼び出しを検出
+            $functionNodes = $this->nodeFinder->find($ast, function(Node $node) {
+                return $node instanceof Node\Stmt\Function_ || $node instanceof Node\Stmt\ClassMethod;
+            });
+
+            foreach ($functionNodes as $functionNode) {
+                if ($functionNode instanceof Node\Stmt\Function_) {
+                    $functionName = $functionNode->name->toString();
+                } elseif ($functionNode instanceof Node\Stmt\ClassMethod) {
+                    $functionName = $functionNode->name->toString();
+                } else {
+                    // 無名関数やその他はスキップ
+                    continue;
+                }
+                
+                $this->findFunctionCalls($functionNode->stmts, $functionName, $relativePath);
+            }
+        } catch (Error $error) {
+            echo "Parse Error in {$filePath}: {$error->getMessage()}\n";
+        }
+    }
+
+    private function cleanupCode($code)
+    {
+        // コメント除去
+        $code = preg_replace('!/\*.*?\*/!s', '', $code);
+        $code = preg_replace('/\/\/.*$/m', '', $code);
+        
+        // PHPタグの正規化
+        $code = preg_replace('/<\?(\s|$)/', '<?php$1', $code);
+        
+        return $code;
+    }
+
+    private function findFunctionCalls($nodes, $callingFunction, $filePath)
+    {
+        if (!is_array($nodes)) {
+            $nodes = [$nodes];
+        }
+
+        $functionCalls = $this->nodeFinder->find($nodes, function(Node $node) {
+            return $node instanceof Node\Expr\FuncCall || $node instanceof Node\Expr\MethodCall;
+        });
+
+        foreach ($functionCalls as $call) {
+            $calledFunction = '';
+            $args = [];
+
+            if ($call instanceof Node\Expr\FuncCall) {
+                if ($call->name instanceof Node\Name) {
+                    $calledFunction = $call->name->toString();
+                }
+            } elseif ($call instanceof Node\Expr\MethodCall) {
+                if ($call->name instanceof Node\Identifier) {
+                    $calledFunction = $call->name->toString();
+                }
+            }
+
+            if (empty($calledFunction) || 
+                in_array($calledFunction, $this->builtinFunctions) || 
+                in_array($calledFunction, $this->skipFunctions)) {
+                continue;
+            }
+
+            foreach ($call->args as $arg) {
+                $args[] = $this->getArgumentString($arg);
+            }
+
+            // 再帰呼び出しの判定を修正
+            $isRecursive = false;
+            if ($callingFunction === $calledFunction) {
+                // 直接の再帰呼び出し
+                $isRecursive = true;
+            } else {
+                // 相互呼び出しのチェック
+                $pair = [$callingFunction, $calledFunction];
+                sort($pair); // 順序を統一
+                $pairKey = implode('->', $pair);
+                
+                if (isset($this->recursivePairs[$pairKey])) {
+                    $isRecursive = true;
+                } else {
+                    $this->recursivePairs[$pairKey] = true;
+                }
+            }
+
+            $this->addToExcel([
+                $filePath,
+                $callingFunction,
+                $calledFunction,
+                implode(', ', $args),
+                $isRecursive ? 'Yes' : 'No'
+            ]);
+        }
+    }
+
+    private function getArgumentString($arg)
+    {
+        if ($arg->value instanceof Node\Scalar\String_) {
+            return '"' . $arg->value->value . '"';
+        } elseif ($arg->value instanceof Node\Scalar\LNumber) {
+            return $arg->value->value;
+        } elseif ($arg->value instanceof Node\Expr\Variable) {
+            return '$' . $arg->value->name;
+        }
+        // 未対応の型の場合は、その内容を出力
+        return (string)$arg->value;
+    }
+
+    private function addToExcel($data)
+    {
+        $sheet = $this->spreadsheet->getActiveSheet();
+        foreach ($data as $col => $value) {
+            $cell = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($col + 1) . $this->currentRow;
+            $sheet->setCellValue($cell, $value);
+        }
+        $this->currentRow++;
+    }
+
+    public function saveExcel($outputPath)
+    {
+        $writer = new Xlsx($this->spreadsheet);
+        $writer->save($outputPath);
+    }
+}
+
+// CLI起動用
+if (php_sapi_name() === 'cli' && basename(__FILE__) === basename($_SERVER['argv'][0])) {
+    $dir = $argv[1] ?? null;
+    if (!$dir || !is_dir($dir)) {
+        fwrite(STDERR, "Usage: php FunctionCallFinder.php <target_directory>\n");
+        exit(1);
+    }
+    $finder = new FunctionCallFinder();
+    $finder->loadSkipFunctions('skip_functions.txt');
+    $finder->processDirectory($dir);
+    $finder->saveExcel('function_calls.xlsx');
+    echo "Done. Output: function_calls.xlsx\n";
+} 
