@@ -1,0 +1,163 @@
+#!/usr/bin/env php
+<?php
+
+require 'vendor/autoload.php';
+
+use PhpParser\Node;
+use PhpParser\NodeFinder;
+use PhpParser\ParserFactory;
+use PhpParser\NodeTraverser;
+use PhpParser\NodeVisitor\NameResolver;
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+
+class FunctionCallFinder
+{
+    private $targetFunctions = [];
+    private $spreadsheet;
+    private $currentRow = 2;
+
+    public function __construct(string $functionListFile)
+    {
+        $this->loadTargetFunctions($functionListFile);
+        $this->spreadsheet = new Spreadsheet();
+        $this->setupSpreadsheet();
+    }
+
+    private function loadTargetFunctions(string $file): void
+    {
+        if (!file_exists($file)) {
+            throw new RuntimeException("Function list file not found: {$file}");
+        }
+
+        $lines = file($file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+        foreach ($lines as $line) {
+            list($function, $argIndex) = explode(',', $line);
+            $this->targetFunctions[trim($function)] = (int)trim($argIndex);
+        }
+    }
+
+    private function setupSpreadsheet(): void
+    {
+        $sheet = $this->spreadsheet->getActiveSheet();
+        $sheet->setCellValue('A1', 'filePath');
+        $sheet->setCellValue('B1', 'calledFunction');
+        $sheet->setCellValue('C1', 'chooseArgument');
+    }
+
+    public function processDirectory(string $directory): void
+    {
+        $iterator = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($directory)
+        );
+
+        foreach ($iterator as $file) {
+            if ($file->isFile() && $file->getExtension() === 'php') {
+                $this->processFile($file->getPathname(), $directory);
+            }
+        }
+    }
+
+    private function processFile(string $filePath, string $baseDir): void
+    {
+        $code = file_get_contents($filePath);
+        
+        // コメントの除去
+        $code = preg_replace('!/\*.*?\*/!s', '', $code);
+        $code = preg_replace('/\/\/.*$/m', '', $code);
+        
+        // <? を <?php に変換
+        $code = preg_replace('/<\?(?!php|=)/', '<?php', $code);
+
+        try {
+            $parser = (new ParserFactory)->create(ParserFactory::PREFER_PHP7);
+            $ast = $parser->parse($code);
+
+            if ($ast === null) {
+                return;
+            }
+
+            $traverser = new NodeTraverser();
+            $traverser->addVisitor(new NameResolver());
+            $ast = $traverser->traverse($ast);
+
+            $nodeFinder = new NodeFinder();
+            $functionCalls = $nodeFinder->find($ast, function(Node $node) {
+                return $node instanceof Node\Expr\MethodCall || 
+                       $node instanceof Node\Expr\FuncCall;
+            });
+
+            foreach ($functionCalls as $call) {
+                $functionName = $this->getFunctionName($call);
+                if (isset($this->targetFunctions[$functionName]) && property_exists($call, 'args')) {
+                    $argIndex = $this->targetFunctions[$functionName];
+                    if (isset($call->args[$argIndex])) {
+                        $this->addToSpreadsheet(
+                            $this->getRelativePath($filePath, $baseDir),
+                            $functionName,
+                            $this->getArgumentValue($call->args[$argIndex])
+                        );
+                    }
+                }
+            }
+        } catch (\PhpParser\Error $e) {
+            echo "Parse error in {$filePath}: {$e->getMessage()}\n";
+        }
+    }
+
+    private function getFunctionName(Node $call): string
+    {
+        if ($call instanceof Node\Expr\MethodCall) {
+            return $call->name->name;
+        }
+        return $call->name->parts[0];
+    }
+
+    private function getArgumentValue(Node\Arg $arg): string
+    {
+        if ($arg->value instanceof Node\Scalar\String_) {
+            return $arg->value->value;
+        }
+        return 'N/A';
+    }
+
+    private function getRelativePath(string $path, string $baseDir): string
+    {
+        return str_replace($baseDir . '/', '', $path);
+    }
+
+    private function addToSpreadsheet(string $filePath, string $function, string $argument): void
+    {
+        $sheet = $this->spreadsheet->getActiveSheet();
+        $sheet->setCellValue('A' . $this->currentRow, $filePath);
+        $sheet->setCellValue('B' . $this->currentRow, $function);
+        $sheet->setCellValue('C' . $this->currentRow, $argument);
+        $this->currentRow++;
+    }
+
+    public function save(string $outputFile): void
+    {
+        $writer = new Xlsx($this->spreadsheet);
+        $writer->save($outputFile);
+    }
+}
+
+// コマンドライン引数の処理
+if ($argc < 4) {
+    echo "Usage: php function_call_finder.php <function_list_file> <target_directory> <output_excel_file>\n";
+    exit(1);
+}
+
+$functionListFile = $argv[1];
+$targetDirectory = $argv[2];
+$outputFile = $argv[3];
+
+try {
+    $finder = new FunctionCallFinder($functionListFile);
+    $finder->processDirectory($targetDirectory);
+    $finder->save($outputFile);
+    echo "処理が完了しました。\n";
+} catch (Exception $e) {
+    echo "エラーが発生しました: " . $e->getMessage() . "\n";
+    exit(1);
+} 
