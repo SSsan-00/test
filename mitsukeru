@@ -1,0 +1,403 @@
+#!/usr/bin/env php
+<?php
+
+require 'vendor/autoload.php';
+
+use PhpParser\Node;
+use PhpParser\NodeFinder;
+use PhpParser\ParserFactory;
+use PhpParser\NodeTraverser;
+use PhpParser\NodeVisitor\NameResolver;
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+use PhpParser\Error as PhpParserError;
+
+class FunctionCallFinder
+{
+    // 対象関数リスト（関数名 => 引数インデックス）
+    private array $targetFunctions = [];
+    // スプレッドシートオブジェクト
+    private Spreadsheet $spreadsheet;
+    // 現在の行番号
+    private int $currentRow = 2;
+    // 重複チェック用
+    private array $processedCalls = [];
+    // 関数リストファイルパス
+    private const FUNCTION_LIST_FILE = 'test_files/functions.txt';
+    // 出力ファイル名
+    private const OUTPUT_FILE = 'output.xlsx';
+
+    // コンストラクタ：関数リストの読み込みとスプレッドシート初期化
+    public function __construct()
+    {
+        $this->loadTargetFunctions(self::FUNCTION_LIST_FILE);
+        $this->spreadsheet = new Spreadsheet();
+        $this->setupSpreadsheet();
+    }
+
+    // 関数リストファイルを読み込む
+    private function loadTargetFunctions(string $file): void
+    {
+        if (!file_exists($file)) {
+            throw new \RuntimeException("Function list file not found: {$file}");
+        }
+
+        $lines = file($file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+        foreach ($lines as $line) {
+            list($function, $argIndex) = explode(',', $line);
+            $this->targetFunctions[trim($function)] = (int)trim($argIndex);
+        }
+    }
+
+    // スプレッドシートのヘッダーを設定
+    private function setupSpreadsheet(): void
+    {
+        $sheet = $this->spreadsheet->getActiveSheet();
+        $sheet->setCellValue('A1', 'filePath');
+        $sheet->setCellValue('B1', 'calledFunction');
+        $sheet->setCellValue('C1', 'chooseArgument');
+    }
+
+    // ディレクトリを再帰的に走査し、PHPファイルを処理
+    public function processDirectory(string $directory): void
+    {
+        $iterator = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($directory)
+        );
+
+        foreach ($iterator as $file) {
+            if ($file->isFile() && $file->getExtension() === 'php') {
+                $this->processFile($file->getPathname(), $directory);
+            }
+        }
+    }
+
+    // ファイル単位で処理（コメント除去・タグ補完・パース）
+    private function processFile(string $filePath, string $baseDir): void
+    {
+        $code = file_get_contents($filePath);
+        
+        // コメントの除去
+        $code = preg_replace('!/\*.*?\*/!s', '', $code);  // 複数行コメント
+        $code = preg_replace('/\/\/.*$/m', '', $code);    // 単一行コメント
+        $code = preg_replace('/#.*$/m', '', $code);         // #によるコメント
+        
+        // <? を <?php に変換
+        $code = preg_replace('/<\?(?!php|=)/', '<?php', $code);
+
+        try {
+            // PHP-ParserでAST解析
+            $this->processWithPhpParser($code, $filePath, $baseDir);
+        } catch (PhpParserError $e) {
+            // パースエラー時は正規表現でフォールバック
+            echo "PHP-Parser error in {$filePath}: {$e->getMessage()}\n";
+            echo "Falling back to regex-based parsing...\n";
+            $this->processWithRegex($code, $filePath, $baseDir);
+        }
+    }
+
+    // PHP-Parserを使った関数呼び出し検出
+    private function processWithPhpParser(string $code, string $filePath, string $baseDir): void
+    {
+        $parser = (new ParserFactory)->create(ParserFactory::PREFER_PHP7);
+        $ast = $parser->parse($code);
+
+        if ($ast === null) {
+            return;
+        }
+
+        // 名前解決
+        $traverser = new NodeTraverser();
+        $traverser->addVisitor(new NameResolver());
+        $ast = $traverser->traverse($ast);
+
+        $nodeFinder = new NodeFinder();
+        // 関数・メソッド呼び出しノードを抽出
+        $functionCalls = $nodeFinder->find($ast, function(Node $node) {
+            return ($node instanceof Node\Expr\MethodCall && property_exists($node, 'args')) || 
+                   ($node instanceof Node\Expr\FuncCall && property_exists($node, 'args'));
+        });
+
+        foreach ($functionCalls as $call) {
+            $functionName = $this->getFunctionName($call);
+            // 対象関数のみ処理
+            if (isset($this->targetFunctions[$functionName])) {
+                $argIndex = $this->targetFunctions[$functionName];
+                // 指定インデックスの引数が存在する場合のみ
+                if (isset($call->args[$argIndex])) {
+                    $relativePath = $this->getRelativePath($filePath, $baseDir);
+                    $argument = $this->getArgumentValue($call->args[$argIndex]);
+                    
+                    // 重複チェック用のキーを生成
+                    $key = $relativePath . '|' . $functionName . '|' . $argument;
+                    
+                    if (!isset($this->processedCalls[$key])) {
+                        $this->addToSpreadsheet($relativePath, $functionName, $argument);
+                        $this->processedCalls[$key] = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // 正規表現によるフォールバック解析
+    private function processWithRegex(string $code, string $filePath, string $baseDir): void
+    {
+        // 関数呼び出しのパターン
+        $functionPattern = '/(?:^|\s|;|{|})(?:(\w+)\s*\(|(\w+)\s*->\s*(\w+)\s*\()/m';
+        
+        preg_match_all($functionPattern, $code, $matches, PREG_OFFSET_CAPTURE);
+        
+        foreach ($matches[0] as $index => $match) {
+            $functionName = $matches[1][$index][0] ?: $matches[3][$index][0];
+            
+            if (isset($this->targetFunctions[$functionName])) {
+                $argIndex = $this->targetFunctions[$functionName];
+                
+                // 引数の抽出
+                $startPos = $match[1] + strlen($match[0]);
+                $endPos = $this->findClosingParenthesis($code, $startPos);
+                
+                if ($endPos !== false) {
+                    $argsString = substr($code, $startPos, $endPos - $startPos);
+                    $args = $this->parseArguments($argsString);
+                    
+                    if (isset($args[$argIndex])) {
+                        $relativePath = $this->getRelativePath($filePath, $baseDir);
+                        $argument = $this->cleanArgument($args[$argIndex]);
+                        
+                        // 重複チェック用のキーを生成
+                        $key = $relativePath . '|' . $functionName . '|' . $argument;
+                        
+                        if (!isset($this->processedCalls[$key])) {
+                            $this->addToSpreadsheet($relativePath, $functionName, $argument);
+                            $this->processedCalls[$key] = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 対応する閉じ括弧を探す
+    private function findClosingParenthesis(string $code, int $startPos): int|false
+    {
+        $level = 1;
+        $pos = $startPos;
+        $len = strlen($code);
+        
+        while ($pos < $len && $level > 0) {
+            $char = $code[$pos];
+            if ($char === '(') {
+                $level++;
+            } elseif ($char === ')') {
+                $level--;
+            } elseif ($char === '"' || $char === "'") {
+                $pos = $this->skipString($code, $pos, $char);
+                if ($pos === false) return false;
+                continue;
+            }
+            $pos++;
+        }
+        
+        return $level === 0 ? $pos : false;
+    }
+
+    // 文字列リテラルをスキップ
+    private function skipString(string $code, int $startPos, string $quote): int|false
+    {
+        $pos = $startPos + 1;
+        $len = strlen($code);
+        
+        while ($pos < $len) {
+            if ($code[$pos] === $quote && $code[$pos - 1] !== '\\') {
+                return $pos;
+            }
+            $pos++;
+        }
+        
+        return false;
+    }
+
+    // 引数文字列を分割して配列化
+    private function parseArguments(string $argsString): array
+    {
+        $args = [];
+        $currentArg = '';
+        $level = 0;
+        $inString = false;
+        $stringQuote = '';
+        
+        for ($i = 0; $i < strlen($argsString); $i++) {
+            $char = $argsString[$i];
+            
+            if ($char === '"' || $char === "'") {
+                if (!$inString) {
+                    $inString = true;
+                    $stringQuote = $char;
+                } elseif ($char === $stringQuote && $argsString[$i - 1] !== '\\') {
+                    $inString = false;
+                }
+            }
+            
+            if (!$inString && $char === ',' && $level === 0) {
+                $args[] = trim($currentArg);
+                $currentArg = '';
+                continue;
+            }
+            
+            if (!$inString) {
+                if ($char === '(') $level++;
+                if ($char === ')') $level--;
+            }
+            
+            $currentArg .= $char;
+        }
+        
+        if ($currentArg !== '') {
+            $args[] = trim($currentArg);
+        }
+        
+        return $args;
+    }
+
+    // 引数の内容を整形
+    private function cleanArgument(string $arg): string
+    {
+        // 文字列リテラルの処理
+        if (preg_match('/^[\'"](.*)[\'"]$/', $arg, $matches)) {
+            return $matches[1];
+        }
+        
+        // 変数の処理
+        if (preg_match('/^\$(\w+)$/', $arg, $matches)) {
+            return '${' . $matches[1] . '}';
+        }
+        
+        // 関数呼び出しの処理
+        if (preg_match('/^\w+\s*\(/', $arg)) {
+            return '[Function Call]';
+        }
+        
+        // 配列の処理
+        if (preg_match('/^\[.*\]$/', $arg)) {
+            return '[Array]';
+        }
+        
+        // 文字列連結の処理
+        if (strpos($arg, '.') !== false) {
+            return '[String Concatenation]';
+        }
+        
+        return $arg;
+    }
+
+    // 関数名を取得
+    private function getFunctionName(Node $call): string
+    {
+        if ($call instanceof Node\Expr\MethodCall && $call->name instanceof Node\Identifier) {
+            return $call->name->name;
+        }
+        if ($call instanceof Node\Expr\FuncCall && $call->name instanceof Node\Name) {
+            return $call->name->parts[0];
+        }
+        return '';
+    }
+
+    // 引数ノードから値を取得
+    private function getArgumentValue(Node\Arg $arg): string
+    {
+        if ($arg->value instanceof Node\Scalar\String_) {
+            return $arg->value->value;
+        } elseif ($arg->value instanceof Node\Expr\BinaryOp\Concat) {
+            return $this->getConcatValue($arg->value);
+        } elseif ($arg->value instanceof Node\Expr\Variable) {
+            return '${' . $arg->value->name . '}';
+        } elseif ($arg->value instanceof Node\Expr\FuncCall) {
+            return '[Function Call]';
+        } elseif ($arg->value instanceof Node\Expr\Array_) {
+            return '[Array]';
+        } elseif ($arg->value instanceof Node\Expr\ArrayDimFetch) {
+            return '[Array Access]';
+        } elseif ($arg->value instanceof Node\Expr\PropertyFetch) {
+            return '[Property Access]';
+        } elseif ($arg->value instanceof Node\Expr\StaticPropertyFetch) {
+            return '[Static Property Access]';
+        } elseif ($arg->value instanceof Node\Expr\ClassConstFetch) {
+            return '[Class Constant]';
+        } elseif ($arg->value instanceof Node\Expr\ConstFetch) {
+            return '[Constant]';
+        } elseif ($arg->value instanceof Node\Expr\New_) {
+            return '[New Object]';
+        }
+        return 'N/A';
+    }
+
+    // 文字列連結ノードから値を取得
+    private function getConcatValue(Node\Expr\BinaryOp\Concat $node): string
+    {
+        $left = $this->getNodeValue($node->left);
+        $right = $this->getNodeValue($node->right);
+        return $left . $right;
+    }
+
+    // 任意ノードから値を取得
+    private function getNodeValue(Node $node): string
+    {
+        if ($node instanceof Node\Scalar\String_) {
+            return $node->value;
+        } elseif ($node instanceof Node\Expr\BinaryOp\Concat) {
+            return $this->getConcatValue($node);
+        } elseif ($node instanceof Node\Expr\Variable) {
+            return '${' . $node->name . '}';
+        } elseif ($node instanceof Node\Scalar\LNumber) {
+            return (string)$node->value;
+        } elseif ($node instanceof Node\Scalar\DNumber) {
+            return (string)$node->value;
+        } elseif ($node instanceof Node\Expr\ConstFetch) {
+            return $node->name->toString();
+        }
+        return '';
+    }
+
+    // 相対パスを取得
+    private function getRelativePath(string $path, string $baseDir): string
+    {
+        return str_replace($baseDir . '/', '', $path);
+    }
+
+    // スプレッドシートに1行追加
+    private function addToSpreadsheet(string $filePath, string $function, string $argument): void
+    {
+        $sheet = $this->spreadsheet->getActiveSheet();
+        $sheet->setCellValue('A' . $this->currentRow, $filePath);
+        $sheet->setCellValue('B' . $this->currentRow, $function);
+        $sheet->setCellValue('C' . $this->currentRow, $argument);
+        $this->currentRow++;
+    }
+
+    // エクセルファイル保存
+    public function save(): void
+    {
+        $writer = new Xlsx($this->spreadsheet);
+        $writer->save(self::OUTPUT_FILE);
+    }
+}
+
+// コマンドライン引数の処理
+if ($argc < 2) {
+    echo "Usage: php function_call_finder.php <target_directory>\n";
+    exit(1);
+}
+
+$targetDirectory = $argv[1];
+
+try {
+    $finder = new FunctionCallFinder();
+    $finder->processDirectory($targetDirectory);
+    $finder->save();
+    echo "処理が完了しました。\n";
+} catch (Exception $e) {
+    echo "エラーが発生しました: " . $e->getMessage() . "\n";
+    exit(1);
+} 
