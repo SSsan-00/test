@@ -66,6 +66,7 @@ class FunctionCallFinder
         );
 
         foreach ($iterator as $file) {
+            //in_array($file->getExtension(), ['php', 'inc', 'html'])
             if ($file->isFile() && $file->getExtension() === 'php') {
                 $this->processFile($file->getPathname(), $directory);
             }
