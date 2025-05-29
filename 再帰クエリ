@@ -1,0 +1,28 @@
+CREATE VIEW dbo.v_function_call_list AS
+WITH RecursiveCalls AS (
+    -- 初期状態：main, __construct, __destruct から始まる呼び出し
+    SELECT
+        f.file_path,
+        f.called AS call_list
+    FROM
+        functions f
+    WHERE
+        f.calling IN ('main', '__construct', '__destruct')
+
+    UNION ALL
+
+    -- 再帰部分：前の呼び出しで得た called を呼び出し元として、同一ファイル内でさらに呼び出される関数を取得
+    SELECT
+        f.file_path,
+        f.called
+    FROM
+        functions f
+    INNER JOIN RecursiveCalls rc
+        ON f.file_path = rc.file_path
+        AND f.calling = rc.call_list
+)
+SELECT DISTINCT
+    file_path,
+    call_list
+FROM
+    RecursiveCalls;
