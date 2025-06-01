@@ -1,8 +1,10 @@
 WITH A AS (
     SELECT DISTINCT [file-path], table_name FROM UsageA
+--     WHERE [file-path] LIKE '/src/module1/%'
 ),
 B AS (
     SELECT DISTINCT [file-path], table_name FROM UsageB
+--     WHERE [file-path] LIKE '/src/module1/%'
 ),
 Matched AS (
     SELECT A.[file-path], A.table_name
