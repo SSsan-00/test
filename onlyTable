@@ -1,0 +1,21 @@
+SELECT 
+    [file-path], 
+    table_name, 
+    'Only in A' AS Source
+FROM UsageA
+WHERE NOT EXISTS (
+    SELECT 1 FROM UsageB 
+    WHERE UsageB.[file-path] = UsageA.[file-path]
+      AND UsageB.table_name = UsageA.table_name
+)
+UNION ALL
+SELECT 
+    [file-path], 
+    table_name, 
+    'Only in B' AS Source
+FROM UsageB
+WHERE NOT EXISTS (
+    SELECT 1 FROM UsageA 
+    WHERE UsageA.[file-path] = UsageB.[file-path]
+      AND UsageA.table_name = UsageB.table_name
+);
