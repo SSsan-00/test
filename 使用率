@@ -1,0 +1,17 @@
+WITH A AS (
+    SELECT DISTINCT [file-path], table_name FROM UsageA
+),
+B AS (
+    SELECT DISTINCT [file-path], table_name FROM UsageB
+),
+Matched AS (
+    SELECT A.[file-path], A.table_name
+    FROM A
+    INNER JOIN B ON A.[file-path] = B.[file-path] AND A.table_name = B.table_name
+)
+SELECT
+    (SELECT COUNT(*) FROM A) AS A_TableCount,
+    (SELECT COUNT(*) FROM B) AS B_TableCount,
+    (SELECT COUNT(*) FROM Matched) AS MatchedCount,
+    CAST((SELECT COUNT(*) FROM Matched) AS FLOAT) / NULLIF((SELECT COUNT(*) FROM A), 0) AS A_MatchRate,
+    CAST((SELECT COUNT(*) FROM Matched) AS FLOAT) / NULLIF((SELECT COUNT(*) FROM B), 0) AS B_MatchRate;
