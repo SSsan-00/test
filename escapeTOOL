@@ -4,8 +4,7 @@
  *  escape.php
  * ---------------------------------------------------------------
  *  目的 :
- *      プロジェクト一式を静的解析し、SQLインジェクションの
- *      危険がある “未エスケープ変数” を自動ラップする CLI ツール。
+ *      “未エスケープ変数” をラップする CLI ツール。
  *
  *  主な処理フロー :
  *      1. 対象ディレクトリを再帰的に走査し *.php / *.inc を収集
@@ -19,8 +18,6 @@
  *  使い方 :
  *      $ php escape.php <scan_dir>
  *
- *  ※ 外部設定ファイル (excluded.json / targets.json) の読み込みは
- *    本バージョンではオミットしています。
  *
  *  ※ ラップ関数名はダミーの `sqlXXXXX` で出力。
  *    運用時は実際のエスケープ関数名に置換。
@@ -141,7 +138,7 @@ function replace_lines(string $content, array &$logRows, string $relativePath, a
 
         $original = $line;
 
-        // 変数と定数の候補を検出
+        // 変数の候補を検出
         $matches = [];
         preg_match_all($variablePattern, $line, $varMatches);
 
@@ -213,7 +210,7 @@ function main(array $argv) {
     $startTime = microtime(true);
     [$script, $input_dir] = $argv;
     $output_dir = 'output';
-    $excluded = [];   // 外部ファイル読み込み機能をオミット
+    $excluded = [];   
     $log_entries = [];
 
     echo "ファイルのスキャンを開始します...\n";
@@ -225,7 +222,7 @@ function main(array $argv) {
         return relative_path($input_dir, $file);
     }, $files);
 
-    // 一括で上書き確認
+    // 上書き確認
     if (!check_existing_files($output_dir, $relative_files)) {
         echo "処理を中止します。\n";
         exit(0);
