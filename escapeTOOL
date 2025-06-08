@@ -1,0 +1,297 @@
+<?php
+/**
+ * ---------------------------------------------------------------
+ *  escape.php
+ * ---------------------------------------------------------------
+ *  目的 :
+ *      プロジェクト一式を静的解析し、SQLインジェクションの
+ *      危険がある “未エスケープ変数” を自動ラップする CLI ツール。
+ *
+ *  主な処理フロー :
+ *      1. 対象ディレクトリを再帰的に走査し *.php / *.inc を収集
+ *      2. 各ファイルを 1 行ずつ解析
+ *         - 変数 ($var / $_GET['x']‥) を検出
+ *         - 既に sql* 系関数で包まれている場合はスキップ
+ *         - 未ラップの場合のみ `sqlXXXXX()` で包む
+ *      3. 加工後のソースを output/ に出力
+ *      4. 変更箇所を Excel (log_YYYYMMDD.xlsx) に記録
+ *
+ *  使い方 :
+ *      $ php escape.php <scan_dir>
+ *
+ *  ※ 外部設定ファイル (excluded.json / targets.json) の読み込みは
+ *    本バージョンではオミットしています。
+ *
+ *  ※ ラップ関数名はダミーの `sqlXXXXX` で出力。
+ *    運用時は実際のエスケープ関数名に置換。
+ * ---------------------------------------------------------------
+ * @author SS
+ */
+require 'vendor/autoload.php';
+
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+
+/**
+ * 進捗表示用の関数
+ *
+ * @param int $current 現在の進捗数
+ * @param int $total 全体の数
+ * @param string $message 表示メッセージ
+ * @return void
+ */
+function show_progress(int $current, int $total, string $message = ''): void {
+    $percentage = round(($current / $total) * 100);
+    $bar = str_repeat('=', $percentage) . str_repeat(' ', 100 - $percentage);
+    echo "\r[$bar] $percentage% $message";
+    if ($current === $total) {
+        echo PHP_EOL;
+    }
+}
+
+/**
+ * 出力ディレクトリに既存ファイルがあるかチェックし、上書き確認を行う
+ *
+ * @param string $output_dir 出力ディレクトリパス
+ * @param array $files チェック対象ファイル名リスト（相対パス）
+ * @return bool 上書き許可なら true、拒否なら false
+ */
+function check_existing_files(string $output_dir, array $files): bool {
+    $existing_files = [];
+    foreach ($files as $file) {
+        $output_path = $output_dir . DIRECTORY_SEPARATOR . $file;
+        if (file_exists($output_path)) {
+            $existing_files[] = $file;
+        }
+    }
+
+    if (!empty($existing_files)) {
+        echo "以下のファイルは既に存在します：\n";
+        foreach ($existing_files as $file) {
+            echo "- $file\n";
+        }
+        // ユーザーに対して安全確認（既存ファイルの誤上書き防止）
+        echo "上書きしますか？ (yes/no): ";
+        $handle = fopen("php://stdin", "r");
+        $response = strtolower(trim(fgets($handle)));
+        fclose($handle);
+        return $response === 'yes';
+    }
+
+    return true;
+}
+
+/**
+ * 指定ディレクトリを再帰的に走査し、php / inc ファイルを収集する
+ *
+ * @param string $dir 対象ディレクトリパス
+ * @return array ファイルパスの配列
+ */
+function recursive_scan(string $dir): array {
+    $files = [];
+    $iterator = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS)
+    );
+    foreach ($iterator as $file) {
+        if (in_array($file->getExtension(), ['php', 'inc'])) {
+            $files[] = $file->getPathname();
+        }
+    }
+    return $files;
+}
+
+/**
+ * 基準パスからの相対パスを取得する
+ *
+ * @param string $base 基準ディレクトリパス
+ * @param string $target 対象ファイルパス
+ * @return string 相対パス
+ */
+function relative_path(string $base, string $target): string {
+    return ltrim(str_replace($base, '', $target), DIRECTORY_SEPARATOR);
+}
+
+/**
+ * ファイルの内容を行単位で解析し、対象変数を sqlXXXXX() でラップする
+ * 変更内容は $logRows に記録する
+ *
+ * @param string $content ファイルの全内容
+ * @param array &$logRows 変更ログ配列（参照渡し）
+ * @param string $relativePath ファイルの相対パス
+ * @param array $excluded 除外対象の正規表現パターン配列
+ * @return string 加工後のファイル内容
+ */
+function replace_lines(string $content, array &$logRows, string $relativePath, array $excluded = []): string {
+    $lines = explode("\n", $content);
+    // 変数パターン: 通常変数・スーパーグローバル・配列アクセス ($var, $_GET['x'] など)
+    $variablePattern = '/\$[\w]+(?:\[[^\]]+\])*/';
+    // - $variablePattern : 変数 & 配列アクセス ($foo / $arr['key'])
+    // - $sqlFunctionPattern : 既ラップ判定用 (sqlFoo( ... ))
+    $sqlFunctionPattern = '/sql\w+\s*\(/';
+
+    // -----------------------------
+    // 行単位の解析フェーズ
+    // -----------------------------
+    $totalLines = count($lines);
+    foreach ($lines as $i => &$line) {
+        // 処理前の行を保持しておく（差分ログ用）
+        if ($i % 100 === 0) {
+            show_progress($i, $totalLines, "処理中: $relativePath");
+        }
+
+        $original = $line;
+
+        // 変数と定数の候補を検出
+        $matches = [];
+        preg_match_all($variablePattern, $line, $varMatches);
+
+        $candidates = array_unique($varMatches[0]); // 変数のみを対象
+
+        // -------------------------
+        // 変数候補ごとの置換処理
+        // -------------------------
+        foreach ($candidates as $match) {
+            // 除外リストに含まれる場合はスキップ
+            foreach ($excluded as $skip) {
+                if (preg_match('/^' . $skip . '$/', $match)) {
+                    continue 2;
+                }
+            }
+            // 左辺（= や .= の直前にある変数）はラップ対象外
+            if (preg_match('/^\s*' . preg_quote($match, '/') . '\s*(?:\.\=|\=)/', $line)) {
+                continue;
+            }
+
+            // 既にSQL関数でラップされているかチェック
+            $pattern = '/sql\w+\s*\(\s*' . preg_quote($match, '/') . '\s*\)/';
+            if (!preg_match($pattern, $line)) {
+                // 変数名の前後が英数字・アンダースコアで続かないことを確認して置換
+                // 追加: ブレース付き変数 "{$var}" の場合の処理
+                // "{$var}" → sqlXXXXX({$var})  ※ 引用符を除去しブレースは保持
+                $bracedQuoted = '/"\{\$' . preg_quote(ltrim($match, '$'), '/') . '\}"/';
+                if (preg_match($bracedQuoted, $line)) {
+                    $line = preg_replace(
+                        $bracedQuoted,
+                        'sqlXXXXX({' . $match . '})',
+                        $line
+                    );
+                    continue;
+                }
+
+                $line = preg_replace(
+                    '/(?<![A-Za-z0-9_])' . preg_quote($match, '/') . '(?![A-Za-z0-9_])/',
+                    'sqlXXXXX($0)',
+                    $line
+                );
+            }
+        }
+
+        // 変更があった場合のみログに記録
+        if ($original !== $line) {
+            $logRows[] = [$relativePath, (string)($i + 1), $original, $line];
+        }
+    }
+    show_progress($totalLines, $totalLines, "完了: $relativePath");
+    return implode("\n", $lines);
+}
+
+/**
+ * メイン処理
+ *
+ * @param array $argv コマンドライン引数配列
+ * @return void
+ */
+function main(array $argv) {
+    if (count($argv) < 2) {
+        echo "使用方法: php recursive_replace.php <入力ディレクトリ>\n";
+        exit(1);
+    }
+
+    // ----------------------------------------------------------
+    // 1) 前処理 : 変数初期化 & 設定読み込み
+    // ----------------------------------------------------------
+    $startTime = microtime(true);
+    [$script, $input_dir] = $argv;
+    $output_dir = 'output';
+    $excluded = [];   // 外部ファイル読み込み機能をオミット
+    $log_entries = [];
+
+    echo "ファイルのスキャンを開始します...\n";
+    $files = recursive_scan($input_dir);
+    $totalFiles = count($files);
+    echo "{$totalFiles}個のファイルが見つかりました。\n";
+
+    $relative_files = array_map(function($file) use ($input_dir) {
+        return relative_path($input_dir, $file);
+    }, $files);
+
+    // 一括で上書き確認
+    if (!check_existing_files($output_dir, $relative_files)) {
+        echo "処理を中止します。\n";
+        exit(0);
+    }
+
+    // ----------------------------------------------------------
+    // 2) ファイル走査 & 個別処理
+    // ----------------------------------------------------------
+    echo "\n処理を開始します...\n";
+    foreach ($files as $i => $file) {
+        $relative = relative_path($input_dir, $file);
+        $output_path = $output_dir . DIRECTORY_SEPARATOR . $relative;
+        $output_dirname = dirname($output_path);
+
+        if (!is_dir($output_dirname)) {
+            mkdir($output_dirname, 0777, true);
+        }
+
+        try {
+            $original = file_get_contents($file);
+            $logRows = [];
+            $processed = replace_lines($original, $logRows, $relative, $excluded);
+
+            if (!empty($logRows)) {
+                file_put_contents($output_path, $processed);
+                $log_entries = array_merge($log_entries, $logRows);
+            }
+        } catch (Exception $e) {
+            $log_entries[] = [$relative, 'エラー: ' . $e->getMessage(), '', ''];
+        }
+    }
+
+    // ----------------------------------------------------------
+    // 3) 解析結果を Excel へ書き出し
+    // ----------------------------------------------------------
+    echo "\nログファイルを作成中...\n";
+    $spreadsheet = new Spreadsheet();
+    $sheet = $spreadsheet->getActiveSheet();
+    $sheet->setCellValue('A1', 'ファイルパス');
+    $sheet->setCellValue('B1', '行番号');
+    $sheet->setCellValue('C1', '変更前');
+    $sheet->setCellValue('D1', '変更後');
+
+    foreach ($log_entries as $i => [$file_path, $line, $before, $after]) {
+        $sheet->setCellValue("A" . ($i + 2), $file_path);
+        $sheet->setCellValue("B" . ($i + 2), $line);
+        $sheet->setCellValue("C" . ($i + 2), $before);
+        $sheet->setCellValue("D" . ($i + 2), $after);
+    }
+
+    $date = date('Ymd');
+    $logFilename = "log_{$date}.xlsx";
+    $writer = new Xlsx($spreadsheet);
+    $writer->save($logFilename);
+
+    $endTime = microtime(true);
+    $executionTime = round($endTime - $startTime, 2);
+
+    // ----------------------------------------------------------
+    // 4) 終了メッセージ
+    // ----------------------------------------------------------
+    echo "\n処理が完了しました。\n";
+    echo "実行時間: {$executionTime}秒\n";
+    echo "処理したファイル数: {$totalFiles}\n";
+    echo "変更を加えたファイル数: " . count(array_unique(array_column($log_entries, 0))) . "\n";
+    echo "ログファイル: {$logFilename}\n";
+}
+
+main($argv);
