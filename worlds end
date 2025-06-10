@@ -1,0 +1,315 @@
+#!/usr/bin/env php
+<?php
+/**
+ * ---------------------------------------------------------------
+ *  escape.php  (Improved Edition)
+ * ---------------------------------------------------------------
+ *  ◆ 目的
+ *      ・"未エスケープ変数" を sqlXXXXX() でラップして安全化
+ *      ・変更差分を Excel (log_YYYYMMDD.xlsx) に記録
+ *
+ *  ◆ 追加改良点 (2025-06-09)
+ *      1. HEREDOC / NOWDOC を解析し、HEREDOC 内の変数もラップ
+ *         - NOWDOC (<<<'SQL') は PHP が変数展開しない → 変換スキップ
+ *      2. 多行文字列を正しく把握。開始～終了ラベル間を
+ *         ひとかたまりの「論理行」として処理
+ *      3. 変数名の部分一致誤変換をさらに厳格に防止
+ *      4. 処理関数を細分化し、可読性・テスト容易性を向上
+ *
+ *  ◆ 使い方
+ *      $ php escape.php <scan_dir>
+ *
+ *  @author SS
+ * ---------------------------------------------------------------
+ */
+
+require_once __DIR__ . '/vendor/autoload.php';
+
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+
+/* ===============================================================
+ *  0.  ユーティリティ
+ * =============================================================== */
+
+/**
+ * プログレスバーを 0-100% で表示
+ */
+function show_progress(int $current, int $total, string $msg = ''): void
+{
+    static $lastLen = 0;
+
+    $rate = $total === 0 ? 0 : (int)round($current / $total * 100);
+    $bar  = str_pad(str_repeat('=', $rate), 100);
+    $line = "\r[{$bar}] {$rate}% {$msg}";
+    echo $line . str_repeat(' ', max(0, $lastLen - mb_strlen($line)));
+    $lastLen = mb_strlen($line);
+    if ($current >= $total) echo PHP_EOL;
+}
+
+/**
+ * 再帰的に *.php / *.inc ファイルを収集
+ */
+function collect_source_files(string $root): array
+{
+    $it = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($root, FilesystemIterator::SKIP_DOTS)
+    );
+    $paths = [];
+    foreach ($it as $file) {
+        if (\in_array($file->getExtension(), ['php', 'inc'], true)) {
+            $paths[] = $file->getPathname();
+        }
+    }
+    sort($paths);
+    return $paths;
+}
+
+/**
+ * $target を $base からの相対パスへ変換
+ */
+function relpath(string $base, string $target): string
+{
+    return ltrim(str_replace($base, '', $target), DIRECTORY_SEPARATOR);
+}
+
+/* ===============================================================
+ *  1.  変数ラップ処理本体
+ * =============================================================== */
+
+/**
+ * 変換対象のコンテキストを定義
+ */
+class ConversionContext {
+    public const ASSIGNMENT_RIGHT = 'assignment_right';  // 代入の右辺
+    public const HEREDOC = 'heredoc';                    // ヒアドキュメント内
+    public const NOWDOC = 'nowdoc';                      // ナウドキュメント内（処理対象外）
+
+    private static array $contexts = [
+        self::ASSIGNMENT_RIGHT => true,  // 処理対象
+        self::HEREDOC => true,          // 処理対象
+        self::NOWDOC => false,          // 処理対象外
+    ];
+
+    public static function isTarget(string $context): bool {
+        return self::$contexts[$context] ?? false;
+    }
+
+    public static function addContext(string $context, bool $isTarget = true): void {
+        self::$contexts[$context] = $isTarget;
+    }
+}
+
+/**
+ * 1 ファイル分の置換を行い、変更行をログに格納して返す
+ *
+ * @return array{processed:string, logRows:array<array{0:string,1:int,2:string,3:string}>}
+ */
+function process_file(
+    string $content,
+    string $relPath,
+    array  $excludePatterns = []
+): array {
+    // ---------- 正規表現パターンの準備 ----------
+    //   $foo, $arr['x'], $_POST['id'] など
+    $varPattern = '/\$[A-Za-z_\x80-\xff][A-Za-z0-9_\x80-\xff]*(?:\[[^\]]+\])*/u';
+
+    // ---------- 行ベースの解析 ----------
+    $lines  = explode("\n", $content);
+    $total  = \count($lines);
+    $log    = [];
+
+    $inDoc  = false;              // HEREDOC / NOWDOC内部かどうか
+    $docEnd = '';                 // 終了ラベル
+    $docIsNow = false;            // NOWDOC フラグ
+    $currentContext = null;       // 現在のコンテキスト
+
+    foreach ($lines as $idx => &$line) {
+        // 100行ごとに進捗表示
+        if ($idx % 100 === 0) show_progress($idx, $total, $relPath);
+
+        $originalLine = $line;
+        $modifiedLine = $line;
+
+        /* ---- (1) 代入の右辺判定 ---- */
+        if (preg_match('/^\s*\$[A-Za-z_\x80-\xff][A-Za-z0-9_\x80-\xff]*(?:\[[^\]]+\])*\s*(?:=|\.=)\s*(.+)$/u', $line, $m)) {
+            $currentContext = ConversionContext::ASSIGNMENT_RIGHT;
+            $modifiedLine = $m[1]; // 代入の右辺のみを処理
+        }
+
+        /* ---- (2) HEREDOC/NOWDOC 開始判定 ---- */
+        if (!$inDoc &&
+            preg_match('/<<<(?P<quote>[\'"]?)(?P<label>[A-Za-z_][A-Za-z0-9_]*)\k<quote>/', $line, $m)
+        ) {
+            $inDoc     = true;
+            $docEnd    = $m['label'];
+            $docIsNow  = ($m['quote'] === '\''); // quote が ' → NOWDOC
+            $currentContext = $docIsNow ? ConversionContext::NOWDOC : ConversionContext::HEREDOC;
+        }
+
+        /* ---- (3) HEREDOC/NOWDOC 終了判定 ---- */
+        if ($inDoc && preg_match("/^{$docEnd};?\s*$/", trim($line))) {
+            $inDoc = false;
+            $docEnd = '';
+            $docIsNow = false;
+            $currentContext = null;
+            continue;
+        }
+
+        /* ---- (4) 変換対象コンテキストの場合のみ処理 ---- */
+        if ($currentContext && ConversionContext::isTarget($currentContext)) {
+            /* ---- (4-1) 1 行内の変数候補を抽出 ---- */
+            preg_match_all($varPattern, $modifiedLine, $matches);
+            $candidates = array_unique($matches[0]);
+
+            foreach ($candidates as $var) {
+                // a) 除外リスト
+                foreach ($excludePatterns as $pat) {
+                    if (preg_match('/^' . $pat . '$/u', $var)) {
+                        continue 2;   // 外側 foreach ($candidates...) へ
+                    }
+                }
+
+                // b) 既に sql*() で包まれている？
+                $alreadyWrapped = preg_match(
+                    '/sql\w+\s*\(\s*' . preg_quote($var, '/') . '\s*\)/ui',
+                    $modifiedLine
+                );
+                if ($alreadyWrapped) continue;
+
+                /* ---- (4-2) ブレース付き変数 "{$var}" への特別対応 ---- */
+                $braced = '\{\$' . preg_quote(ltrim($var, '$'), '/') . '\}';
+                if (preg_match('/"' . $braced . '"/u', $modifiedLine)) {
+                    $modifiedLine = preg_replace(
+                        '/"' . $braced . '"/u',
+                        'sqlXXXXX({$0})',   // {$0} = {$var}
+                        $modifiedLine
+                    );
+                    continue;
+                }
+
+                /* ---- (4-3) 通常の変数 $var をラップ ---- */
+                $modifiedLine = preg_replace(
+                    '/(?<![A-Za-z0-9_\x80-\xff])' . preg_quote($var, '/') . '(?![A-Za-z0-9_\x80-\xff])/u',
+                    'sqlXXXXX(' . $var . ')',
+                    $modifiedLine
+                );
+            }
+        }
+
+        /* ---- (5) 代入の右辺を元の行に戻す ---- */
+        if ($currentContext === ConversionContext::ASSIGNMENT_RIGHT) {
+            $line = preg_replace(
+                '/^\s*(\$[A-Za-z_\x80-\xff][A-Za-z0-9_\x80-\xff]*(?:\[[^\]]+\])*\s*(?:=|\.=)\s*).+$/u',
+                '$1' . $modifiedLine,
+                $line
+            );
+        } else {
+            $line = $modifiedLine;
+        }
+
+        /* ---- (6) ログ記録 ---- */
+        if ($originalLine !== $line) {
+            $log[] = [$relPath, $idx + 1, $originalLine, $line];
+        }
+    }
+    // 進捗完了
+    show_progress($total, $total, $relPath);
+
+    return ['processed' => implode("\n", $lines), 'logRows' => $log];
+}
+
+/* ===============================================================
+ *  2.  CLI エントリーポイント
+ * =============================================================== */
+
+function main(array $argv): void
+{
+    if (count($argv) < 2) {
+        fwrite(STDERR, "使用方法: php escape.php <scan_dir>\n");
+        exit(1);
+    }
+
+    [$self, $scanDir] = $argv;
+    $scanDir   = realpath($scanDir) ?: $scanDir;
+    $outputDir = __DIR__ . '/output';
+    if (!is_dir($outputDir)) mkdir($outputDir, 0777, true);
+
+    /* ---------- 収集 ---------- */
+    echo "📂 スキャン対象: {$scanDir}\n";
+    $files = collect_source_files($scanDir);
+    echo "   → " . \count($files) . " ファイルを発見\n";
+
+    /* ---------- 上書き確認 ---------- */
+    $relFiles = array_map(fn($f) => relpath($scanDir, $f), $files);
+    $overwrite = check_existing_files($outputDir, $relFiles);
+    if (!$overwrite) {
+        echo "🚫 中止しました\n";
+        return;
+    }
+
+    /* ---------- 置換処理 ---------- */
+    $start = microtime(true);
+    $allLogs = [];
+    foreach ($files as $index => $path) {
+        $rel = relpath($scanDir, $path);
+        $src = file_get_contents($path);
+        ['processed' => $dst, 'logRows' => $rows] = process_file($src, $rel);
+
+        if ($rows) {
+            // 出力先ディレクトリを作成
+            $outPath = $outputDir . DIRECTORY_SEPARATOR . $rel;
+            if (!is_dir(dirname($outPath))) {
+                mkdir(dirname($outPath), 0777, true);
+            }
+            file_put_contents($outPath, $dst);
+            $allLogs = array_merge($allLogs, $rows);
+        }
+    }
+
+    /* ---------- Excel ログ ---------- */
+    echo "\n📑 Excel ログを作成中...\n";
+    $book = new Spreadsheet();
+    $sheet = $book->getActiveSheet();
+    $sheet->fromArray(
+        ['ファイルパス', '行番号', '変更前', '変更後'],
+        null,
+        'A1'
+    );
+    foreach ($allLogs as $i => [$f, $l, $b, $a]) {
+        $sheet->fromArray([$f, $l, $b, $a], null, 'A' . ($i + 2));
+    }
+    $logName = 'log_' . date('Ymd_His') . '.xlsx';
+    (new Xlsx($book))->save($logName);
+
+    /* ---------- 終了通知 ---------- */
+    $elapsed = round(microtime(true) - $start, 2);
+    echo "✅ 完了 (処理時間: {$elapsed}s)\n";
+    echo "   ・変更対象ファイル数: " . \count(array_unique(array_column($allLogs, 0))) . "\n";
+    echo "   ・Excel ログ        : {$logName}\n";
+}
+
+/* ===============================================================
+ *  実行
+ * =============================================================== */
+main($argv);
+
+
+/* ---------------------------------------------------------------
+ *  補助関数  : check_existing_files
+ * --------------------------------------------------------------- */
+function check_existing_files(string $outDir, array $relPaths): bool
+{
+    $dupes = [];
+    foreach ($relPaths as $p) {
+        $outPath = $outDir . DIRECTORY_SEPARATOR . $p;
+        if (is_file($outPath)) $dupes[] = $p;
+    }
+    if (!$dupes) return true;
+
+    echo "⚠️  既に存在するファイルがあります (計 " . count($dupes) . ")\n";
+    foreach ($dupes as $p) echo "   - {$p}\n";
+    echo "上書きしてもよろしいですか？ (yes/no): ";
+    $ans = trim(fgets(STDIN));
+    return strtolower($ans) === 'yes';
+}
