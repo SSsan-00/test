@@ -2,31 +2,42 @@
 <?php
 /**
  * ---------------------------------------------------------------
- *  escape.php  (Improved Edition)
+ *  escape.php  (Improved Edition – LHS 変数名フィルタ付き)
  * ---------------------------------------------------------------
  *  ◆ 目的
  *      ・"未エスケープ変数" を sqlXXXXX() でラップして安全化
  *      ・変更差分を Excel (log_YYYYMMDD.xlsx) に記録
  *
- *  ◆ 追加改良点 (2025-06-09)
+ *  ◆ 追加改良点
  *      1. HEREDOC / NOWDOC を解析し、HEREDOC 内の変数もラップ
  *         - NOWDOC (<<<'SQL') は PHP が変数展開しない → 変換スキップ
  *      2. 多行文字列を正しく把握。開始～終了ラベル間を
  *         ひとかたまりの「論理行」として処理
  *      3. 変数名の部分一致誤変換をさらに厳格に防止
  *      4. 処理関数を細分化し、可読性・テスト容易性を向上
+ *      5. **（New! 2025-06-11）**  
+ *         代入の左辺が `$sql` または `$query` のときだけ右辺をラップ。  
+ *         左辺変数名は配列 `TARGET_LHS_VARS` を編集するだけで変更可能
  *
  *  ◆ 使い方
  *      $ php escape.php <scan_dir>
  *
- *  @author SS
- * ---------------------------------------------------------------
+ *  ---------------------------------------------------------------
  */
 
 require_once __DIR__ . '/vendor/autoload.php';
 
 use PhpOffice\PhpSpreadsheet\Spreadsheet;
 use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+
+/**
+ * ---------------------------------------------------------------
+ *  ラップ対象となる「左辺変数名」（$ を除いた名前）を定義
+ *    - ここを編集するだけで簡単に増減できる
+ *    - 大文字・小文字は区別しません
+ * ---------------------------------------------------------------
+ */
+const TARGET_LHS_VARS = ['sql', 'query'];
 
 /* ===============================================================
  *  0.  ユーティリティ
@@ -57,7 +68,7 @@ function collect_source_files(string $root): array
     );
     $paths = [];
     foreach ($it as $file) {
-        if (\in_array($file->getExtension(), ['php', 'inc'], true)) {
+        if (in_array($file->getExtension(), ['php', 'inc'], true)) {
             $paths[] = $file->getPathname();
         }
     }
@@ -82,20 +93,22 @@ function relpath(string $base, string $target): string
  */
 class ConversionContext {
     public const ASSIGNMENT_RIGHT = 'assignment_right';  // 代入の右辺
-    public const HEREDOC = 'heredoc';                    // ヒアドキュメント内
-    public const NOWDOC = 'nowdoc';                      // ナウドキュメント内（処理対象外）
+    public const HEREDOC         = 'heredoc';            // ヒアドキュメント内
+    public const NOWDOC          = 'nowdoc';             // ナウドキュメント内（処理対象外）
 
     private static array $contexts = [
         self::ASSIGNMENT_RIGHT => true,  // 処理対象
-        self::HEREDOC => true,          // 処理対象
-        self::NOWDOC => false,          // 処理対象外
+        self::HEREDOC          => true,  // 処理対象
+        self::NOWDOC           => false, // 処理対象外
     ];
 
-    public static function isTarget(string $context): bool {
+    public static function isTarget(string $context): bool
+    {
         return self::$contexts[$context] ?? false;
     }
 
-    public static function addContext(string $context, bool $isTarget = true): void {
+    public static function addContext(string $context, bool $isTarget = true): void
+    {
         self::$contexts[$context] = $isTarget;
     }
 }
@@ -103,81 +116,124 @@ class ConversionContext {
 /**
  * 1 ファイル分の置換を行い、変更行をログに格納して返す
  *
- * @return array{processed:string, logRows:array<array{0:string,1:int,2:string,3:string}>}
+ * @param string $content          処理対象ファイルの内容
+ * @param string $relPath          ルートからの相対パス（ログ用）
+ * @param array  $excludePatterns  ラップ除外変数パターン（正規表現）
+ * @param array  $lhsTargets       代入左辺が対象となる変数名リスト
+ *
+ * @return array{
+ *     processed:string,
+ *     logRows:array<array{0:string,1:int,2:string,3:string}>
+ * }
  */
 function process_file(
     string $content,
     string $relPath,
-    array  $excludePatterns = []
+    array  $excludePatterns = [],
+    array  $lhsTargets      = TARGET_LHS_VARS
 ): array {
-    // ---------- 正規表現パターンの準備 ----------
+    /* ---------- 正規表現パターン ---------- */
     //   $foo, $arr['x'], $_POST['id'] など
     $varPattern = '/\$[A-Za-z_\x80-\xff][A-Za-z0-9_\x80-\xff]*(?:\[[^\]]+\])*/u';
 
-    // ---------- 行ベースの解析 ----------
-    $lines  = explode("\n", $content);
-    $total  = \count($lines);
-    $log    = [];
+    /* ---------- 行ベースの解析 ---------- */
+    $lines = explode("\n", $content);
+    $total = count($lines);
+    $log   = [];
 
-    $inDoc  = false;              // HEREDOC / NOWDOC内部かどうか
-    $docEnd = '';                 // 終了ラベル
-    $docIsNow = false;            // NOWDOC フラグ
-    $currentContext = null;       // 現在のコンテキスト
+    // 状態保持用フラグ
+    $inDoc          = false;  // HEREDOC/NOWDOC 内か
+    $docEndLabel    = '';     // HEREDOC 終了ラベル
+    $docIsNowDoc    = false;  // NOWDOC フラグ
+    $docIsTarget    = false;  // HEREDOC が対象かどうか
+    $currentContext = null;   // 現在のコンテキスト
+
+    // 比較用に左辺変数名を小文字化
+    $lhsTargetsLC = array_map('strtolower', $lhsTargets);
 
     foreach ($lines as $idx => &$line) {
-        // 100行ごとに進捗表示
+        // 100 行ごとに進捗表示
         if ($idx % 100 === 0) show_progress($idx, $total, $relPath);
 
-        $originalLine = $line;
-        $modifiedLine = $line;
+        $originalLine = $line;   // ログ用
+        $modifiedLine = $line;   // 変換用
 
-        /* ---- (1) 代入の右辺判定 ---- */
-        if (preg_match('/^\s*\$[A-Za-z_\x80-\xff][A-Za-z0-9_\x80-\xff]*(?:\[[^\]]+\])*\s*(?:=|\.=)\s*(.+)$/u', $line, $m)) {
-            $currentContext = ConversionContext::ASSIGNMENT_RIGHT;
-            $modifiedLine = $m[1]; // 代入の右辺のみを処理
+        /* =======================================================
+         * (1) 代入行の判定
+         * ------------------------------------------------------- */
+        $lhsMatch = [];
+        if (preg_match(
+            '/^\s*(\$[A-Za-z_\x80-\xff][A-Za-z0-9_\x80-\xff]*)(?:\[[^\]]+\])?' . // $var or $arr[...]
+            '\s*(=|\.=)\s*(.+)$/u',
+            $line,
+            $lhsMatch
+        )) {
+            $lhsVarName = strtolower(ltrim($lhsMatch[1], '$'));
+
+            if (in_array($lhsVarName, $lhsTargetsLC, true)) {
+                $currentContext = ConversionContext::ASSIGNMENT_RIGHT;  // 右辺を処理
+                $modifiedLine   = $lhsMatch[3];                         // 右辺のみ抽出
+            } else {
+                $currentContext = null; // 対象外
+            }
         }
 
-        /* ---- (2) HEREDOC/NOWDOC 開始判定 ---- */
-        if (!$inDoc &&
-            preg_match('/<<<(?P<quote>[\'"]?)(?P<label>[A-Za-z_][A-Za-z0-9_]*)\k<quote>/', $line, $m)
+        /* =======================================================
+         * (2) HEREDOC / NOWDOC 開始判定
+         * ------------------------------------------------------- */
+        if (
+            !$inDoc &&
+            preg_match(
+                '/^\s*(\$[A-Za-z_\x80-\xff][A-Za-z0-9_\x80-\xff]*)?\s*(=|\.=)?\s*<<<(?P<quote>[\'"]?)(?P<label>[A-Za-z_][A-Za-z0-9_]*)\k<quote>/u',
+                $line,
+                $m
+            )
         ) {
-            $inDoc     = true;
-            $docEnd    = $m['label'];
-            $docIsNow  = ($m['quote'] === '\''); // quote が ' → NOWDOC
-            $currentContext = $docIsNow ? ConversionContext::NOWDOC : ConversionContext::HEREDOC;
+            $lhsName     = isset($m[1]) ? strtolower(ltrim($m[1], '$')) : '';
+            $docIsTarget = in_array($lhsName, $lhsTargetsLC, true);
+            $inDoc       = true;
+            $docEndLabel = $m['label'];
+            $docIsNowDoc = ($m['quote'] === '\'');
+
+            $currentContext = $docIsNowDoc
+                ? ConversionContext::NOWDOC
+                : ($docIsTarget ? ConversionContext::HEREDOC : null);
         }
 
-        /* ---- (3) HEREDOC/NOWDOC 終了判定 ---- */
-        if ($inDoc && preg_match("/^{$docEnd};?\s*$/", trim($line))) {
-            $inDoc = false;
-            $docEnd = '';
-            $docIsNow = false;
+        /* =======================================================
+         * (3) HEREDOC / NOWDOC 終了判定
+         * ------------------------------------------------------- */
+        if ($inDoc && preg_match('/^' . preg_quote($docEndLabel, '/') . ';?\s*$/', trim($line))) {
+            $inDoc          = false;
+            $docEndLabel    = '';
+            $docIsNowDoc    = false;
+            $docIsTarget    = false;
             $currentContext = null;
-            continue;
+            continue;   // 終了行自体は加工不要
         }
 
-        /* ---- (4) 変換対象コンテキストの場合のみ処理 ---- */
+        /* =======================================================
+         * (4) ラップ処理（対象コンテキストのみ）
+         * ------------------------------------------------------- */
         if ($currentContext && ConversionContext::isTarget($currentContext)) {
-            /* ---- (4-1) 1 行内の変数候補を抽出 ---- */
+            // 1 行内の変数候補を抽出
             preg_match_all($varPattern, $modifiedLine, $matches);
             $candidates = array_unique($matches[0]);
 
             foreach ($candidates as $var) {
-                // a) 除外リスト
+                /* ---- a) 除外パターン ---- */
                 foreach ($excludePatterns as $pat) {
                     if (preg_match('/^' . $pat . '$/u', $var)) {
-                        continue 2;   // 外側 foreach ($candidates...) へ
+                        continue 2;   // 次の $var へ
                     }
                 }
 
-                // b) 既に sql*() で包まれている？
-                $alreadyWrapped = preg_match(
-                    '/sql\w+\s*\(\s*' . preg_quote($var, '/') . '\s*\)/ui',
-                    $modifiedLine
-                );
-                if ($alreadyWrapped) continue;
+                /* ---- b) 既にラップ済み？ ---- */
+                if (preg_match('/sql\w+\s*\(\s*' . preg_quote($var, '/') . '\s*\)/ui', $modifiedLine)) {
+                    continue;
+                }
 
-                /* ---- (4-2) ブレース付き変数 "{$var}" への特別対応 ---- */
+                /* ---- c) ブレース付き変数 "{$var}" ---- */
                 $braced = '\{\$' . preg_quote(ltrim($var, '$'), '/') . '\}';
                 if (preg_match('/"' . $braced . '"/u', $modifiedLine)) {
                     $modifiedLine = preg_replace(
@@ -188,7 +244,7 @@ function process_file(
                     continue;
                 }
 
-                /* ---- (4-3) 通常の変数 $var をラップ ---- */
+                /* ---- d) 通常変数 $var ---- */
                 $modifiedLine = preg_replace(
                     '/(?<![A-Za-z0-9_\x80-\xff])' . preg_quote($var, '/') . '(?![A-Za-z0-9_\x80-\xff])/u',
                     'sqlXXXXX(' . $var . ')',
@@ -197,10 +253,12 @@ function process_file(
             }
         }
 
-        /* ---- (5) 代入の右辺を元の行に戻す ---- */
+        /* =======================================================
+         * (5) 代入行の右辺を元の行に戻す
+         * ------------------------------------------------------- */
         if ($currentContext === ConversionContext::ASSIGNMENT_RIGHT) {
             $line = preg_replace(
-                '/^\s*(\$[A-Za-z_\x80-\xff][A-Za-z0-9_\x80-\xff]*(?:\[[^\]]+\])*\s*(?:=|\.=)\s*).+$/u',
+                '/^(\s*\$[A-Za-z_\x80-\xff][A-Za-z0-9_\x80-\xff]*(?:\[[^\]]+\])?\s*(?:=|\.=)\s*).+$/u',
                 '$1' . $modifiedLine,
                 $line
             );
@@ -208,15 +266,21 @@ function process_file(
             $line = $modifiedLine;
         }
 
-        /* ---- (6) ログ記録 ---- */
+        /* =======================================================
+         * (6) ログ記録
+         * ------------------------------------------------------- */
         if ($originalLine !== $line) {
             $log[] = [$relPath, $idx + 1, $originalLine, $line];
         }
-    }
-    // 進捗完了
+    } // 行ループ終了
+
+    // 進捗完了表示
     show_progress($total, $total, $relPath);
 
-    return ['processed' => implode("\n", $lines), 'logRows' => $log];
+    return [
+        'processed' => implode("\n", $lines),
+        'logRows'   => $log,
+    ];
 }
 
 /* ===============================================================
@@ -238,10 +302,10 @@ function main(array $argv): void
     /* ---------- 収集 ---------- */
     echo "📂 スキャン対象: {$scanDir}\n";
     $files = collect_source_files($scanDir);
-    echo "   → " . \count($files) . " ファイルを発見\n";
+    echo "   → " . count($files) . " ファイルを発見\n";
 
     /* ---------- 上書き確認 ---------- */
-    $relFiles = array_map(fn($f) => relpath($scanDir, $f), $files);
+    $relFiles  = array_map(fn($f) => relpath($scanDir, $f), $files);
     $overwrite = check_existing_files($outputDir, $relFiles);
     if (!$overwrite) {
         echo "🚫 中止しました\n";
@@ -249,12 +313,15 @@ function main(array $argv): void
     }
 
     /* ---------- 置換処理 ---------- */
-    $start = microtime(true);
+    $start   = microtime(true);
     $allLogs = [];
-    foreach ($files as $index => $path) {
+
+    foreach ($files as $path) {
         $rel = relpath($scanDir, $path);
         $src = file_get_contents($path);
-        ['processed' => $dst, 'logRows' => $rows] = process_file($src, $rel);
+
+        ['processed' => $dst, 'logRows' => $rows]
+            = process_file($src, $rel, [], TARGET_LHS_VARS); // ★ 第4引数に対象変数リスト
 
         if ($rows) {
             // 出力先ディレクトリを作成
@@ -269,7 +336,7 @@ function main(array $argv): void
 
     /* ---------- Excel ログ ---------- */
     echo "\n📑 Excel ログを作成中...\n";
-    $book = new Spreadsheet();
+    $book  = new Spreadsheet();
     $sheet = $book->getActiveSheet();
     $sheet->fromArray(
         ['ファイルパス', '行番号', '変更前', '変更後'],
@@ -285,7 +352,7 @@ function main(array $argv): void
     /* ---------- 終了通知 ---------- */
     $elapsed = round(microtime(true) - $start, 2);
     echo "✅ 完了 (処理時間: {$elapsed}s)\n";
-    echo "   ・変更対象ファイル数: " . \count(array_unique(array_column($allLogs, 0))) . "\n";
+    echo "   ・変更対象ファイル数: " . count(array_unique(array_column($allLogs, 0))) . "\n";
     echo "   ・Excel ログ        : {$logName}\n";
 }
 
@@ -293,7 +360,6 @@ function main(array $argv): void
  *  実行
  * =============================================================== */
 main($argv);
-
 
 /* ---------------------------------------------------------------
  *  補助関数  : check_existing_files
