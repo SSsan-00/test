@@ -1,0 +1,355 @@
+#!/usr/bin/env php
+<?php
+/**
+ * ---------------------------------------------------------------
+ *  escape.php
+ * ---------------------------------------------------------------
+ *  ◆ 改修ポイント（2025-06-12）
+ *      1. 「if ($cnt==1) $sql = …」のような **行頭以外の代入** も検出
+ *         └ 正規表現を行全体に拡張し、前置コードを prefix として保持
+ *      2. 変更が無かったファイルも必ずコピーし
+ *         Excel ログへ “NO CHANGE” を 1 行出力（従来通り）
+ * ---------------------------------------------------------------
+ */
+
+require_once __DIR__ . '/vendor/autoload.php';
+
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+
+/* ===============================================================
+ *  定数
+ * =============================================================== */
+const TARGET_LHS_VARS      = ['sql', 'query'];   // 左辺がこれらの場合だけ右辺ラップ
+const EXCLUDE_VAR_PATTERNS = ['\\$sql2', '\\$sq2']; // 完全除外する変数
+
+/* ===============================================================
+ *  0. ユーティリティ
+ * =============================================================== */
+
+/**
+ * プログレスバー (0-100 %)
+ */
+function show_progress(int $current, int $total, string $msg = ''): void
+{
+    static $lastLen = 0;
+    $rate = $total === 0 ? 0 : (int)round($current / $total * 100);
+    $bar  = str_pad(str_repeat('=', $rate), 100);
+    $line = "\r[{$bar}] {$rate}% {$msg}";
+    echo $line . str_repeat(' ', max(0, $lastLen - mb_strlen($line)));
+    $lastLen = mb_strlen($line);
+    if ($current >= $total) echo PHP_EOL;
+}
+
+/**
+ * ディレクトリ以下の *.php / *.inc を再帰取得
+ */
+function collect_source_files(string $root): array
+{
+    $it = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($root, FilesystemIterator::SKIP_DOTS)
+    );
+    $paths = [];
+    foreach ($it as $file) {
+        if (in_array($file->getExtension(), ['php', 'inc'], true)) {
+            $paths[] = $file->getPathname();
+        }
+    }
+    sort($paths);
+    return $paths;
+}
+
+/**
+ * 相対パスへ変換
+ */
+function relpath(string $base, string $target): string
+{
+    return ltrim(str_replace($base, '', $target), DIRECTORY_SEPARATOR);
+}
+
+/* ===============================================================
+ *  1. ラップ処理本体
+ * =============================================================== */
+
+/**
+ * 変換対象コンテキスト
+ */
+class ConversionContext
+{
+    public const ASSIGNMENT_RIGHT = 'assignment_right';
+    public const HEREDOC          = 'heredoc';
+    public const NOWDOC           = 'nowdoc';
+
+    private static array $contexts = [
+        self::ASSIGNMENT_RIGHT => true,
+        self::HEREDOC          => true,
+        self::NOWDOC           => false,
+    ];
+
+    public static function isTarget(string $context): bool
+    {
+        return self::$contexts[$context] ?? false;
+    }
+}
+
+/**
+ * ファイル 1 本を処理して変更後コードとログを返す
+ *
+ * @return array{processed:string, logRows:array<array{0:string,1:int,2:string,3:string}>}
+ */
+function process_file(
+    string $content,
+    string $relPath,
+    array  $excludePatterns = EXCLUDE_VAR_PATTERNS,
+    array  $lhsTargets      = TARGET_LHS_VARS
+): array {
+    /* ---------- 準備 ---------- */
+    $varPattern = '/\$[A-Za-z_\x80-\xff][A-Za-z0-9_\x80-\xff]*(?:\[[^\]]+\])*/u';
+    $lhsLC      = array_map('strtolower', $lhsTargets);
+
+    $lines  = explode("\n", $content);
+    $total  = count($lines);
+    $log    = [];
+
+    $inDoc       = false;
+    $docEnd      = '';
+    $docIsNow    = false;
+    $ctx         = null;
+
+    /**
+     * $var が行中で 「sql任意(... )」の引数に含まれているか判定
+     */
+    $insideSql = static function (string $line, string $var): bool {
+        if (!preg_match_all('/sql[A-Za-z0-9_]*\s*\(/i', $line, $ms, PREG_OFFSET_CAPTURE)) {
+            return false;
+        }
+        foreach ($ms[0] as [, $start]) {
+            $open = strpos($line, '(', $start);
+            if ($open === false) continue;
+
+            $depth = 0;
+            for ($i = $open, $len = strlen($line); $i < $len; $i++) {
+                $ch = $line[$i];
+                if ($ch === '(') {
+                    $depth++;
+                } elseif ($ch === ')') {
+                    $depth--;
+                    if ($depth === 0) {
+                        $args = substr($line, $open + 1, $i - $open - 1);
+                        if (strpos($args, $var) !== false) return true;
+                        break;
+                    }
+                }
+            }
+        }
+        return false;
+    };
+
+    foreach ($lines as $idx => &$line) {
+        if ($idx % 100 === 0) show_progress($idx, $total, $relPath);
+
+        $orig = $line;    // 変更前
+        $mod  = $line;    // 作業用
+
+        $assignPrefix = null; // 行頭以外の代入用保持
+
+        /* =======================================================
+         * (1) 代入行検出 ― 「if (…) $sql = …」も拾う
+         * ------------------------------------------------------- */
+        if (preg_match(
+            '/^(.*?\b)(\$[A-Za-z_\x80-\xff][A-Za-z0-9_\x80-\xff]*(?:\[[^\]]+\])?)\s*(=|\.=)\s*(.+)$/u',
+            $line,
+            $mAssign
+        )) {
+            [$full, $prefix, $lhsVar, $op, $rhs] = $mAssign;
+            if (in_array(strtolower(ltrim($lhsVar, '$')), $lhsLC, true)) {
+                $ctx          = ConversionContext::ASSIGNMENT_RIGHT;
+                $mod          = $rhs;                         // 処理対象は右辺のみ
+                $assignPrefix = $prefix . $lhsVar . $op . ' ';
+            } else {
+                $ctx = null;
+            }
+        }
+
+        /* =======================================================
+         * (2) HEREDOC / NOWDOC 開始判定
+         * ------------------------------------------------------- */
+        if (
+            !$inDoc &&
+            preg_match(
+                '/^\s*(\$[A-Za-z_\x80-\xff][A-Za-z0-9_\x80-\xff]*)?\s*(=|\.=)?\s*<<<(?P<q>[\'"]?)(?P<label>[A-Za-z_][A-Za-z0-9_]*)\k<q>/u',
+                $line,
+                $mDoc
+            )
+        ) {
+            $lhsName  = isset($mDoc[1]) ? strtolower(ltrim($mDoc[1], '$')) : '';
+            $docIsTarget = in_array($lhsName, $lhsLC, true);
+            $inDoc    = true;
+            $docEnd   = $mDoc['label'];
+            $docIsNow = ($mDoc['q'] === '\'');
+
+            $ctx = $docIsNow
+                ? ConversionContext::NOWDOC
+                : ($docIsTarget ? ConversionContext::HEREDOC : null);
+        }
+
+        /* =======================================================
+         * (3) HEREDOC / NOWDOC 終了判定
+         * ------------------------------------------------------- */
+        if ($inDoc && preg_match('/^' . preg_quote($docEnd, '/') . ';?\s*$/', trim($line))) {
+            $inDoc = false;
+            $docEnd = '';
+            $docIsNow = false;
+            $ctx = null;
+            // 終了行そのものは加工不要
+            continue;
+        }
+
+        /* =======================================================
+         * (4) 変数ラップ処理
+         * ------------------------------------------------------- */
+        if ($ctx && ConversionContext::isTarget($ctx)) {
+            preg_match_all($varPattern, $mod, $mVars);
+            $cand = array_unique($mVars[0]);
+
+            foreach ($cand as $v) {
+                /* a) 除外リスト */
+                foreach ($excludePatterns as $pat) {
+                    if (preg_match('/^' . $pat . '$/u', $v)) continue 2;
+                }
+                /* b) 既に sql*() の引数内ならスキップ */
+                if ($insideSql($mod, $v)) continue;
+
+                /* c) ブレース付き変数 "{$var}" */
+                $braced = '\{\$' . preg_quote(ltrim($v, '$'), '/') . '\}';
+                if (preg_match('/"' . $braced . '"/u', $mod)) {
+                    $mod = preg_replace('/"' . $braced . '"/u', 'sqlXXXXX({$0})', $mod);
+                    continue;
+                }
+
+                /* d) 通常変数置換 */
+                $mod = preg_replace(
+                    '/(?<![A-Za-z0-9_\x80-\xff])' . preg_quote($v, '/') . '(?![A-Za-z0-9_\x80-\xff])/u',
+                    'sqlXXXXX(' . $v . ')',
+                    $mod
+                );
+            }
+        }
+
+        /* =======================================================
+         * (5) 行再構築
+         * ------------------------------------------------------- */
+        if ($assignPrefix !== null) {
+            $line = $assignPrefix . $mod;
+        } else {
+            $line = $mod;
+        }
+
+        /* =======================================================
+         * (6) ログ
+         * ------------------------------------------------------- */
+        if ($orig !== $line) {
+            $log[] = [$relPath, $idx + 1, $orig, $line];
+        }
+    }
+
+    show_progress($total, $total, $relPath);
+
+    return ['processed' => implode("\n", $lines), 'logRows' => $log];
+}
+
+/* ===============================================================
+ *  2. Excel ログ出力
+ * =============================================================== */
+function export_excel_log(array $rows): string
+{
+    $data    = [['ファイルパス', '行番号', '変更前', '変更後']];
+    $data    = array_merge($data, $rows);
+    $name    = 'log_' . date('Ymd_His') . '.xlsx';
+
+    $wb = new Spreadsheet();
+    $ws = $wb->getActiveSheet();
+    $ws->fromArray($data, null, 'A1', true);
+    $ws->setTitle('Log', false);
+
+    $writer = new Xlsx($wb);
+    $writer->setPreCalculateFormulas(false);
+    $writer->save($name);
+
+    $wb->disconnectWorksheets();
+    unset($wb);
+
+    return $name;
+}
+
+/* ===============================================================
+ *  3. メイン
+ * =============================================================== */
+function main(array $argv): void
+{
+    if (count($argv) < 2) {
+        fwrite(STDERR, "使用方法: php escape.php <scan_dir>\n");
+        exit(1);
+    }
+
+    [, $scanDir] = $argv;
+    $scanDir   = realpath($scanDir) ?: $scanDir;
+    $outDir    = __DIR__ . '/output';
+    if (!is_dir($outDir)) mkdir($outDir, 0777, true);
+
+    echo "📂 スキャン対象: {$scanDir}\n";
+    $files = collect_source_files($scanDir);
+    echo "   → " . count($files) . " ファイルを発見\n";
+
+    if (!check_existing_files($outDir, array_map(fn($f) => relpath($scanDir, $f), $files))) {
+        echo "🚫 中止しました\n";
+        return;
+    }
+
+    $logs  = [];
+    $start = microtime(true);
+
+    foreach ($files as $path) {
+        $rel = relpath($scanDir, $path);
+        $src = file_get_contents($path);
+
+        ['processed' => $dst, 'logRows' => $rows]
+            = process_file($src, $rel, EXCLUDE_VAR_PATTERNS, TARGET_LHS_VARS);
+
+        /* --- 出力先に保存（全ファイル） --- */
+        $outPath = $outDir . DIRECTORY_SEPARATOR . $rel;
+        if (!is_dir(dirname($outPath))) mkdir(dirname($outPath), 0777, true);
+        file_put_contents($outPath, $dst);
+
+        /* --- ログ --- */
+        $logs = array_merge($logs, $rows ?: [[$rel, 0, '', 'NO CHANGE']]);
+    }
+
+    /* --- Excel 出力 --- */
+    echo "\n📑 Excel ログを作成中...\n";
+    $logFile = export_excel_log($logs);
+
+    /* --- 終了 --- */
+    $elapsed = round(microtime(true) - $start, 2);
+    echo "✅ 完了 (処理時間: {$elapsed}s)\n";
+    echo "   ・対象ファイル数 : " . count($files) . "\n";
+    echo "   ・Excel ログ     : {$logFile}\n";
+}
+main($argv);
+
+/* ---------------------------------------------------------------
+ *  補助: 上書き確認
+ * --------------------------------------------------------------- */
+function check_existing_files(string $outDir, array $relPaths): bool
+{
+    $dupes = [];
+    foreach ($relPaths as $p) {
+        if (is_file($outDir . DIRECTORY_SEPARATOR . $p)) $dupes[] = $p;
+    }
+    if (!$dupes) return true;
+
+    echo "⚠️  既に存在するファイルがあります (計 " . count($dupes) . ")\n";
+    foreach ($dupes as $p) echo "   - {$p}\n";
+    echo "上書きしてもよろしいですか？ (yes/no): ";
+    return strtolower(trim(fgets(STDIN))) === 'yes';
+}
