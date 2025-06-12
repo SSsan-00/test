@@ -248,22 +248,52 @@ function process_file(
 /* ===============================================================
  *  2. Excel ログ出力
  * =============================================================== */
+/* ===============================================================
+ *  2. Excel ログ出力  ★FIXED
+ * =============================================================== */
 function export_excel_log(array $rows): string
 {
-    $data    = [['ファイルパス', '行番号', '変更前', '変更後']];
-    $data    = array_merge($data, $rows);
+    // ヘッダー行
     $logName = 'log_' . date('Ymd_His') . '.xlsx';
-
-    $wb = new Spreadsheet();
-    $ws = $wb->getActiveSheet();
-    $ws->fromArray($data, null, 'A1', true);
+    $wb      = new Spreadsheet();
+    $ws      = $wb->getActiveSheet();
     $ws->setTitle('Log', false);
 
-    $writer = new Xlsx($wb);
-    $writer->setPreCalculateFormulas(false);
-    $writer->save($logName);
+    // 1) 見出し
+    $headers = ['ファイルパス', '行番号', '変更前', '変更後'];
+    foreach ($headers as $col => $label) {
+        $ws->setCellValueByColumnAndRow($col + 1, 1, $label);
+    }
 
-    $wb->disconnectWorksheets();
+    // 2) データ行 ― １行ずつ “文字列” として明示的に書き込む
+    $rowIdx = 2;                                // 書き込み先 Excel 行 (2 行目〜)
+    foreach ($rows as [$path, $lineNum, $before, $after]) {
+        // A列: パス
+        $ws->setCellValueExplicitByColumnAndRow(
+            1, $rowIdx, $path, DataType::TYPE_STRING
+        );
+        // B列: 行番号（数値）
+        $ws->setCellValueExplicitByColumnAndRow(
+            2, $rowIdx, $lineNum, DataType::TYPE_NUMERIC
+        );
+        // C列: 変更前
+        $ws->setCellValueExplicitByColumnAndRow(
+            3, $rowIdx, $before, DataType::TYPE_STRING
+        );
+        // D列: 変更後
+        $ws->setCellValueExplicitByColumnAndRow(
+            4, $rowIdx, $after, DataType::TYPE_STRING
+        );
+
+        $rowIdx++;
+    }
+
+    // ★ 数式計算を完全停止（大量データでも高速 & 余計な警告を防ぐ）
+    $wb->getCalculationEngine()->disableCalculationCache();
+    $wb->getCalculationEngine()->disableCalculation();
+
+    (new Xlsx($wb))->save($logName);
+    $wb->disconnectWorksheets();   // メモリ開放
     unset($wb);
 
     return $logName;
