@@ -1,0 +1,109 @@
+#!/usr/bin/env php
+<?php
+/**
+ * list2excel.php
+ *
+ * 指定ディレクトリを再帰走査し、相対パス一覧を Excel (.xlsx) で出力する CLI ツール
+ *
+ * 使い方:
+ *   php list2excel.php <target_dir> [output.xlsx]
+ *
+ *   <target_dir> : 走査したいフォルダの絶対/相対パス
+ *   [output.xlsx]: 出力先ファイル名 (省略時: file_list.xlsx)
+ *
+ * 依存:
+ *   - PHP 8.0 以上推奨
+ *   - Composer で phpoffice/phpspreadsheet をインストールしていること
+ *
+ * (c) 2025
+ */
+
+declare(strict_types=1);
+
+require __DIR__ . '/vendor/autoload.php';
+
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+
+// ---------- 1. CLI 引数のバリデーション ----------
+$argvCount = $_SERVER['argc'];
+if ($argvCount < 2 || $argvCount > 3) {
+    fwrite(STDERR, "Usage: php {$argv[0]} <target_dir> [output.xlsx]\n");
+    exit(1);
+}
+
+$baseDir = realpath($argv[1]);
+if ($baseDir === false || !is_dir($baseDir)) {
+    fwrite(STDERR, "Error: '{$argv[1]}' is not a valid directory.\n");
+    exit(1);
+}
+$baseDir = rtrim($baseDir, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR; // 末尾スラッシュ保証
+
+$outputFile = $argv[2] ?? 'file_list.xlsx';
+
+// ---------- 2. ディレクトリを再帰走査して一覧を作成 ----------
+$paths = []; // 結果格納用
+
+$directoryIterator = new RecursiveDirectoryIterator(
+    $baseDir,
+    RecursiveDirectoryIterator::SKIP_DOTS
+);
+
+$iterator = new RecursiveIteratorIterator(
+    $directoryIterator,
+    RecursiveIteratorIterator::SELF_FIRST
+);
+
+foreach ($iterator as $fileInfo) {
+    // $fileInfo は SplFileInfo オブジェクト
+    $absolutePath = $fileInfo->getPathname();
+    $relativePath = substr($absolutePath, strlen($baseDir)); // 基準フォルダからの相対パス
+
+    // 取得したい追加情報を必要に応じて増やせます
+    $paths[] = [
+        'path'        => $relativePath,
+        'type'        => $fileInfo->isDir() ? 'DIR' : 'FILE',
+        'size (byte)' => $fileInfo->isDir() ? '' : $fileInfo->getSize(),
+        'modified'    => date('Y-m-d H:i:s', $fileInfo->getMTime()),
+    ];
+}
+
+// ---------- 3. Excel ワークブックを作成 ----------
+$spreadsheet = new Spreadsheet();
+$sheet       = $spreadsheet->getActiveSheet();
+$sheet->setTitle('File List');
+
+// ヘッダ行を作成
+$headers = array_keys($paths[0] ?? ['path' => '']); // 空フォルダでもヘッダだけは書きたい
+$col     = 1;
+foreach ($headers as $header) {
+    $sheet->setCellValueByColumnAndRow($col++, 1, $header);
+}
+
+// データ行を出力
+$row = 2; // データは 2 行目から
+foreach ($paths as $item) {
+    $col = 1;
+    foreach ($headers as $key) {
+        $sheet->setCellValueByColumnAndRow($col++, $row, $item[$key] ?? '');
+    }
+    $row++;
+}
+
+// ---------- 4. オートフィルタ＆列幅自動調整 (任意) ----------
+$sheet->setAutoFilter($sheet->calculateWorksheetDimension());
+foreach (range('A', $sheet->getHighestColumn()) as $colLetter) {
+    $sheet->getColumnDimension($colLetter)->setAutoSize(true);
+}
+
+// ---------- 5. ファイル保存 ----------
+try {
+    $writer = new Xlsx($spreadsheet);
+    $writer->save($outputFile);
+    echo "Success: Excel file generated -> {$outputFile}\n";
+    echo "Target directory : {$baseDir}\n";
+    echo "Total items      : " . count($paths) . "\n";
+} catch (Throwable $e) {
+    fwrite(STDERR, "Error while saving Excel: " . $e->getMessage() . "\n");
+    exit(1);
+}
