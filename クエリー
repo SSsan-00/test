@@ -1,0 +1,17 @@
+SELECT 
+    COALESCE(a.file_path, b.file_path) AS file_path,
+    COALESCE(a.table_name, b.table_name) AS table_name,
+    CONCAT(COALESCE(a.C, ''), COALESCE(a.R, ''), COALESCE(a.U, ''), COALESCE(a.D, '')) AS A_CRUD,
+    CONCAT(COALESCE(b.C, ''), COALESCE(b.R, ''), COALESCE(b.U, ''), COALESCE(b.D, '')) AS B_CRUD,
+    CASE 
+        WHEN CONCAT(COALESCE(a.C, ''), COALESCE(a.R, ''), COALESCE(a.U, ''), COALESCE(a.D, '')) = 
+             CONCAT(COALESCE(b.C, ''), COALESCE(b.R, ''), COALESCE(b.U, ''), COALESCE(b.D, ''))
+        THEN ''
+        ELSE 'Different'
+    END AS Difference
+FROM 
+    TableA a
+FULL OUTER JOIN 
+    TableB b
+ON 
+    a.file_path = b.file_path AND a.table_name = b.table_name;
