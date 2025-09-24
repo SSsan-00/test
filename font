@@ -1,86 +1,107 @@
-# フォント調査方法まとめ
+# フォント表示差異の検証方法と調整方針
 
-## 前提
+## 背景
 
--   環境: Windows クライアント
--   制約: フォントのインストールは禁止（会社規定）
--   調査目的: ページで `font-family: Osaka`
-    が指定されているが、実際にどのフォントが使われているかを確認する
-
-------------------------------------------------------------------------
-
-## 1. Chromium 系ブラウザ (Edge/Chrome)
-
-### 方法
-
-1.  対象ページを開く
-2.  F12キーで DevTools を起動
-3.  Elements → Computed → **Rendered Fonts** を確認
-
-### メリット
-
--   実際に使用されているフォントファイル名が表示される\
-    例: `Segoe UI (Regular)` や `Meiryo`
-
-### 注意点
-
--   IEモードではこの機能は利用不可
+-   同一フォント「MS UI Gothic」を使用しているにも関わらず、\
+    **Edge IEモード (Trident/GDI)** と **Chrome (Blink/DirectWrite)**
+    で見た目に差異が発生。
+-   理由は
+    **レンダリングエンジンの違い**により、アンチエイリアスやピクセルスナップ処理が異なるため。
+-   基準: **IEモードの表示に Chrome を寄せたい**。
 
 ------------------------------------------------------------------------
 
-## 2. Edge IEモード (Trident/MSHTML)
+## 1. 現象確認方法
 
-### 方法A: JavaScript を使った検出
+### (1) 実フォント確認
 
-1.  開発者ツールのコンソールに以下をコピペ
+-   DevTools (Chromium 系): Computed → **Rendered Fonts** で
+    `MS UI Gothic` を確認
+-   IEモード: JavaScript フォント検出 or コントロールパネル →
+    フォント一覧
 
-``` js
-function detectFont(font) {
-  const testStr = "mmmmmmmmmwwwwwww";
-  const size = "72px";
+### (2) レンダリング比較
 
-  const canvas = document.createElement("canvas");
-  const ctx = canvas.getContext("2d");
+-   同一テキストを用意 (`あいうえおABC123` など)
+-   スクリーンショットを取得
+-   ピクセルレベルで比較（例: GIMP, Photoshop, ImageMagick `compare`）
 
-  ctx.font = size + " monospace";
-  const baseWidth = ctx.measureText(testStr).width;
+### (3) ズーム検証
 
-  ctx.font = size + " '" + font + "', monospace";
-  const testWidth = ctx.measureText(testStr).width;
+-   100%, 125%, 150% など異なる DPI/ズームで表示確認
+-   違いが大きくなるポイントを特定
 
-  return baseWidth !== testWidth;
+------------------------------------------------------------------------
+
+## 2. 差異の原因整理
+
+-   **IEモード (Trident/MSHTML)**
+    -   GDI レンダリング\
+    -   ピクセルスナップ強め → カクッとした見た目\
+-   **Chrome (Blink/Skia)**
+    -   DirectWrite レンダリング\
+    -   サブピクセルアンチエイリアス (ClearType) →
+        滑らかだがにじみやすい
+
+------------------------------------------------------------------------
+
+## 3. Chrome 側を IE 表示に近づける方法
+
+### (1) CSS フォントスムージング指定
+
+``` css
+body {
+  -webkit-font-smoothing: none; /* サブピクセルAAを無効化 */
+  text-rendering: geometricPrecision; /* 幾何学的に近い描画 */
 }
-
-console.log("Osaka →", detectFont("Osaka") ? "存在" : "代替中");
 ```
 
-2.  結果が `"存在"` ならそのフォントは利用可能、`"代替中"`
-    なら別フォントで描画されている
+-   Chrome でアンチエイリアスを抑制し、IE(GDI)
+    のようなカクッとした表示に近づける
+
+### (2) モノクロアンチエイリアス指定 (Windows 環境)
+
+``` css
+body {
+  -webkit-font-smoothing: antialiased; /* グレースケールAA */
+}
+```
+
+-   ClearType のにじみを抑え、GDI 表示に近づける
+
+### (3) 特定要素だけ適用
+
+``` css
+.ie-like {
+  -webkit-font-smoothing: none;
+  text-rendering: optimizeSpeed;
+}
+```
 
 ------------------------------------------------------------------------
 
-### 方法B: Windows のフォント一覧
+## 4. 注意点
 
-1.  コントロールパネル → フォントを開く
-2.  検索欄に「Osaka」と入力
-3.  見つからなければインストールされていないため、代替フォントで描画されている
+-   100% 完全一致は不可能（描画エンジンが異なるため）
+-   「見た目の傾向」を揃えることは可能
+    -   IE = 角ばった表示 → Chrome 側でアンチエイリアスを切る\
+-   ユーザー環境の DPI / ClearType 設定によっても変化
 
 ------------------------------------------------------------------------
 
-## 3. その他の方法
+## 5. 推奨検証フロー
 
-### Process Explorer (上級者向け)
-
--   Sysinternals の「Process
-    Explorer」を利用して、IEモードのプロセスがロードしているフォントファイルを調査可能\
--   ただし会社のセキュリティ規定で持ち込み不可の場合がある
+1.  対象ページに CSS のスムージング指定を追加
+2.  IEモードと Chrome でスクリーンショットを比較
+3.  最も近い描画になる設定を採用
+4.  ズーム倍率ごとに差異を再確認
 
 ------------------------------------------------------------------------
 
 ## まとめ
 
--   **最も手軽**: Chrome/Edge (Chromium) の「Rendered Fonts」確認\
--   **IEモード**: JavaScript 検出または Windows
-    フォント一覧で代替先を推測\
--   **高精度調査**: Process Explorer
-    でロード中のフォントを直接確認（環境制約あり）
+-   同じ「MS UI Gothic」でも **GDI (IE) と DirectWrite (Chrome)**
+    で見た目が異なる
+-   Chrome 側を IE に近づけるには **CSS
+    でアンチエイリアスを制御**するのが有効
+-   完全一致は難しいが「にじみを抑えて角ばった表示」に寄せることは可能
