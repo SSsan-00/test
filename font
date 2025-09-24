@@ -1,0 +1,86 @@
+# フォント調査方法まとめ
+
+## 前提
+
+-   環境: Windows クライアント
+-   制約: フォントのインストールは禁止（会社規定）
+-   調査目的: ページで `font-family: Osaka`
+    が指定されているが、実際にどのフォントが使われているかを確認する
+
+------------------------------------------------------------------------
+
+## 1. Chromium 系ブラウザ (Edge/Chrome)
+
+### 方法
+
+1.  対象ページを開く
+2.  F12キーで DevTools を起動
+3.  Elements → Computed → **Rendered Fonts** を確認
+
+### メリット
+
+-   実際に使用されているフォントファイル名が表示される\
+    例: `Segoe UI (Regular)` や `Meiryo`
+
+### 注意点
+
+-   IEモードではこの機能は利用不可
+
+------------------------------------------------------------------------
+
+## 2. Edge IEモード (Trident/MSHTML)
+
+### 方法A: JavaScript を使った検出
+
+1.  開発者ツールのコンソールに以下をコピペ
+
+``` js
+function detectFont(font) {
+  const testStr = "mmmmmmmmmwwwwwww";
+  const size = "72px";
+
+  const canvas = document.createElement("canvas");
+  const ctx = canvas.getContext("2d");
+
+  ctx.font = size + " monospace";
+  const baseWidth = ctx.measureText(testStr).width;
+
+  ctx.font = size + " '" + font + "', monospace";
+  const testWidth = ctx.measureText(testStr).width;
+
+  return baseWidth !== testWidth;
+}
+
+console.log("Osaka →", detectFont("Osaka") ? "存在" : "代替中");
+```
+
+2.  結果が `"存在"` ならそのフォントは利用可能、`"代替中"`
+    なら別フォントで描画されている
+
+------------------------------------------------------------------------
+
+### 方法B: Windows のフォント一覧
+
+1.  コントロールパネル → フォントを開く
+2.  検索欄に「Osaka」と入力
+3.  見つからなければインストールされていないため、代替フォントで描画されている
+
+------------------------------------------------------------------------
+
+## 3. その他の方法
+
+### Process Explorer (上級者向け)
+
+-   Sysinternals の「Process
+    Explorer」を利用して、IEモードのプロセスがロードしているフォントファイルを調査可能\
+-   ただし会社のセキュリティ規定で持ち込み不可の場合がある
+
+------------------------------------------------------------------------
+
+## まとめ
+
+-   **最も手軽**: Chrome/Edge (Chromium) の「Rendered Fonts」確認\
+-   **IEモード**: JavaScript 検出または Windows
+    フォント一覧で代替先を推測\
+-   **高精度調査**: Process Explorer
+    でロード中のフォントを直接確認（環境制約あり）
