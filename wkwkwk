@@ -1,0 +1,219 @@
+# PHPソース検索ツール（テーブル・カラム組み合わせ調査）
+
+## 概要
+
+PHPソースコード（`.php` / `.inc`）を対象に、  
+指定した複数の検索語の組み合わせが **同一ファイル内に存在する箇所** を検出し、CSVとして出力するツールです。
+
+主に以下の用途を想定しています。
+
+- テーブル・カラムの影響範囲調査
+- SQL使用箇所の洗い出し
+- レガシーコードの解析
+
+---
+
+## 特徴
+
+- 任意個の検索語に対応（`|` 区切り）
+- 複数行SQLも検出可能（ファイル単位判定）
+- EUC-JP / Shift_JIS / UTF-8 対応
+- 進捗表示あり（大量ファイル対応）
+- 結果をCSVで出力（Excelで確認可能）
+- 検索条件はCSVで管理（コード変更不要）
+
+---
+
+## フォルダ構成
+
+```
+C:\work\search-tool\
+├─ search-match-terms.ps1
+├─ targets.csv
+└─ src\
+```
+
+---
+
+## 使い方
+
+### ① 検索条件ファイルを作成
+
+`targets.csv`
+
+```csv
+match_terms
+mst_customer|customer_name
+mst_customer|customer_name|customer_id
+mst_order|order_no|status
+```
+
+---
+
+### ② スクリプトを実行
+
+```powershell
+cd C:\work\search-tool
+.\search-match-terms.ps1
+```
+
+---
+
+### ③ 結果確認
+
+`result.csv` が生成されます。
+
+```csv
+ファイルパス,ヒット行,検索文字列,ヒット行の内容
+src/customer/edit.php,12,mst_customer|customer_name,customer_name
+```
+
+---
+
+## 引数
+
+| 引数 | 説明 |
+|---|---|
+| `-TargetsCsv` | 検索条件CSV（デフォルト: targets.csv） |
+| `-OutputCsv` | 出力CSV（デフォルト: result.csv） |
+
+---
+
+### 使用例
+
+```powershell
+# 別の検索条件を使う
+.\search-match-terms.ps1 -TargetsCsv ".\my_targets.csv"
+
+# 出力ファイルを変更
+.\search-match-terms.ps1 -OutputCsv ".\result_2026.csv"
+
+# 両方指定
+.\search-match-terms.ps1 -TargetsCsv ".\targets.csv" -OutputCsv ".\result.csv"
+```
+
+---
+
+## 検索条件の書き方
+
+### 基本ルール
+
+- `|` で区切る
+- 1行 = 1条件
+- **すべての語がファイル内に存在するとヒット**
+
+---
+
+### 例
+
+| 記述 | 意味 |
+|---|---|
+| `mst_customer|customer_name` | 両方あればヒット |
+| `mst_customer|customer_name|customer_id` | 3つすべて必要 |
+| `mst_order|order_no|status` | 3語条件 |
+
+---
+
+## 出力仕様
+
+### result.csv
+
+| 列名 | 説明 |
+|---|---|
+| ファイルパス | 相対パス（/区切り） |
+| ヒット行 | 行番号 |
+| 検索文字列 | match_terms |
+| ヒット行の内容 | 該当行 |
+
+---
+
+## 実行時の出力
+
+### 進捗表示
+
+```
+検索条件数: 3
+検索対象ファイル数: 1245
+進捗: 100/1245 件
+```
+
+---
+
+### 集計結果
+
+```
+総ヒット件数         : 152
+ヒットファイル数     : 18
+読み込み失敗ファイル数 : 0
+```
+
+---
+
+## 注意事項
+
+### 1. 完全一致ではない
+
+以下でもヒットします：
+
+```php
+$sql1 = "SELECT * FROM mst_customer";
+$sql2 = "SELECT customer_name FROM other_table";
+```
+
+→ 同一ファイル内に両方あるため
+
+---
+
+### 2. コメントも対象
+
+```php
+// mst_customer customer_name
+```
+
+→ ヒットします
+
+---
+
+### 3. エイリアスは未対応
+
+```sql
+SELECT c.name FROM mst_customer c
+```
+
+→ `customer_name` は検出できません
+
+---
+
+## 推奨運用
+
+```
+① targets.csv を編集
+② スクリプト実行
+③ result.csv をExcelで確認
+④ 条件を調整して再実行
+```
+
+---
+
+## よくあるエラー
+
+### スクリプト実行エラー
+
+```powershell
+Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
+```
+
+---
+
+## 今後の拡張案
+
+- コメント除外
+- SQL解析（エイリアス対応）
+- サブクエリ対応
+- 精度向上（単語境界判定）
+
+---
+
+## ライセンス
+
+社内利用想定
