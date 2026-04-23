@@ -1,0 +1,197 @@
+param(
+    # 検索対象の組み合わせCSV
+    [string]$TargetsCsv = "targets.csv",
+
+    # 出力CSV
+    [string]$OutputCsv = "result.csv"
+)
+
+# =========================================================
+# 初期設定
+# =========================================================
+
+# 相対パスの基準になるカレントディレクトリ
+$baseDir = (Get-Location).Path
+
+# 検索対象の拡張子
+$targetExtensions = @("*.php", "*.inc")
+
+# 結果格納用
+$result = New-Object System.Collections.Generic.List[object]
+
+# .NET Core / PowerShell 7 系でも EUC-JP や Shift_JIS を扱えるようにする
+[System.Text.Encoding]::RegisterProvider([System.Text.CodePagesEncodingProvider]::Instance)
+
+# =========================================================
+# 指定したエンコード群でファイル読み込みを試す関数
+# =========================================================
+function Read-FileWithEncodings {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FilePath
+    )
+
+    # 業務系でよく遭遇する文字コードを順番に試す
+    $encodings = @(
+        [System.Text.Encoding]::UTF8,
+        [System.Text.Encoding]::GetEncoding("euc-jp"),
+        [System.Text.Encoding]::GetEncoding(932)   # Shift_JIS / CP932
+    )
+
+    foreach ($encoding in $encodings) {
+        $reader = $null
+
+        try {
+            # detectEncodingFromByteOrderMarks を true にして BOM 付きも考慮
+            $reader = New-Object System.IO.StreamReader($FilePath, $encoding, $true)
+            $content = $reader.ReadToEnd()
+
+            return $content
+        }
+        catch {
+            # 読み込み失敗時は次のエンコードを試す
+            continue
+        }
+        finally {
+            if ($null -ne $reader) {
+                $reader.Close()
+                $reader.Dispose()
+            }
+        }
+    }
+
+    # どのエンコードでも読めなかった場合は null を返す
+    return $null
+}
+
+# =========================================================
+# 文字列を含む行番号一覧を取得する関数
+# =========================================================
+function Get-MatchingLineNumbers {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$Lines,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Pattern
+    )
+
+    $matchedLineNumbers = New-Object System.Collections.Generic.List[int]
+
+    for ($i = 0; $i -lt $Lines.Count; $i++) {
+        # 正規表現の特殊文字を無害化して完全に文字列として検索する
+        if ($Lines[$i] -match [regex]::Escape($Pattern)) {
+            # CSV では 1 始まりの行番号にする
+            $matchedLineNumbers.Add($i + 1)
+        }
+    }
+
+    return $matchedLineNumbers
+}
+
+# =========================================================
+# targets.csv の存在確認
+# =========================================================
+if (-not (Test-Path -LiteralPath $TargetsCsv)) {
+    Write-Error "targets.csv が見つかりません: $TargetsCsv"
+    exit 1
+}
+
+# =========================================================
+# targets.csv 読み込み
+# =========================================================
+try {
+    $targets = Import-Csv -LiteralPath $TargetsCsv
+}
+catch {
+    Write-Error "targets.csv の読み込みに失敗しました: $TargetsCsv"
+    exit 1
+}
+
+if ($null -eq $targets -or $targets.Count -eq 0) {
+    Write-Error "targets.csv に検索対象がありません。"
+    exit 1
+}
+
+# 必須ヘッダの簡易チェック
+$firstTarget = $targets | Select-Object -First 1
+if (-not ($firstTarget.PSObject.Properties.Name -contains "table_name") -or
+    -not ($firstTarget.PSObject.Properties.Name -contains "column_name")) {
+    Write-Error "targets.csv のヘッダは table_name,column_name である必要があります。"
+    exit 1
+}
+
+# =========================================================
+# 対象ファイル一覧を取得
+# =========================================================
+$files = foreach ($pattern in $targetExtensions) {
+    Get-ChildItem -Recurse -File -Filter $pattern
+}
+
+# =========================================================
+# ファイルごとに走査
+# =========================================================
+foreach ($file in $files) {
+    $content = Read-FileWithEncodings -FilePath $file.FullName
+
+    # 読めなかったファイルはスキップ
+    if ($null -eq $content) {
+        continue
+    }
+
+    # 改行コード差異を吸収して行配列にする
+    $lines = $content -split "`r`n|`n|`r"
+
+    # 相対パス化 + スラッシュ変換
+    $relativePath = [System.IO.Path]::GetRelativePath($baseDir, $file.FullName)
+    $normalizedPath = $relativePath.Replace('\', '/')
+
+    # 1ファイルに対して、targets.csv の全組み合わせをチェック
+    foreach ($target in $targets) {
+        $tableName = [string]$target.table_name
+        $columnName = [string]$target.column_name
+
+        # 空行対策
+        if ([string]::IsNullOrWhiteSpace($tableName) -or [string]::IsNullOrWhiteSpace($columnName)) {
+            continue
+        }
+
+        # ファイル全体にテーブル名とカラム名の両方があるかを判定
+        $hasTable = $content -match [regex]::Escape($tableName)
+        $hasColumn = $content -match [regex]::Escape($columnName)
+
+        if (-not ($hasTable -and $hasColumn)) {
+            continue
+        }
+
+        # ヒットしたファイルについて、
+        # テーブル名またはカラム名を含む行番号を集める
+        $tableLineNumbers = Get-MatchingLineNumbers -Lines $lines -Pattern $tableName
+        $columnLineNumbers = Get-MatchingLineNumbers -Lines $lines -Pattern $columnName
+
+        # 重複行番号を除外しつつ昇順に並べる
+        $hitLineNumbers = @($tableLineNumbers + $columnLineNumbers | Sort-Object -Unique)
+
+        foreach ($lineNumber in $hitLineNumbers) {
+            $lineText = $lines[$lineNumber - 1]
+
+            # CSV 1行分のオブジェクト
+            $result.Add([PSCustomObject]@{
+                file_path   = $normalizedPath
+                line_number = $lineNumber
+                table_name  = $tableName
+                column_name = $columnName
+                line_text   = $lineText.Trim()
+            })
+        }
+    }
+}
+
+# =========================================================
+# 出力
+# =========================================================
+$result |
+    Sort-Object file_path, table_name, column_name, line_number |
+    Export-Csv -LiteralPath $OutputCsv -NoTypeInformation -Encoding UTF8
+
+Write-Output "出力完了: $OutputCsv"
