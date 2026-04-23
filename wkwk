@@ -19,6 +19,9 @@ $targetExtensions = @("*.php", "*.inc")
 # 結果格納用
 $result = New-Object System.Collections.Generic.List[object]
 
+# 読み込み失敗ファイル格納用
+$failedFiles = New-Object System.Collections.Generic.List[string]
+
 # PowerShell 7 系でも EUC-JP / Shift_JIS を扱えるようにする
 [System.Text.Encoding]::RegisterProvider([System.Text.CodePagesEncodingProvider]::Instance)
 
@@ -31,6 +34,7 @@ function Read-FileWithEncodings {
         [string]$FilePath
     )
 
+    # 業務系で遭遇しやすい文字コードを順に試す
     $encodings = @(
         [System.Text.Encoding]::UTF8,
         [System.Text.Encoding]::GetEncoding("euc-jp"),
@@ -121,23 +125,52 @@ $files = foreach ($pattern in $targetExtensions) {
     Get-ChildItem -Recurse -File -Filter $pattern
 }
 
+$files = @($files)
+
+if ($files.Count -eq 0) {
+    Write-Warning "検索対象ファイルが見つかりませんでした。"
+    exit 0
+}
+
+Write-Output ("検索対象ファイル数: {0}" -f $files.Count)
+
 # =========================================================
 # ファイルごとに走査
 # =========================================================
+$currentFileIndex = 0
+
 foreach ($file in $files) {
+    $currentFileIndex++
+
+    # 相対パスに変換し、区切りを / に統一
+    $relativePath = [System.IO.Path]::GetRelativePath($baseDir, $file.FullName)
+    $normalizedPath = $relativePath.Replace('\', '/')
+
+    # 進捗率を算出
+    $percentComplete = [int](($currentFileIndex / $files.Count) * 100)
+
+    # 進捗バー表示
+    Write-Progress `
+        -Id 1 `
+        -Activity "ソースファイルを走査中" `
+        -Status ("{0}/{1} 件: {2}" -f $currentFileIndex, $files.Count, $normalizedPath) `
+        -PercentComplete $percentComplete
+
+    # 100件ごとにログ出力
+    if ($currentFileIndex % 100 -eq 0) {
+        Write-Output ("進捗: {0}/{1} 件" -f $currentFileIndex, $files.Count)
+    }
+
     $content = Read-FileWithEncodings -FilePath $file.FullName
 
-    # 読めなかったファイルはスキップ
+    # 読めなかったファイルは記録してスキップ
     if ($null -eq $content) {
+        $failedFiles.Add($normalizedPath)
         continue
     }
 
     # 改行差異を吸収して行配列にする
     $lines = $content -split "`r`n|`n|`r"
-
-    # 相対パスに変換し、区切りを / に統一
-    $relativePath = [System.IO.Path]::GetRelativePath($baseDir, $file.FullName)
-    $normalizedPath = $relativePath.Replace('\', '/')
 
     # -----------------------------------------------------
     # 1ファイルに対して、検索条件を順番に判定
@@ -145,7 +178,7 @@ foreach ($file in $files) {
     foreach ($target in $targets) {
         $matchTermsText = $target.match_terms
 
-        # | で分割して、各検索語を作る
+        # | で分割して各検索語を作る
         $terms = $matchTermsText -split '\|' |
             ForEach-Object { $_.Trim() } |
             Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
@@ -186,15 +219,18 @@ foreach ($file in $files) {
 
             if ($isHitLine) {
                 $result.Add([PSCustomObject]@{
-                    ファイルパス   = $normalizedPath
-                    ヒット行       = $i + 1
-                    検索文字列     = $matchTermsText
+                    ファイルパス     = $normalizedPath
+                    ヒット行         = $i + 1
+                    検索文字列       = $matchTermsText
                     'ヒット行の内容' = $line.Trim()
                 })
             }
         }
     }
 }
+
+# 進捗バーを閉じる
+Write-Progress -Id 1 -Activity "ソースファイルを走査中" -Completed
 
 # =========================================================
 # CSV出力
@@ -204,3 +240,88 @@ $result |
     Export-Csv -LiteralPath $OutputCsv -NoTypeInformation -Encoding UTF8
 
 Write-Output "出力完了: $OutputCsv"
+
+# =========================================================
+# 集計表示
+# =========================================================
+$totalHitCount = $result.Count
+
+# ヒットしたファイル数（重複除外）
+$hitFileCount = 0
+if ($totalHitCount -gt 0) {
+    $hitFileCount = ($result | Select-Object -ExpandProperty ファイルパス -Unique).Count
+}
+
+# 読み込み失敗ファイル数
+$failedFileCount = $failedFiles.Count
+
+Write-Output "========================================"
+Write-Output ("総ヒット件数         : {0}" -f $totalHitCount)
+Write-Output ("ヒットファイル数     : {0}" -f $hitFileCount)
+Write-Output ("読み込み失敗ファイル数 : {0}" -f $failedFileCount)
+
+# 検索文字列ごとのヒット件数
+Write-Output "検索文字列ごとのヒット件数:"
+if ($totalHitCount -gt 0) {
+    $result |
+        Group-Object 検索文字列 |
+        Sort-Object Name |
+        ForEach-Object {
+            Write-Output ("- {0} : {1}" -f $_.Name, $_.Count)
+        }
+}
+else {
+    Write-Output "- ヒットなし"
+}
+
+# 検索文字列ごとのヒットファイル数
+Write-Output "検索文字列ごとのヒットファイル数:"
+$hitFileCountBySearchText = @{}
+foreach ($target in $targets) {
+    $searchText = $target.match_terms
+
+    $fileCount = 0
+    if ($totalHitCount -gt 0) {
+        $matchedRows = $result | Where-Object { $_.検索文字列 -eq $searchText }
+
+        if ($matchedRows) {
+            $fileCount = ($matchedRows | Select-Object -ExpandProperty ファイルパス -Unique).Count
+        }
+    }
+
+    $hitFileCountBySearchText[$searchText] = $fileCount
+    Write-Output ("- {0} : {1}" -f $searchText, $fileCount)
+}
+
+# ヒット0件の検索文字列一覧
+$zeroHitSearchTexts = @(
+    $targets |
+        Where-Object {
+            $searchText = $_.match_terms
+            -not $hitFileCountBySearchText.ContainsKey($searchText) -or $hitFileCountBySearchText[$searchText] -eq 0
+        } |
+        Select-Object -ExpandProperty match_terms
+)
+
+Write-Output "ヒット0件の検索文字列:"
+if ($zeroHitSearchTexts.Count -gt 0) {
+    foreach ($searchText in $zeroHitSearchTexts) {
+        Write-Output ("- {0}" -f $searchText)
+    }
+}
+else {
+    Write-Output "- なし"
+}
+
+# 読み込み失敗ファイル一覧
+Write-Output "読み込み失敗ファイル一覧:"
+if ($failedFileCount -gt 0) {
+    $failedFiles |
+        Sort-Object -Unique |
+        ForEach-Object {
+            Write-Output ("- {0}" -f $_)
+        }
+}
+else {
+    Write-Output "- なし"
+}
